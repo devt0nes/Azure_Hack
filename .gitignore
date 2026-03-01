@@ -34,6 +34,9 @@ share/python-wheels/
 .env.production.local
 *.env
 
+# Day 4: Dev Tunnels
+.tunnel-url
+
 # IDE / Editor
 .vscode/
 .idea/

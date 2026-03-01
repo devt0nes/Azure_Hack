@@ -195,7 +195,82 @@ Configured version control for GitHub push:
 
 ---
 
-## 🔧 Hotfix — Learning Mode Height Issue
+## � Day 4 — February 27, 2026
+
+### Latest changes
+Implemented local preview with Docker Compose and Azure Dev Tunnels:
+
+**Docker Compose Setup**
+- Production-ready `docker-compose.template.yml` with frontend and backend services
+- Frontend: Node 20 Alpine with Vite hot-reload (`npm run dev -- --host 0.0.0.0`)
+- Backend: Python 3.11 slim with FastAPI + uvicorn auto-reload
+- Shared network for container communication
+- Volume mounts for instant code changes without rebuilds
+- Cached node_modules and pip packages for faster startups
+
+**Dev Tunnels Integration**
+- PowerShell scripts: `start-devtunnel.ps1` and `stop-devtunnel.ps1`
+- Creates persistent Azure Dev Tunnel with public HTTPS URL
+- Forwards localhost:5173 to `https://*.devtunnels.ms` domain
+- Saves tunnel URL to `.tunnel-url` file (git-ignored)
+- Auto-reconnect on existing tunnels
+
+**Preview Component with iframe**
+- Embedded preview in Command Center UI (`Preview.jsx`)
+- Real-time iframe rendering of frontend with tunnel or localhost URL
+- Tunnel status indicator (local vs active)
+- Controls: Refresh iframe, Open in external tab
+- Shows tunnel URL with copy hint
+- Docker Compose quick start hint at bottom
+
+**Tunnel Service (`services/tunnel.js`)**
+- Queries backend `/api/tunnel-status` endpoint for active tunnel info
+- Graceful fallback to localhost when tunnel not configured
+- Docker environment detection (checks for `backend:8000` in API_BASE_URL)
+- Returns: `{ url, status, port }`
+
+**Backend Updates (`api.py`)**
+- FastAPI server with CORS middleware for cross-origin dev tunnels
+- Health check endpoint: `GET /` returns service info
+- Tunnel status endpoint: `GET /api/tunnel-status` reads `.tunnel-url` file
+- Placeholder endpoints ready: `/clarify`, `/aeg`, `/execute`, `/tutor/ask`
+- uvicorn with `--reload` flag for hot-reload on file changes
+
+**Hot-reload Configuration**
+- Frontend: Vite watches `platform-frontend/` directory via Docker volume
+- Backend: uvicorn watches `platform-backend/` with `--reload` flag
+- node_modules volume prevents host overrides (faster installs)
+- Python package cache volume reduces pip install times
+- Changes reflect instantly without container rebuilds
+
+**Quick Start Script**
+- `infrastructure/scripts/start-local.ps1` launches Docker Compose
+- Checks Docker daemon status before starting
+- Displays service URLs (frontend:5173, backend:8000)
+- Graceful shutdown with `docker-compose down` on Ctrl+C
+
+### Notes
+- **Docker required**: Install Docker Desktop to use local preview
+- **Dev Tunnels CLI**: Install with `winget install Microsoft.devtunnel` for public URLs
+- Run Docker Compose: `docker-compose -f infrastructure/docker-compose.template.yml up`
+- Run Dev Tunnel: `.\infrastructure\scripts\start-devtunnel.ps1`
+- Hot-reload works automatically - edit files and see changes live
+- iframe sandbox: `allow-same-origin allow-scripts allow-forms allow-popups`
+- `.tunnel-url` is git-ignored (tunnel URLs are ephemeral)
+- Set `VITE_PREVIEW_URL` in `.env` to override default localhost
+
+### Next steps
+1. Install Docker Desktop if not already installed
+2. Copy `.env.example` to `.env` and configure variables
+3. Start local environment: `.\infrastructure\scripts\start-local.ps1`
+4. (Optional) Start dev tunnel: `.\infrastructure\scripts\start-devtunnel.ps1`
+5. Click "Preview" tab in Command Center to see embedded iframe
+6. Test hot-reload: Edit `App.jsx` and watch changes appear instantly
+7. Share tunnel URL with team for collaborative preview
+
+---
+
+## �🔧 Hotfix — Learning Mode Height Issue
 
 ### Latest changes
 Fixed Learning Mode tab displaying blank content:
