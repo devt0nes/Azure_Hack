@@ -85,3 +85,7 @@ Desktop.ini
 *.temp
 *.bak
 *.cache
+
+__pycache__/
+*.pyc
+.env
