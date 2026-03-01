@@ -1,0 +1,148 @@
+{
+  "id": "f504608a-5147-4466-a6bf-d8a8f05b012b",
+  "project_id": "f504608a-5147-4466-a6bf-d8a8f05b012b",
+  "nodes": [
+    {
+      "agent_id": "agent-1",
+      "role": "Database Architect",
+      "inputs": [],
+      "outputs": [
+        "database_schema"
+      ],
+      "token_budget": 100,
+      "model_preference": "gpt-4o-mini",
+      "status": "PENDING",
+      "pending_since": null,
+      "priority": "NORMAL"
+    },
+    {
+      "agent_id": "agent-2",
+      "role": "Backend Engineer",
+      "inputs": [
+        "database_schema"
+      ],
+      "outputs": [
+        "backend_api"
+      ],
+      "token_budget": 150,
+      "model_preference": "gpt-4o-mini",
+      "status": "PENDING",
+      "pending_since": null,
+      "priority": "NORMAL"
+    },
+    {
+      "agent_id": "agent-3",
+      "role": "Security Reviewer",
+      "inputs": [
+        "backend_api"
+      ],
+      "outputs": [
+        "security_audit"
+      ],
+      "token_budget": 100,
+      "model_preference": "gpt-4o",
+      "status": "PENDING",
+      "pending_since": null,
+      "priority": "NORMAL"
+    },
+    {
+      "agent_id": "agent-4",
+      "role": "Frontend Engineer",
+      "inputs": [
+        "backend_api"
+      ],
+      "outputs": [
+        "frontend_code"
+      ],
+      "token_budget": 150,
+      "model_preference": "gpt-4o-mini",
+      "status": "PENDING",
+      "pending_since": null,
+      "priority": "NORMAL"
+    },
+    {
+      "agent_id": "agent-5",
+      "role": "QA Engineer",
+      "inputs": [
+        "frontend_code",
+        "backend_api"
+      ],
+      "outputs": [
+        "test_results"
+      ],
+      "token_budget": 100,
+      "model_preference": "gpt-4o-mini",
+      "status": "PENDING",
+      "pending_since": null,
+      "priority": "NORMAL"
+    },
+    {
+      "agent_id": "agent-6",
+      "role": "DevOps Engineer",
+      "inputs": [
+        "test_results",
+        "security_audit"
+      ],
+      "outputs": [
+        "deployment_plan"
+      ],
+      "token_budget": 100,
+      "model_preference": "gpt-4o",
+      "status": "PENDING",
+      "pending_since": null,
+      "priority": "NORMAL"
+    },
+    {
+      "agent_id": "agent-7",
+      "role": "Documentation Writer",
+      "inputs": [
+        "deployment_plan"
+      ],
+      "outputs": [
+        "user_documentation"
+      ],
+      "token_budget": 50,
+      "model_preference": "gpt-4o-mini",
+      "status": "PENDING",
+      "pending_since": null,
+      "priority": "NORMAL"
+    }
+  ],
+  "edges": [
+    {
+      "from_agent": "agent-1",
+      "to_agent": "agent-2"
+    },
+    {
+      "from_agent": "agent-2",
+      "to_agent": "agent-3"
+    },
+    {
+      "from_agent": "agent-2",
+      "to_agent": "agent-4"
+    },
+    {
+      "from_agent": "agent-4",
+      "to_agent": "agent-5"
+    },
+    {
+      "from_agent": "agent-2",
+      "to_agent": "agent-5"
+    },
+    {
+      "from_agent": "agent-3",
+      "to_agent": "agent-6"
+    },
+    {
+      "from_agent": "agent-5",
+      "to_agent": "agent-6"
+    },
+    {
+      "from_agent": "agent-6",
+      "to_agent": "agent-7"
+    }
+  ],
+  "status": "APPROVED",
+  "revision_notes": "",
+  "created_at": "2026-02-28T07:16:36.371561"
+}

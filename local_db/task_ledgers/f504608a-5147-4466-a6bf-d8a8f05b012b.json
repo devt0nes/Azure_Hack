@@ -1,0 +1,31 @@
+{
+  "id": "f504608a-5147-4466-a6bf-d8a8f05b012b",
+  "project_id": "f504608a-5147-4466-a6bf-d8a8f05b012b",
+  "owner_id": "default_user",
+  "user_intent": "Task management for small teams",
+  "functional_requirements": [
+    "Task assignment",
+    "Deadlines",
+    "Progress tracking",
+    "Comments"
+  ],
+  "non_functional_requirements": {
+    "performance": "Page load under 2 seconds",
+    "budget": "$200/month"
+  },
+  "tech_constraints": {
+    "preferred": "FastAPI backend, React frontend, PostgreSQL database",
+    "forbidden": "None specified"
+  },
+  "integration_targets": [],
+  "guardrail_overrides": [],
+  "revision_history": [
+    {
+      "type": "STRUCTURAL",
+      "description": "add a payment module using Stripe",
+      "timestamp": "2026-02-28T07:26:42.983282"
+    }
+  ],
+  "status": "DRAFT",
+  "created_at": "2026-02-27T15:22:59.672856"
+}
