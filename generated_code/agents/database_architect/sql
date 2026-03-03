@@ -1,0 +1,28 @@
+-- File: database_indexes_and_maintenance.sql
+
+-- Index optimization and maintenance script
+
+-- Rebuild fragmented indexes
+-- Replace 'your_database_name' with your actual database name
+USE your_database_name;
+
+-- Rebuild indexes on all tables
+DECLARE @tableName NVARCHAR(128);
+DECLARE tableCursor CURSOR FOR
+SELECT name FROM sys.tables;
+
+OPEN tableCursor;
+FETCH NEXT FROM tableCursor INTO @tableName;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    PRINT 'Rebuilding indexes on table: ' + @tableName;
+    EXEC('ALTER INDEX ALL ON ' + @tableName + ' REBUILD');
+    FETCH NEXT FROM tableCursor INTO @tableName;
+END;
+
+CLOSE tableCursor;
+DEALLOCATE tableCursor;
+
+-- Update statistics on all tables
+EXEC sp_updatestats;
