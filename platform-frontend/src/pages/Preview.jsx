@@ -6,6 +6,7 @@ export default function Preview() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [refreshKey, setRefreshKey] = useState(0)
+  const [isExpanded, setIsExpanded] = useState(false)
 
   useEffect(() => {
     loadTunnelInfo()
@@ -34,6 +35,10 @@ export default function Preview() {
     }
   }
 
+  const toggleExpanded = () => {
+    setIsExpanded((prev) => !prev)
+  }
+
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
@@ -50,6 +55,12 @@ export default function Preview() {
 
         {/* Controls */}
         <div className="flex gap-2">
+          <button
+            onClick={toggleExpanded}
+            className="rounded-md bg-ink/5 px-3 py-1.5 text-xs font-medium text-ink/70 transition hover:bg-ink/10"
+          >
+            {isExpanded ? '🗕 Collapse' : '🗖 Expand'}
+          </button>
           <button
             onClick={handleRefresh}
             className="rounded-md bg-ink/5 px-3 py-1.5 text-xs font-medium text-ink/70 transition hover:bg-ink/10"
@@ -83,7 +94,11 @@ export default function Preview() {
       )}
 
       {/* Preview iframe */}
-      <div className="flex-1 min-h-0">
+      <div
+        className={`min-h-[320px] transition-all duration-200 ${
+          isExpanded ? 'h-[560px]' : 'h-[380px]'
+        }`}
+      >
         {loading && (
           <div className="flex h-full items-center justify-center rounded-lg border border-ink/10 bg-white/60">
             <p className="text-sm text-ink/50">Loading preview...</p>

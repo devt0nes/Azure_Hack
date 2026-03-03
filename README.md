@@ -269,7 +269,59 @@ Implemented local preview with Docker Compose and Azure Dev Tunnels:
 7. Share tunnel URL with team for collaborative preview
 
 ---
+## 📊 Day 4 Enhancement — March 3, 2026
 
+### Latest changes
+Enhanced AEG visualization with task-ledger format support and focused preview:
+
+**Task-Ledger JSON Parser**
+- Added support for full task-ledger payload format from Director AI
+- Parses `agent_specifications.required_agents`, `agent_dependencies`, and `parallel_execution_groups`
+- Auto-generates DAG from agent dependency mappings
+- Backward compatible with legacy `nodes/edges` format
+- Sample task-ledger embedded for demo without backend (LegalDocs SaaS Platform example)
+
+**Smart Graph Layout**
+- Positions agents by parallel execution groups (horizontal stages)
+- Groups displayed left-to-right showing execution flow
+- Each node shows: Agent role (title-cased), group number, handoff count
+- Dependency edges rendered with animated transitions
+- Auto-fit view with zoom controls (0.5x - 1.5x)
+
+**Clickable Card Preview with Focus Mode**
+- AEG preview now clickable with hover hint ("Click to focus")
+- Clicking opens full-screen modal overlay with larger graph canvas
+- Focused view: 72vh height, max-width 7xl (1280px+)
+- Close button dismisses overlay back to card view
+- Card shows project name and data source (Sample Ledger vs Backend API)
+
+**Node Metadata Display**
+- Agent names formatted from snake_case to Title Case
+- Group level indicator: "Group 1", "Group 2", etc.
+- Handoff count shows number of downstream dependencies
+- Color-coded states: PENDING (midnight), RUNNING (ember), COMPLETED (emerald), FAILED (red)
+
+**Dual Parser Strategy**
+- `normalizeLegacyGraph()`: Handles old `{ nodes, edges }` format
+- `normalizeLedgerGraph()`: Handles full task-ledger with `agent_specifications`
+- `toFlowGraph()`: Auto-detects format and routes to correct parser
+- Graceful error handling for unsupported formats
+
+### Notes
+- Task-ledger format expected from backend `/aeg` endpoint
+- Sample ledger shows 9-agent LegalDocs SaaS project with 4 execution groups
+- Agent dependencies create directed edges (e.g., solution_architect → backend_engineer)
+- Ungrouped agents positioned in final column automatically
+- Backend can return either format - frontend adapts automatically
+
+### Next steps
+1. Click AEG Preview card in Command Center to test focused view
+2. Inspect sample task-ledger graph structure and dependencies
+3. Implement backend `/aeg` endpoint to return real task-ledger JSON
+4. Wire SignalR to update agent node states in real-time during execution
+5. Add node click handlers to show agent details/logs in side panel
+
+---
 ## �🔧 Hotfix — Learning Mode Height Issue
 
 ### Latest changes
