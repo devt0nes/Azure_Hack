@@ -4,6 +4,10 @@ import uuid
 import os
 import logging
 import re
+import ast
+import subprocess
+import random
+import hashlib
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Set, Tuple
 from enum import Enum
@@ -12,7 +16,7 @@ from dotenv import load_dotenv
 
 # --- Azure & AI Imports ---
 from azure.cosmos import CosmosClient, PartitionKey
-from azure.servicebus.aio import ServiceBusClient
+from azure.servicebus.aio import ServiceBusClient, ServiceBusReceiver
 from azure.servicebus import ServiceBusMessage
 from openai import AzureOpenAI
 
@@ -39,6 +43,7 @@ COSMOS_CONNECTION_STR = os.getenv("COSMOS_CONNECTION_STR")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "agentic-nexus-db")
 LEDGER_CONTAINER = os.getenv("LEDGER_CONTAINER", "TaskLedgers")
 AGENT_CONTAINER = os.getenv("AGENT_CONTAINER", "AgentRegistry")
+EXCHANGE_LOG_CONTAINER = os.getenv("EXCHANGE_LOG_CONTAINER", "AgentExchangeLog")
 
 SERVICE_BUS_STR = os.getenv("SERVICE_BUS_STR")
 GHOST_HANDSHAKE_QUEUE = os.getenv("GHOST_HANDSHAKE_QUEUE", "agent-handshake-stubs")
@@ -49,6 +54,13 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 MAX_PARALLEL_AGENTS = int(os.getenv("MAX_PARALLEL_AGENTS", "5"))
 AGENT_TIMEOUT_SECONDS = int(os.getenv("AGENT_TIMEOUT_SECONDS", "300"))
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+AGENT_TRACE_MODE = os.getenv("AGENT_TRACE_MODE", "summary").strip().lower()
+PERSIST_CODE_TO_DB = os.getenv("PERSIST_CODE_TO_DB", "false").strip().lower() == "true"
+REQUIRE_OUTPUT_FOR_COMPLETION = os.getenv("REQUIRE_OUTPUT_FOR_COMPLETION", "true").strip().lower() == "true"
+SERVICE_BUS_RETRY_MAX = int(os.getenv("SERVICE_BUS_RETRY_MAX", "3"))
+SERVICE_BUS_RETRY_BASE_MS = int(os.getenv("SERVICE_BUS_RETRY_BASE_MS", "500"))
+ENABLE_SERVICE_BUS_CONSUMER = os.getenv("ENABLE_SERVICE_BUS_CONSUMER", "false").strip().lower() == "true"
+RFC_BLOCKING_MODE = os.getenv("RFC_BLOCKING_MODE", "false").strip().lower() == "true"
 
 # Configure logging
 logging.basicConfig(
@@ -57,11 +69,110 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+VALID_TRACE_MODES = {"off", "summary", "code", "raw"}
+
+
+def set_agent_trace_mode(mode: str) -> str:
+    """Update trace mode at runtime."""
+    global AGENT_TRACE_MODE
+    normalized = mode.strip().lower()
+    if normalized in VALID_TRACE_MODES:
+        AGENT_TRACE_MODE = normalized
+    return AGENT_TRACE_MODE
+
 # Create output directory for generated code
 OUTPUT_DIR = Path("./generated_code")
 OUTPUT_DIR.mkdir(exist_ok=True)
 (OUTPUT_DIR / "agents").mkdir(exist_ok=True)
 (OUTPUT_DIR / "shared").mkdir(exist_ok=True)
+
+SETUP_PHASE_ROLES: Set[str] = {
+    "solution_architect",
+    "api_designer",
+    "database_architect",
+    "security_engineer",
+    "devops_engineer",
+}
+
+CODING_PHASE_ROLES: Set[str] = {
+    "backend_engineer",
+    "frontend_engineer",
+    "qa_engineer",
+    "ml_engineer",
+}
+MAX_AGENT_ITERATIONS = int(os.getenv("MAX_AGENT_ITERATIONS", "15"))
+
+ROLE_KEYWORD_MAP: Dict[str, Set[str]] = {
+    "backend_engineer": {"backend", "api", "service"},
+    "frontend_engineer": {"frontend", "ui", "react", "dashboard"},
+    "database_architect": {"database", "db", "schema"},
+    "devops_engineer": {"devops", "ci/cd", "infra", "terraform", "docker"},
+    "security_engineer": {"security", "auth", "encryption"},
+    "qa_engineer": {"qa", "test", "testing"},
+    "solution_architect": {"architect", "architecture", "solution"},
+    "api_designer": {"api designer", "openapi", "swagger"},
+    "ml_engineer": {"ml", "ai", "inference", "nlp"},
+}
+
+
+def extract_target_roles(text: str, all_roles: Set[str]) -> Set[str]:
+    """Infer targeted roles from an instruction text."""
+    text_l = text.lower()
+    matched: Set[str] = set()
+    for role in all_roles:
+        role_pattern = r"\b" + re.escape(role.replace("_", " ")) + r"s?\b"
+        if re.search(role_pattern, text_l):
+            matched.add(role)
+            continue
+        for keyword in ROLE_KEYWORD_MAP.get(role, set()):
+            kw_pattern = r"\b" + re.escape(keyword) + r"s?\b"
+            if re.search(kw_pattern, text_l):
+                matched.add(role)
+                break
+    return matched if matched else all_roles
+
+
+class ServiceBusPublisher:
+    """Resilient publisher with backoff and lightweight health stats."""
+
+    stats: Dict[str, int] = {
+        "publish_success": 0,
+        "publish_failures": 0,
+        "retry_attempts": 0,
+    }
+
+    @staticmethod
+    async def publish_json(destination_kind: str, destination_name: str, payload: Dict) -> bool:
+        if not SERVICE_BUS_STR:
+            return False
+        for attempt in range(1, SERVICE_BUS_RETRY_MAX + 1):
+            try:
+                async with ServiceBusClient.from_connection_string(SERVICE_BUS_STR) as sb:
+                    if destination_kind == "topic":
+                        async with sb.get_topic_sender(destination_name) as sender:
+                            await sender.send_messages(ServiceBusMessage(json.dumps(payload)))
+                    else:
+                        async with sb.get_queue_sender(destination_name) as sender:
+                            await sender.send_messages(ServiceBusMessage(json.dumps(payload)))
+                ServiceBusPublisher.stats["publish_success"] += 1
+                return True
+            except Exception as e:
+                ServiceBusPublisher.stats["publish_failures"] += 1
+                if attempt < SERVICE_BUS_RETRY_MAX:
+                    ServiceBusPublisher.stats["retry_attempts"] += 1
+                    backoff = (SERVICE_BUS_RETRY_BASE_MS * (2 ** (attempt - 1))) + random.randint(0, 250)
+                    await asyncio.sleep(backoff / 1000.0)
+                else:
+                    logger.warning(
+                        f"⚠️  Service Bus publish failed after {attempt} attempt(s) "
+                        f"to {destination_kind}:{destination_name} | {e}"
+                    )
+                    return False
+        return False
+
+    @staticmethod
+    def health_snapshot() -> Dict[str, int]:
+        return dict(ServiceBusPublisher.stats)
 
 # ==========================================
 # 2. AGENT ROLE ENUMS & DEFINITIONS
@@ -78,6 +189,16 @@ class AgentRole(str, Enum):
     API_DESIGNER = "api_designer"
     ML_ENGINEER = "ml_engineer"
 
+class AgentStatus(str, Enum):
+    """Enumeration of agent execution statuses for iterative workflows."""
+    CREATED = "created"
+    IN_PROGRESS = "in_progress"
+    WAITING_FOR_RESPONSE = "waiting_for_response"  # Awaiting handoff response
+    PAUSED = "paused"  # Awaiting user input
+    BLOCKED = "blocked"  # Waiting for dependency
+    COMPLETED = "completed"
+    FAILED = "failed"
+
 class AgentSpecialty(str, Enum):
     """Agent specializations within their role."""
     AZURE_INFRASTRUCTURE = "azure_infrastructure"
@@ -90,6 +211,14 @@ class AgentSpecialty(str, Enum):
     TESTING_AUTOMATION = "testing_automation"
     ML_INTEGRATION = "ml_integration"
     DEVOPS_CI_CD = "devops_ci_cd"
+
+class BlackboardPostType(str, Enum):
+    """Types of posts on the hierarchical blackboard."""
+    GLOBAL_RFC = "global_rfc"      # Everyone sees this
+    GROUP_RFC = "group_rfc"        # Only specific group sees this
+    HANDOFF = "handoff"            # Direct handoff request
+    UPDATE = "update"              # Work progress update
+    QUESTION = "question"          # Question for team
 
 # ==========================================
 # 3. AGENT COMMUNICATION HUB [NEW]
@@ -131,6 +260,286 @@ class AgentCommunicationHub:
     async def get_all_artifacts(self) -> Dict[str, str]:
         """Get all published artifacts."""
         return self.shared_artifacts.copy()
+
+# ==========================================
+# 3.5. PERSISTENT BLACKBOARD SYSTEM [NEW]
+# ==========================================
+class BlackboardSystem:
+    """
+    Persistent hierarchical blackboard system backed by Cosmos DB.
+    Supports global posts (visible to all agents) and group posts (visible to specific roles).
+    All posts are immediately persisted to prevent data loss.
+    """
+    def __init__(self, cosmos_manager, project_id: str):
+        self.cosmos_manager = cosmos_manager
+        self.project_id = project_id
+        self.local_cache: List[Dict] = []
+        self.local_cache_by_role: Dict[str, List[Dict]] = {}
+
+    async def post_to_board(self, sender_id: str, target_group: str, content: str, 
+                           post_type: BlackboardPostType, role_of_sender: str = None) -> str:
+        """Post a message to the blackboard (global or group-specific)."""
+        post_id = str(uuid.uuid4())[:8]
+        post = {
+            "id": post_id,
+            "project_id": self.project_id,
+            "sender_id": sender_id,
+            "sender_role": role_of_sender,
+            "target_group": target_group,
+            "content": content,
+            "post_type": post_type.value,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "visible_to_roles": [target_group] if target_group != "all" else []
+        }
+        
+        self.local_cache.append(post)
+        if target_group not in self.local_cache_by_role:
+            self.local_cache_by_role[target_group] = []
+        self.local_cache_by_role[target_group].append(post)
+        
+        try:
+            if self.cosmos_manager:
+                await self.cosmos_manager.save_blackboard_post(self.project_id, post)
+        except Exception as e:
+            logger.warning(f"⚠️  Could not persist blackboard post to Cosmos DB: {e}")
+        
+        return post_id
+
+    async def read_board(self, agent_role: str) -> str:
+        """Fetch posts relevant to this agent's role."""
+        relevant_posts = [
+            p for p in self.local_cache
+            if p["target_group"] == "all" or p["target_group"] == agent_role
+        ]
+        
+        if not relevant_posts:
+            return "📋 Blackboard is currently empty."
+        
+        board_text = "\n" + "="*70 + "\n📋 BLACKBOARD\n" + "="*70 + "\n"
+        for p in sorted(relevant_posts, key=lambda x: x["timestamp"]):
+            scope = "🌍 GLOBAL" if p["target_group"] == "all" else f"👥 {p['target_group'].upper()}"
+            board_text += f"[{p['post_type'].upper()}] {scope} | {p['sender_id']}: {p['content'][:150]}\n"
+        board_text += "="*70
+        return board_text
+
+    async def get_critical_posts(self, agent_role: str) -> List[Dict]:
+        """Get high-priority posts (HANDOFF, QUESTION)."""
+        return [
+            p for p in self.local_cache
+            if (p["target_group"] == "all" or p["target_group"] == agent_role)
+            and p["post_type"] in ["handoff", "question"]
+        ]
+
+# ==========================================
+# 3.6. PLACEHOLDER DETECTION SYSTEM [NEW]
+# ==========================================
+class PlaceholderDetector:
+    """
+    Detects if the LLM returned placeholder code instead of actual implementation.
+    Ensures agents produce production-ready code, not frameworks with TODOs.
+    """
+    
+    PLACEHOLDER_PATTERNS = [
+        "<complete",
+        "<your",
+        "<implementation",
+        "...",
+        "# TODO:",
+        "pass  # TODO",
+        "TODO:",
+        "[Your code here]",
+        "[Implementation here]",
+        "code goes here",
+        "logic here",
+        "finish this",
+        "complete this",
+        "<complete implementation",
+        "# Add your code here"
+    ]
+    
+    @staticmethod
+    def check_for_placeholders(response_text: str) -> Tuple[bool, str]:
+        """
+        Detect if the LLM returned placeholder code.
+        Returns: (has_placeholder, error_message)
+        """
+        response_lower = response_text.lower()
+        
+        for placeholder in PlaceholderDetector.PLACEHOLDER_PATTERNS:
+            if placeholder.lower() in response_lower:
+                # Check if it's in a code block
+                code_blocks = re.findall(r'```[^`]*```', response_text, re.DOTALL)
+                for block in code_blocks:
+                    if placeholder.lower() in block.lower():
+                        return True, f"Placeholder detected: '{placeholder}'"
+        
+        return False, ""
+    
+    @staticmethod
+    def get_placeholder_error_message() -> str:
+        """Generate error message for placeholder code."""
+        return """❌ ERROR: You provided placeholder code instead of actual implementation.
+
+REQUIREMENT:
+- You MUST generate complete, functional code
+- No placeholders like <complete ...>, <implementation>, ..., or TODO comments
+- Every function/class must have actual working code
+- If unsure how to implement something, provide your best attempt
+
+ACTION: Please regenerate the code with full implementation in your next iteration."""
+
+# ==========================================
+# 3.7. INTERACTIVE SHELL [NEW]
+# ==========================================
+async def run_interactive_shell(
+    agents: Dict[str, 'Agent'],
+    ledger: 'TaskLedger',
+    blackboard_manager: 'BlackboardManager',
+    swarm_orchestrator: 'SwarmOrchestrator',
+    project_id: str,
+):
+    """
+    Interactive shell for real-time feedback and control of agents.
+    Runs at the end of main() to allow user to interact with the system.
+    
+    Commands:
+    - status: Show all agents and their progress
+    - blackboard: Display recent central blackboard posts
+    - ask [q]: Post instruction and auto-rerun targeted agents
+    - rerun [role|agent_id]: Explicitly rerun selected agents
+    - trace [off|summary|code|raw]: Set runtime trace mode
+    - exit: Exit the interactive shell
+    """
+    logger.info("\n🎮 Entering interactive mode (press Ctrl+C to exit)...\n")
+    
+    while True:
+        try:
+            user_input = (await asyncio.to_thread(input, "[NEXUS] > ")).strip()
+            command_l = user_input.lower()
+            
+            if not user_input:
+                continue
+            
+            elif command_l in {"exit", "quit"}:
+                logger.info("\n👋 Exiting Agentic Nexus. Goodbye!")
+                break
+            
+            elif command_l == "status":
+                logger.info("\n" + "="*70)
+                logger.info("📊 SWARM STATUS REPORT")
+                logger.info("="*70)
+                completed = len([a for a in agents.values() if a.status == AgentStatus.COMPLETED])
+                waiting = len([a for a in agents.values() if a.status == AgentStatus.WAITING_FOR_RESPONSE])
+                paused = len([a for a in agents.values() if a.status == AgentStatus.PAUSED])
+                failed = len([a for a in agents.values() if a.status == AgentStatus.FAILED])
+                total_files = sum(len(a.generated_code) for a in agents.values())
+                logger.info(f"Agents Completed: {completed}/{len(agents)}")
+                logger.info(f"Waiting: {waiting} | Paused: {paused} | Failed: {failed}")
+                logger.info(f"Total Files Generated: {total_files}")
+                logger.info(f"Trace Mode: {AGENT_TRACE_MODE}")
+                logger.info(f"Project ID: {project_id}")
+                logger.info(f"Service Bus Health: {ServiceBusPublisher.health_snapshot()}")
+                for agent_id, agent in agents.items():
+                    if agent.status == AgentStatus.COMPLETED:
+                        status_icon = "✅"
+                    elif agent.status == AgentStatus.IN_PROGRESS:
+                        status_icon = "⏳"
+                    elif agent.status == AgentStatus.WAITING_FOR_RESPONSE:
+                        status_icon = "📨"
+                    elif agent.status == AgentStatus.PAUSED:
+                        status_icon = "⏸️"
+                    elif agent.status == AgentStatus.FAILED:
+                        status_icon = "❌"
+                    else:
+                        status_icon = "❓"
+                    logger.info(f"  {status_icon} {agent_id}: {agent.status.value} ({len(agent.generated_code)} files)")
+                logger.info("="*70 + "\n")
+            
+            elif command_l == "blackboard":
+                central = blackboard_manager.central_blackboard.messages[-20:]
+                if not central:
+                    logger.info("\n📋 Blackboard is currently empty.\n")
+                else:
+                    logger.info("\n" + "="*70)
+                    logger.info("📋 TEAM CENTRAL BLACKBOARD (LAST 20)")
+                    logger.info("="*70)
+                    for msg in central:
+                        title = str(msg.get("message", {}).get("title", "untitled"))
+                        sender = msg.get("from_agent", "unknown")
+                        priority = msg.get("priority", "normal")
+                        logger.info(f"[{priority.upper()}] {sender}: {title} (ID: {msg.get('id')})")
+                    logger.info("="*70 + "\n")
+            
+            elif command_l.startswith("ask "):
+                question = user_input[4:].strip()
+                role_set = set(agent.role.value for agent in agents.values())
+                target_roles = sorted(extract_target_roles(question, role_set))
+                logger.info(f"\n❓ Broadcasting instruction to team: {question}")
+                await blackboard_manager.broadcast_to_central(
+                    "user",
+                    {
+                        "title": f"User instruction ({', '.join(target_roles)})",
+                        "body": question,
+                        "message_type": "user_instruction",
+                        "target_roles": target_roles,
+                        "requires_action": True,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                    priority="critical",
+                )
+                rerun_result = await swarm_orchestrator.rerun_agents(
+                    agents=agents,
+                    task_context=ledger.data,
+                    timeout_per_agent=AGENT_TIMEOUT_SECONDS,
+                    instruction=question,
+                    target_roles=set(target_roles),
+                )
+                logger.info(
+                    "✅ Instruction routed. "
+                    f"matched={rerun_result.get('matched_agents', 0)}, "
+                    f"scheduled={rerun_result.get('scheduled_agents', 0)}.\n"
+                )
+
+            elif command_l.startswith("rerun "):
+                selector = user_input[6:].strip()
+                rerun_result = await swarm_orchestrator.rerun_agents(
+                    agents=agents,
+                    task_context=ledger.data,
+                    timeout_per_agent=AGENT_TIMEOUT_SECONDS,
+                    instruction=f"Manual rerun requested: {selector}",
+                    selector=selector,
+                )
+                logger.info(
+                    f"\n▶️ Rerun requested for '{selector}'. "
+                    f"matched={rerun_result.get('matched_agents', 0)}, "
+                    f"scheduled={rerun_result.get('scheduled_agents', 0)}.\n"
+                )
+
+            elif command_l.startswith("trace "):
+                mode = user_input[6:].strip().lower()
+                selected = set_agent_trace_mode(mode)
+                logger.info(f"\n🧭 Trace mode set to: {selected}\n")
+
+            elif command_l.startswith("agents "):
+                role_filter = user_input[7:].strip().lower()
+                logger.info("")
+                for agent_id, agent in agents.items():
+                    if role_filter in {agent.role.value, agent_id.lower()}:
+                        logger.info(f"  {agent_id}: {agent.role.value} | {agent.status.value}")
+                logger.info("")
+            
+            else:
+                logger.info(
+                    "\n❓ Unknown command. Type 'status', 'blackboard', 'ask [q]', "
+                    "'rerun [role|agent_id]', 'trace [off|summary|code|raw]', "
+                    "'agents [role]', or 'exit'.\n"
+                )
+        
+        except KeyboardInterrupt:
+            logger.info("\n\n👋 Exiting interactive mode.")
+            break
+        except Exception as e:
+            logger.error(f"\n❌ Error in interactive shell: {e}\n")
 
 # ==========================================
 # 4. TASK LEDGER MODEL (ENHANCED) [cite: 356, 46, 47]
@@ -227,6 +636,7 @@ class AgentRegistry:
             "system_prompt_template": """You are a Backend Engineer Agent in Agentic Nexus.
 Your responsibilities:
 - Design and implement RESTful APIs and microservices
+- Write production-ready backend code (Python, Node.js, Java, etc.)
 - Handle authentication, authorization, and security
 - Implement business logic and data processing
 - Ensure scalability and performance optimization
@@ -236,7 +646,28 @@ Your responsibilities:
 Current Task Context:
 {context}
 
-Provide implementation details in JSON format."""
+CODE OUTPUT MODES (Choose based on context):
+
+MODE 1: FULL FILE (for new files or complete rewrites)
+```filename.py
+<complete working code>
+```
+
+MODE 2: SEARCH/REPLACE (for modifying existing files) ⭐ PREFERRED
+<<<<<<< SEARCH
+filename.py
+    def existing_function():
+        return "old"
+=======
+    def existing_function():
+        return "new"The problem is that the individual agent profiles' prompts are being overridden/supplemented, but they lack the critical MODE 2 (SEARCH/REPLACE) instructions. Let me update all of these to include the dual-mode guidance:
+
+
+>>>>>>> REPLACE
+
+For first iteration: Use MODE 1 (full files)
+For subsequent iterations: Use MODE 2 (atomic edits only)
+MODE 2 is faster, more precise, and reduces token waste."""
         },
         AgentRole.FRONTEND_ENGINEER: {
             "role": AgentRole.FRONTEND_ENGINEER,
@@ -245,6 +676,7 @@ Provide implementation details in JSON format."""
             "system_prompt_template": """You are a Frontend Engineer Agent in Agentic Nexus.
 Your responsibilities:
 - Design and implement responsive user interfaces
+- Write production-ready React/Vue/Angular components
 - Handle client-side state management
 - Implement user authentication and authorization flows
 - Ensure accessibility and performance
@@ -254,7 +686,25 @@ Your responsibilities:
 Current Task Context:
 {context}
 
-Provide design and implementation details in JSON format."""
+CODE OUTPUT MODES (Choose based on context):
+
+MODE 1: FULL FILE (for new files or complete rewrites)
+```App.tsx
+<complete React component code>
+```
+
+MODE 2: SEARCH/REPLACE (for modifying existing files) ⭐ PREFERRED
+<<<<<<< SEARCH
+App.tsx
+    const [count, setCount] = useState(0);
+=======
+    const [count, setCount] = useState(0);
+    const [loading, setLoading] = useState(false);
+>>>>>>> REPLACE
+
+For first iteration: Use MODE 1 (full files)
+For subsequent iterations: Use MODE 2 (atomic edits only)
+MODE 2 is faster, more precise, and reduces token waste."""
         },
         AgentRole.DATABASE_ARCHITECT: {
             "role": AgentRole.DATABASE_ARCHITECT,
@@ -263,6 +713,7 @@ Provide design and implementation details in JSON format."""
             "system_prompt_template": """You are a Database Architect Agent in Agentic Nexus.
 Your responsibilities:
 - Design optimal database schemas (SQL, NoSQL)
+- Write SQL DDL statements and migration scripts
 - Ensure data integrity and consistency
 - Optimize queries and indexing strategies
 - Plan backup and disaster recovery
@@ -272,7 +723,32 @@ Your responsibilities:
 Current Task Context:
 {context}
 
-Provide database design specifications in JSON format."""
+CODE OUTPUT MODES (Choose based on context):
+
+MODE 1: FULL FILE (for new files or complete schema rewrites)
+```schema.sql
+CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255));
+CREATE INDEX idx_user_name ON users(name);
+```
+
+MODE 2: SEARCH/REPLACE (for modifying existing schemas) ⭐ PREFERRED
+<<<<<<< SEARCH
+schema.sql
+    CREATE TABLE users (
+        id INT PRIMARY KEY,
+        name VARCHAR(255)
+    );
+=======
+    CREATE TABLE users (
+        id INT PRIMARY KEY,
+        name VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+>>>>>>> REPLACE
+
+For first iteration: Use MODE 1 (full files)
+For subsequent iterations: Use MODE 2 (atomic edits only)
+MODE 2 is faster, more precise, and reduces token waste."""
         },
         AgentRole.SECURITY_ENGINEER: {
             "role": AgentRole.SECURITY_ENGINEER,
@@ -281,16 +757,38 @@ Provide database design specifications in JSON format."""
             "system_prompt_template": """You are a Security Engineer Agent in Agentic Nexus.
 Your responsibilities:
 - Conduct security threat assessments
+- Implement authentication and encryption strategies
+- Write security configuration code
 - Ensure compliance with regulations (GDPR, HIPAA, SOC2, etc.)
-- Design authentication and encryption strategies
-- Implement secrets management
-- Perform security audits and penetration testing recommendations
+- Design secrets management
+- Perform security audits and recommendations
 - Provide security best practices and guidelines
 
 Current Task Context:
 {context}
 
-Provide security specifications in JSON format."""
+CODE OUTPUT MODES (Choose based on context):
+
+MODE 1: FULL FILE (for new files or complete security implementations)
+```security_config.py
+from cryptography.fernet import Fernet
+<complete security configuration code>
+```
+
+MODE 2: SEARCH/REPLACE (for modifying existing security code) ⭐ PREFERRED
+<<<<<<< SEARCH
+security_config.py
+    def validate_token(token):
+        return True
+=======
+    def validate_token(token):
+        from jwt import decode
+        return decode(token, SECRET_KEY, algorithms=['HS256'])
+>>>>>>> REPLACE
+
+For first iteration: Use MODE 1 (full files)
+For subsequent iterations: Use MODE 2 (atomic edits only)
+MODE 2 is faster, more precise, and reduces token waste."""
         },
         AgentRole.DEVOPS_ENGINEER: {
             "role": AgentRole.DEVOPS_ENGINEER,
@@ -298,17 +796,44 @@ Provide security specifications in JSON format."""
             "specialties": [AgentSpecialty.DEVOPS_CI_CD, AgentSpecialty.AZURE_INFRASTRUCTURE],
             "system_prompt_template": """You are a DevOps Engineer Agent in Agentic Nexus.
 Your responsibilities:
-- Design CI/CD pipelines and automation
+- Design CI/CD pipelines and automation scripts
 - Configure Azure infrastructure (VMs, containers, AKS)
+- Write Infrastructure as Code (IaC) configurations
 - Implement monitoring and logging
 - Handle deployment strategies and rollback procedures
 - Ensure infrastructure security and scalability
-- Implement Infrastructure as Code (IaC)
+- Optimize cloud costs
 
 Current Task Context:
 {context}
 
-Provide DevOps specifications in JSON format."""
+CODE OUTPUT MODES (Choose based on context):
+
+MODE 1: FULL FILE (for new files or complete infrastructure configurations)
+```docker-compose.yml
+version: '3'
+services:
+  app:
+    image: myapp:latest
+```
+
+MODE 2: SEARCH/REPLACE (for modifying existing infrastructure) ⭐ PREFERRED
+<<<<<<< SEARCH
+docker-compose.yml
+    services:
+      app:
+        image: myapp:latest
+=======
+    services:
+      app:
+        image: myapp:latest
+        environment:
+          - LOG_LEVEL=DEBUG
+>>>>>>> REPLACE
+
+For first iteration: Use MODE 1 (full files)
+For subsequent iterations: Use MODE 2 (atomic edits only)
+MODE 2 is faster, more precise, and reduces token waste."""
         },
         AgentRole.QA_ENGINEER: {
             "role": AgentRole.QA_ENGINEER,
@@ -317,7 +842,7 @@ Provide DevOps specifications in JSON format."""
             "system_prompt_template": """You are a QA Engineer Agent in Agentic Nexus.
 Your responsibilities:
 - Design comprehensive testing strategies (unit, integration, E2E)
-- Implement automated test suites
+- Write automated test suites and test code
 - Perform performance and load testing
 - Ensure code quality and coverage
 - Design test data and environments
@@ -326,7 +851,33 @@ Your responsibilities:
 Current Task Context:
 {context}
 
-Provide testing specifications in JSON format."""
+CODE OUTPUT MODES (Choose based on context):
+
+MODE 1: FULL FILE (for new test files or complete test suites)
+```test_unit.py
+import unittest
+class TestMyFunction(unittest.TestCase):
+    def test_basic(self):
+        self.assertTrue(True)
+```
+
+MODE 2: SEARCH/REPLACE (for modifying existing tests) ⭐ PREFERRED
+<<<<<<< SEARCH
+test_unit.py
+    class TestMyFunction(unittest.TestCase):
+        def test_basic(self):
+            self.assertTrue(True)
+=======
+    class TestMyFunction(unittest.TestCase):
+        def test_basic(self):
+            self.assertTrue(True)
+        def test_advanced(self):
+            self.assertEqual(1 + 1, 2)
+>>>>>>> REPLACE
+
+For first iteration: Use MODE 1 (full files)
+For subsequent iterations: Use MODE 2 (atomic edits only)
+MODE 2 is faster, more precise, and reduces token waste."""
         },
         AgentRole.SOLUTION_ARCHITECT: {
             "role": AgentRole.SOLUTION_ARCHITECT,
@@ -340,11 +891,32 @@ Your responsibilities:
 - Plan integration between components
 - Provide best practices and design patterns
 - Coordinate across all agent teams
+- Create architecture diagrams and documentation
 
 Current Task Context:
 {context}
 
-Provide architecture design in JSON format."""
+CODE OUTPUT MODES (Choose based on context):
+
+MODE 1: FULL FILE (for new architecture documentation)
+```architecture.md
+# System Architecture
+## Overview
+Complete microservices architecture with database and API layer.
+```
+
+MODE 2: SEARCH/REPLACE (for updating existing documentation) ⭐ PREFERRED
+<<<<<<< SEARCH
+architecture.md
+# System Architecture
+=======
+# System Architecture v2.0
+Updated with Kubernetes orchestration.
+>>>>>>> REPLACE
+
+For first iteration: Use MODE 1 (full files)
+For subsequent iterations: Use MODE 2 (atomic edits only)
+MODE 2 is faster, more precise, and reduces token waste."""
         },
         AgentRole.API_DESIGNER: {
             "role": AgentRole.API_DESIGNER,
@@ -353,7 +925,7 @@ Provide architecture design in JSON format."""
             "system_prompt_template": """You are an API Designer Agent in Agentic Nexus.
 Your responsibilities:
 - Design RESTful API contracts and specifications
-- Define OpenAPI/Swagger specifications
+- Write OpenAPI/Swagger specifications
 - Plan API versioning and deprecation strategies
 - Ensure API consistency and best practices
 - Design SDK and client libraries
@@ -362,7 +934,40 @@ Your responsibilities:
 Current Task Context:
 {context}
 
-Provide API specifications in JSON format."""
+CODE OUTPUT MODES (Choose based on context):
+
+MODE 1: FULL FILE (for new API specifications)
+```openapi.yaml
+openapi: 3.0.0
+info:
+  title: My API
+  version: 1.0.0
+paths:
+  /users:
+    get:
+      summary: List users
+```
+
+MODE 2: SEARCH/REPLACE (for updating existing API specs) ⭐ PREFERRED
+<<<<<<< SEARCH
+openapi.yaml
+  /users:
+    get:
+      summary: List users
+=======
+  /users:
+    get:
+      summary: List users
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+>>>>>>> REPLACE
+
+For first iteration: Use MODE 1 (full files)
+For subsequent iterations: Use MODE 2 (atomic edits only)
+MODE 2 is faster, more precise, and reduces token waste."""
         },
         AgentRole.ML_ENGINEER: {
             "role": AgentRole.ML_ENGINEER,
@@ -372,16 +977,39 @@ Provide API specifications in JSON format."""
 Your responsibilities:
 - Design AI/ML integration architecture
 - Select and integrate appropriate models (GPT-4o, etc.)
+- Write ML pipeline code and inference endpoints
 - Design prompt engineering strategies
-- Implement ML pipelines and inference endpoints
+- Implement model training and evaluation
 - Optimize model performance and costs
-- Plan monitoring and feedback loops
 - Ensure responsible AI practices
+- Plan monitoring and feedback loops
 
 Current Task Context:
 {context}
 
-Provide ML/AI integration specifications in JSON format."""
+CODE OUTPUT MODES (Choose based on context):
+
+MODE 1: FULL FILE (for new ML pipeline code)
+```ml_pipeline.py
+import azure.ai
+from azure.openai import AzureOpenAI
+client = AzureOpenAI()
+```
+
+MODE 2: SEARCH/REPLACE (for updating existing ML code) ⭐ PREFERRED
+<<<<<<< SEARCH
+ml_pipeline.py
+    client = AzureOpenAI()
+=======
+    client = AzureOpenAI(
+        api_key=os.getenv('AZURE_OPENAI_KEY'),
+        api_version='2024-02-01'
+    )
+>>>>>>> REPLACE
+
+For first iteration: Use MODE 1 (full files)
+For subsequent iterations: Use MODE 2 (atomic edits only)
+MODE 2 is faster, more precise, and reduces token waste."""
         },
     }
 
@@ -394,6 +1022,466 @@ Provide ML/AI integration specifications in JSON format."""
     def get_all_roles() -> List[AgentRole]:
         """Get all available agent roles."""
         return list(AgentRegistry.AGENT_PROFILES.keys())
+
+# ==========================================
+# 4.5. CHECKPOINT MANAGER (Stateful Memory) [NEW]
+# ==========================================
+class CheckpointManager:
+    """
+    Manages agent state persistence across iterations.
+    Enables agents to pause, save state, and resume from checkpoints.
+    """
+    def __init__(self, cosmos_manager):
+        self.cosmos = cosmos_manager
+        self.checkpoints: Dict[str, Dict] = {}  # agent_id -> checkpoint data
+    
+    async def save_checkpoint(self, agent_id: str, state: Dict):
+        """Save agent state to Cosmos DB for resumption."""
+        checkpoint = {
+            "id": f"checkpoint_{agent_id}_{datetime.now(timezone.utc).timestamp()}",
+            "agent_id": agent_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "state": state,
+            "message_history": state.get("message_history", []),
+            "context": state.get("context", {}),
+            "status": state.get("status", "paused")
+        }
+        self.checkpoints[agent_id] = checkpoint
+        logger.info(f"💾 Checkpoint saved for {agent_id}")
+    
+    async def load_checkpoint(self, agent_id: str) -> Optional[Dict]:
+        """Load most recent checkpoint for an agent."""
+        if agent_id in self.checkpoints:
+            return self.checkpoints[agent_id]
+        logger.info(f"📂 No checkpoint found for {agent_id}")
+        return None
+    
+    async def list_checkpoints(self, agent_id: str) -> List[Dict]:
+        """List all checkpoints for an agent."""
+        return [self.checkpoints[agent_id]] if agent_id in self.checkpoints else []
+
+# ==========================================
+# 4.6. HANDOFF & RFC MECHANISM [NEW]
+# ==========================================
+class Handoff:
+    """
+    Represents a request from one agent to another for collaboration.
+    Enables dynamic task transfer and delegation.
+    """
+    def __init__(self, from_agent: str, to_agent: str, context: Dict, required_by: Optional[float] = None):
+        self.id = str(uuid.uuid4())[:8]
+        self.from_agent = from_agent
+        self.to_agent = to_agent
+        self.context = context
+        self.created_at = datetime.now(timezone.utc).isoformat()
+        self.required_by = required_by  # Unix timestamp when result is needed
+        self.status = "PENDING"
+        self.result = None
+    
+    def to_dict(self) -> Dict:
+        return {
+            "id": self.id,
+            "from_agent": self.from_agent,
+            "to_agent": self.to_agent,
+            "context": self.context,
+            "created_at": self.created_at,
+            "required_by": self.required_by,
+            "status": self.status,
+            "result": self.result
+        }
+
+class RequestForComment:
+    """
+    Shared workspace item for agents to post requests and feedback.
+    Enables asynchronous, non-blocking collaboration.
+    """
+    def __init__(self, author: str, title: str, description: str, tags: List[str] = None):
+        self.id = str(uuid.uuid4())[:8]
+        self.author = author
+        self.title = title
+        self.description = description
+        self.tags = tags or []
+        self.created_at = datetime.now(timezone.utc).isoformat()
+        self.comments: List[Dict] = []  # {from_agent, content, timestamp}
+        self.status = "OPEN"
+        self.decisions: Dict[str, str] = {}  # key -> decision made
+    
+    def add_comment(self, from_agent: str, content: str):
+        """Add a comment to the RFC."""
+        self.comments.append({
+            "from_agent": from_agent,
+            "content": content,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+    
+    def to_dict(self) -> Dict:
+        return {
+            "id": self.id,
+            "author": self.author,
+            "title": self.title,
+            "description": self.description,
+            "tags": self.tags,
+            "created_at": self.created_at,
+            "comments": self.comments,
+            "status": self.status,
+            "decisions": self.decisions
+        }
+
+class RoleResolver:
+    """
+    Resolves role names to actual agent instances.
+    Enables handoffs using role names instead of specific instance IDs.
+    Provides load balancing across multiple instances of the same role.
+    """
+    def __init__(self, agents: Dict[str, 'Agent']):
+        self.agents = agents
+        self.agent_workload: Dict[str, int] = {agent_id: 0 for agent_id in agents.keys()}
+    
+    def resolve_role_to_agent(self, role_name: str) -> Optional[str]:
+        """
+        Find the best available agent instance for a given role.
+        Returns agent_id of the least-busy agent, or None if role not found.
+        """
+        candidates = [
+            agent_id for agent_id, agent in self.agents.items()
+            if agent.role.value == role_name
+        ]
+        
+        if not candidates:
+            logger.warning(f"⚠️  No agents found for role: {role_name}")
+            return None
+        
+        # Return agent with lowest workload
+        best_agent = min(candidates, key=lambda aid: self.agent_workload.get(aid, 0))
+        logger.info(f"✅ Role '{role_name}' resolved to agent {best_agent}")
+        return best_agent
+    
+    def mark_workload(self, agent_id: str, delta: int = 1):
+        """Update workload for an agent (delta can be positive or negative)."""
+        if agent_id in self.agent_workload:
+            self.agent_workload[agent_id] += delta
+
+class CollaborationBus:
+    """
+    Shared message bus for agents to post handoffs and RFCs.
+    Enables dynamic, non-blocking inter-agent communication.
+    Now supports role-based handoff routing via RoleResolver.
+    Persists all communications to Cosmos DB for audit trails.
+    """
+    def __init__(self, role_resolver: Optional[RoleResolver] = None, cosmos_manager=None, project_id: str = None):
+        self.handoffs: Dict[str, Handoff] = {}
+        self.rfcs: Dict[str, RequestForComment] = {}
+        self.pending_for_agent: Dict[str, List[str]] = {}  # agent_id -> [handoff_ids]
+        self.role_resolver = role_resolver
+        self.cosmos_manager = cosmos_manager  # For persisting communications
+        self.project_id = project_id  # For organizing in Cosmos DB
+    
+    def set_role_resolver(self, role_resolver: RoleResolver):
+        """Set the role resolver after initialization."""
+        self.role_resolver = role_resolver
+    
+    async def post_handoff(self, handoff: Handoff) -> str:
+        """
+        Post a handoff request to the bus AND Azure Service Bus.
+        Automatically resolves role names to agent instances if needed.
+        """
+        target_agent_id = handoff.to_agent
+        
+        # Check if target_agent is a role name (not a specific instance ID)
+        if self.role_resolver and "_" not in handoff.to_agent:
+            # Likely a role name like "backend_engineer"
+            resolved_id = self.role_resolver.resolve_role_to_agent(handoff.to_agent)
+            if resolved_id:
+                target_agent_id = resolved_id
+                logger.info(f"🔄 Resolved role '{handoff.to_agent}' to instance '{target_agent_id}'")
+            else:
+                logger.error(f"❌ Could not resolve role '{handoff.to_agent}' to any agent instance")
+                return None
+        
+        # Update handoff with resolved target
+        handoff.to_agent = target_agent_id
+        
+        self.handoffs[handoff.id] = handoff
+        if target_agent_id not in self.pending_for_agent:
+            self.pending_for_agent[target_agent_id] = []
+        self.pending_for_agent[target_agent_id].append(handoff.id)
+        
+        # Mark workload
+        if self.role_resolver:
+            self.role_resolver.mark_workload(target_agent_id, delta=1)
+        
+        logger.info(f"🤝 [HANDOFF] {handoff.from_agent[:20]} → {target_agent_id[:20]} | Status: {handoff.status} (ID: {handoff.id})")
+        
+        # Persist to Cosmos DB if available
+        if self.cosmos_manager and self.project_id:
+            try:
+                self.cosmos_manager.save_handoff(self.project_id, handoff)
+            except Exception as e:
+                logger.warning(f"⚠️  Could not persist handoff to Cosmos DB: {e}")
+        
+        # Publish to Azure Service Bus for cross-service visibility (best effort)
+        published = await ServiceBusPublisher.publish_json(
+            "topic",
+            "agent-handoff-topic",
+            {
+                "handoff_id": handoff.id,
+                "from_agent": handoff.from_agent,
+                "to_agent": target_agent_id,
+                "title": handoff.context.get("title", "handoff"),
+                "status": handoff.status,
+                "context": handoff.context,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        if not published:
+            logger.info("ℹ️  Continuing without Service Bus handoff publish (local/Cosmos persisted)")
+        
+        return handoff.id
+    
+    async def get_pending_handoffs(self, agent_id: str) -> List[Handoff]:
+        """Get all pending handoffs for an agent."""
+        handoff_ids = self.pending_for_agent.get(agent_id, [])
+        handoffs = [self.handoffs[hid] for hid in handoff_ids if hid in self.handoffs]
+        return handoffs
+    
+    async def complete_handoff(self, handoff_id: str, result: Dict):
+        """Mark a handoff as complete with result."""
+        if handoff_id in self.handoffs:
+            self.handoffs[handoff_id].status = "COMPLETED"
+            self.handoffs[handoff_id].result = result
+            logger.info(f"✅ Handoff completed: {handoff_id}")
+    
+    async def post_rfc(self, rfc: RequestForComment) -> str:
+        """Post an RFC to the shared workspace AND Azure Service Bus."""
+        self.rfcs[rfc.id] = rfc
+        logger.info(f"📝 [RFC] {rfc.title[:50]} (Author: {rfc.author[:20]}, ID: {rfc.id})")
+        
+        # Persist to Cosmos DB if available
+        if self.cosmos_manager and self.project_id:
+            try:
+                self.cosmos_manager.save_rfc(self.project_id, rfc)
+            except Exception as e:
+                logger.warning(f"⚠️  Could not persist RFC to Cosmos DB: {e}")
+        
+        # Publish to Azure Service Bus for cross-service visibility (best effort)
+        published = await ServiceBusPublisher.publish_json(
+            "topic",
+            "agent-rfc-topic",
+            {
+                "rfc_id": rfc.id,
+                "author": rfc.author,
+                "title": rfc.title,
+                "description": rfc.description[:500],
+                "tags": rfc.tags,
+                "timestamp": rfc.created_at,
+            },
+        )
+        if not published:
+            logger.info("ℹ️  Continuing without Service Bus RFC publish (local/Cosmos persisted)")
+        
+        return rfc.id
+    
+    async def get_rfcs_for_agent(self, agent_id: str, tag: str = None) -> List[RequestForComment]:
+        """Get RFCs relevant to an agent (optionally filtered by tag)."""
+        rfcs = list(self.rfcs.values())
+        if tag:
+            rfcs = [r for r in rfcs if tag in r.tags]
+        # Return RFCs authored by or mentioning this agent
+        return rfcs
+
+# ==========================================
+# 4.7. BLACKBOARD SYSTEM (Azure Service Bus) [NEW]
+# ==========================================
+class Blackboard:
+    """
+    Shared communication board for agents to post messages.
+    Uses Azure Service Bus Topics for pub/sub communication.
+    """
+    def __init__(self, topic_name: str, subscription_name: str = None):
+        self.topic_name = topic_name
+        self.subscription_name = subscription_name or f"sub_{topic_name}_{str(uuid.uuid4())[:6]}"
+        self.messages: List[Dict] = []  # In-memory cache
+        self.last_checked: Dict[str, datetime] = {}  # Track who checked last
+    
+    async def post_message(self, from_agent: str, message: Dict, priority: str = "normal"):
+        """Post a message to the blackboard."""
+        entry = {
+            "id": str(uuid.uuid4())[:8],
+            "from_agent": from_agent,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message": message,
+            "priority": priority,  # "critical", "high", "normal", "low"
+            "read_by": []
+        }
+        self.messages.append(entry)
+        priority_icon = "🔴" if priority == "critical" else "🟡" if priority == "high" else "🔵"
+        logger.info(f"{priority_icon} [BLACKBOARD: {self.topic_name}] {from_agent} → '{message.get('title', 'untitled')[:40]}' (ID: {entry['id']})")
+        return entry["id"]
+    
+    async def get_new_messages(self, agent_id: str) -> List[Dict]:
+        """Get messages posted since agent last checked."""
+        last_check = self.last_checked.get(agent_id, datetime.min.replace(tzinfo=timezone.utc))
+        new_messages = [
+            msg for msg in self.messages
+            if datetime.fromisoformat(msg["timestamp"]) > last_check
+            and agent_id not in msg["read_by"]
+        ]
+        
+        # Mark as read
+        for msg in new_messages:
+            msg["read_by"].append(agent_id)
+        
+        self.last_checked[agent_id] = datetime.now(timezone.utc)
+        if new_messages:
+            logger.info(f"📬 [{self.topic_name}] {agent_id} retrieved {len(new_messages)} new message(s)")
+        return new_messages
+    
+    async def get_critical_messages(self, agent_id: str) -> List[Dict]:
+        """Get only critical priority messages."""
+        critical = [msg for msg in self.messages if msg["priority"] == "critical"]
+        return [msg for msg in critical if agent_id not in msg["read_by"]]
+    
+    def to_dict(self) -> Dict:
+        """Convert blackboard state to dict for persistence."""
+        return {
+            "topic_name": self.topic_name,
+            "message_count": len(self.messages),
+            "messages": self.messages[-20:]  # Keep last 20
+        }
+
+class BlackboardManager:
+    """
+    Manages all blackboards (central + group-based).
+    Central blackboard: All agents read/write
+    Group blackboards: Only dependent agents communicate
+    Persists all communications to Cosmos DB for future audits.
+    """
+    def __init__(self, cosmos_manager=None, project_id: str = None):
+        self.central_blackboard = Blackboard("team-central")
+        self.group_blackboards: Dict[str, Blackboard] = {}  # group_id -> Blackboard
+        self.agent_groups: Dict[str, Set[str]] = {}  # agent_id -> {group_ids}
+        self.cosmos_manager = cosmos_manager  # For persisting communications
+        self.project_id = project_id  # For organizing in Cosmos DB
+        self._consumer_task: Optional[asyncio.Task] = None
+    
+    async def create_group_blackboard(self, group_id: str, agent_ids: Set[str]):
+        """Create a blackboard for a specific group of dependent agents."""
+        self.group_blackboards[group_id] = Blackboard(f"group-{group_id}")
+        for agent_id in agent_ids:
+            if agent_id not in self.agent_groups:
+                self.agent_groups[agent_id] = set()
+            self.agent_groups[agent_id].add(group_id)
+        logger.info(f"📋 [GROUP BLACKBOARD] Created '{group_id}' for {len(agent_ids)} agents: {', '.join(agent_ids)}")
+    
+    async def broadcast_to_central(self, from_agent: str, message: Dict, priority: str = "normal"):
+        """Post message to central blackboard (visible to all agents) and persist to Cosmos DB."""
+        message_id = await self.central_blackboard.post_message(from_agent, message, priority)
+        
+        # Persist to Cosmos DB if available
+        if self.cosmos_manager and self.project_id:
+            try:
+                message_data = {
+                    "id": message_id,
+                    "from_agent": from_agent,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "message": message,
+                    "priority": priority
+                }
+                self.cosmos_manager.save_blackboard_message(self.project_id, "team-central", message_data)
+            except Exception as e:
+                logger.warning(f"⚠️  Could not persist blackboard message to Cosmos DB: {e}")
+        
+        return message_id
+    
+    async def post_to_group(self, group_id: str, from_agent: str, message: Dict, priority: str = "normal"):
+        """Post message to specific group blackboard and persist to Cosmos DB."""
+        if group_id not in self.group_blackboards:
+            logger.warning(f"⚠️  Group blackboard {group_id} not found")
+            return None
+        
+        message_id = await self.group_blackboards[group_id].post_message(from_agent, message, priority)
+        
+        # Persist to Cosmos DB if available
+        if self.cosmos_manager and self.project_id:
+            try:
+                message_data = {
+                    "id": message_id,
+                    "from_agent": from_agent,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "message": message,
+                    "priority": priority
+                }
+                self.cosmos_manager.save_blackboard_message(self.project_id, group_id, message_data)
+            except Exception as e:
+                logger.warning(f"⚠️  Could not persist group message to Cosmos DB: {e}")
+        
+        return message_id
+    
+    async def get_agent_messages(self, agent_id: str) -> Dict:
+        """Get all messages for an agent (central + group blackboards)."""
+        messages = {
+            "central": await self.central_blackboard.get_new_messages(agent_id),
+            "groups": {}
+        }
+        
+        # Get messages from all group blackboards agent is in
+        for group_id in self.agent_groups.get(agent_id, set()):
+            messages["groups"][group_id] = await self.group_blackboards[group_id].get_new_messages(agent_id)
+        
+        return messages
+    
+    async def get_critical_messages(self, agent_id: str) -> List[Dict]:
+        """Get critical messages from all blackboards."""
+        critical = await self.central_blackboard.get_critical_messages(agent_id)
+        
+        for group_id in self.agent_groups.get(agent_id, set()):
+            critical.extend(await self.group_blackboards[group_id].get_critical_messages(agent_id))
+        
+        return critical
+
+    async def start_service_bus_sync(self):
+        """Optionally ingest coordination queue events into central blackboard."""
+        if not ENABLE_SERVICE_BUS_CONSUMER or not SERVICE_BUS_STR or self._consumer_task:
+            return
+        self._consumer_task = asyncio.create_task(self._consume_coordination_events())
+        logger.info("📡 Service Bus consumer started for coordination event sync")
+
+    async def stop_service_bus_sync(self):
+        """Stop background Service Bus consumer task."""
+        if self._consumer_task:
+            self._consumer_task.cancel()
+            try:
+                await self._consumer_task
+            except asyncio.CancelledError:
+                pass
+            self._consumer_task = None
+
+    async def _consume_coordination_events(self):
+        while True:
+            try:
+                async with ServiceBusClient.from_connection_string(SERVICE_BUS_STR) as sb:
+                    receiver: ServiceBusReceiver = sb.get_queue_receiver(
+                        queue_name=AGENT_EXECUTION_QUEUE,
+                        max_wait_time=5,
+                    )
+                    async with receiver:
+                        async for message in receiver:
+                            payload = str(message)
+                            await self.broadcast_to_central(
+                                "service_bus_sync",
+                                {
+                                    "title": "Service Bus Coordination Event",
+                                    "body": payload[:800],
+                                    "message_type": "service_bus_sync",
+                                },
+                                priority="low",
+                            )
+                            await receiver.complete_message(message)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"⚠️  Service Bus consumer loop issue: {e}")
+                await asyncio.sleep(2)
 
 # ==========================================
 # 5. DIRECTOR AI (Enhanced) [cite: 335, 343]
@@ -536,134 +1624,919 @@ CRITICAL RULES:
 # ==========================================
 class Agent:
     """
-    Base Agent class representing a specialized worker in the system.
-    Each agent is spawned with a specific role and operational context.
-    NOW: Generates actual production-ready code and communicates with other agents.
+    Iterative Agent class with persistent memory, blackboard integration, and error recovery.
+    Supports pause/resume, handoffs, and dynamic collaboration via the swarm model.
     """
     
-    def __init__(self, agent_id: str, role: AgentRole, project_context: Dict, comm_hub: AgentCommunicationHub, dependencies: List[str] = None):
+    def __init__(self, agent_id: str, role: AgentRole, project_context: Dict, comm_hub: AgentCommunicationHub, 
+                 collaboration_bus: CollaborationBus, checkpoint_manager: CheckpointManager, 
+                 blackboard_manager: BlackboardManager, cosmos_manager=None, dependencies: List[str] = None):
         self.agent_id = agent_id
         self.role = role
         self.project_context = project_context
         self.comm_hub = comm_hub
+        self.collaboration_bus = collaboration_bus
+        self.checkpoint_manager = checkpoint_manager
+        self.blackboard_manager = blackboard_manager
+        self.cosmos_manager = cosmos_manager
         self.dependencies = dependencies or []
-        self.status = "CREATED"
+        self.status = AgentStatus.CREATED
         self.created_at = datetime.now(timezone.utc).isoformat()
         self.outputs = {}
         self.generated_code = {}  # filename -> code content
+        self.change_logs: Dict[str, FileChangeLog] = {}  # filename -> change history
+        self.message_history: List[Dict] = []  # Full conversation history
+        self.iteration_count = 0
+        self.pending_handoffs: List[Handoff] = []
+        self.last_error = None  # Track last error for recovery
+        self.work_completed = False  # Flag to track task completion
+        self.agent_dir = None  # Directory for this agent's files (with UUID)
         self.client = AzureOpenAI(
             api_key=AZURE_OPENAI_KEY,
             api_version=AZURE_OPENAI_API_VERSION,
             azure_endpoint=AZURE_OPENAI_ENDPOINT
         )
-        logger.info(f"✨ Agent spawned: {self.agent_id} ({role.value})")
+        logger.info(f"✨ Agent spawned: {self.agent_id} ({role.value}) - COPILOT EDIT MODE")
 
-    async def execute(self, task_context: Dict) -> Dict:
-        """Execute the agent's task and generate actual production-ready code."""
-        self.status = "IN_PROGRESS"
-        logger.info(f"🔄 Agent {self.agent_id} generating code...")
+    def _trace(self, event: str, details: Optional[Dict[str, Any]] = None):
+        """Runtime trace output with configurable verbosity."""
+        if AGENT_TRACE_MODE == "off":
+            return
+        details = details or {}
+        if AGENT_TRACE_MODE == "summary":
+            compact = ", ".join(f"{k}={v}" for k, v in details.items())
+            logger.info(f"🧭 [TRACE] {self.agent_id} | {event} | {compact}")
+        elif AGENT_TRACE_MODE == "code":
+            if "code_excerpt" in details:
+                logger.info(f"🧭 [TRACE] {self.agent_id} | {event}\n{details['code_excerpt'][:1000]}")
+            else:
+                logger.info(f"🧭 [TRACE] {self.agent_id} | {event} | {details}")
+        else:
+            logger.info(f"🧭 [TRACE-RAW] {self.agent_id} | {event} | {details}")
+
+    def _is_coding_role(self) -> bool:
+        return self.role.value in CODING_PHASE_ROLES
+
+    def _build_execution_contract(self, task_context: Dict) -> str:
+        """Build mandatory execution contract from ledger + user instructions on blackboard."""
+        functional_reqs = task_context.get("functional_requirements", []) or []
+        user_intent = task_context.get("user_intent", "")
+        relevant_instructions: List[str] = []
+
+        for msg in self.blackboard_manager.central_blackboard.messages:
+            content = msg.get("message", {})
+            if not isinstance(content, dict):
+                continue
+            from_agent = msg.get("from_agent", "")
+            target_roles = content.get("target_roles", [])
+            targeted = not target_roles or self.role.value in target_roles
+            if content.get("message_type") == "user_instruction" and targeted:
+                body = content.get("body") or content.get("title")
+                if body:
+                    relevant_instructions.append(str(body))
+            elif from_agent == "user":
+                body = content.get("body") or content.get("title")
+                if body:
+                    relevant_instructions.append(str(body))
+
+        role_expectations = self._derive_role_expectations(" ".join(relevant_instructions))
+        lines = [
+            "MANDATORY EXECUTION CONTRACT:",
+            f"- Role: {self.role.value}",
+            f"- User intent: {user_intent[:250]}",
+        ]
+        if functional_reqs:
+            lines.append("- Functional requirements from ledger:")
+            lines.extend([f"  - {str(r)[:220]}" for r in functional_reqs[:12]])
+        if relevant_instructions:
+            lines.append("- User instructions from blackboard:")
+            lines.extend([f"  - {instr[:220]}" for instr in relevant_instructions[-8:]])
+        if role_expectations:
+            lines.append("- Non-negotiable deliverables for your role:")
+            lines.extend([f"  - {e}" for e in role_expectations])
+        lines.append("- You must not output [COMPLETED] until all applicable deliverables are implemented.")
+        return "\n".join(lines)
+
+    def _derive_role_expectations(self, instruction_blob: str) -> List[str]:
+        instruction_blob = (instruction_blob or "").lower()
+        expectations: List[str] = []
+        if self.role == AgentRole.BACKEND_ENGINEER:
+            expectations.extend([
+                "Implement at least 3 backend artifacts (server + route/service modules).",
+                "Include concrete user and document APIs/services.",
+            ])
+            if "user service" in instruction_blob:
+                expectations.append("Implement explicit User Service module and wire into routes.")
+            if "document service" in instruction_blob:
+                expectations.append("Implement explicit Document Service module and wire into routes.")
+        elif self.role == AgentRole.FRONTEND_ENGINEER:
+            expectations.extend([
+                "Implement at least 3 frontend artifacts (app shell + pages/components).",
+                "Use React routing and include dashboard flow.",
+            ])
+            if "redux" in instruction_blob:
+                expectations.append("Add Redux store setup and connect at least one slice/selector.")
+        elif self.role == AgentRole.QA_ENGINEER:
+            expectations.append("Provide concrete test files, not only RFC/comments.")
+        elif self.role == AgentRole.ML_ENGINEER:
+            expectations.append("Provide concrete ML integration code (pipeline or inference endpoint).")
+        return expectations
+
+    def _contains_any(self, text: str, patterns: List[str]) -> bool:
+        t = text.lower()
+        return any(p.lower() in t for p in patterns)
+
+    def _check_completion_readiness(self, task_context: Dict) -> Tuple[bool, List[str]]:
+        """Role-aware completion gate to prevent shallow outputs."""
+        missing: List[str] = []
+        files = list(self.generated_code.keys())
+        all_text = "\n".join(self.generated_code.values()).lower()
+        instruction_blob = self._build_execution_contract(task_context).lower()
+
+        if self._is_coding_role() and not files:
+            missing.append("No files generated for coding role.")
+            return False, missing
+
+        if self.role == AgentRole.BACKEND_ENGINEER:
+            if len(files) < 3:
+                missing.append("Backend requires at least 3 files (server + modules).")
+            if not self._contains_any(all_text + " " + " ".join(files), ["user service", "/users", "usersrouter", "userrouter"]):
+                missing.append("Missing concrete user service/routes.")
+            if not self._contains_any(all_text + " " + " ".join(files), ["document service", "/documents", "documentsrouter", "documentrouter"]):
+                missing.append("Missing concrete document service/routes.")
+            if "user service" in instruction_blob and "user service" not in all_text:
+                missing.append("Blackboard asked for User Service explicitly; not found.")
+            if "document service" in instruction_blob and "document service" not in all_text:
+                missing.append("Blackboard asked for Document Service explicitly; not found.")
+        elif self.role == AgentRole.FRONTEND_ENGINEER:
+            if len(files) < 3:
+                missing.append("Frontend requires at least 3 files (app + pages/components).")
+            if not self._contains_any(all_text + " " + " ".join(files), ["dashboard", "/dashboard"]):
+                missing.append("Missing dashboard implementation.")
+            if "redux" in instruction_blob and "redux" not in all_text:
+                missing.append("Blackboard asked for Redux; no Redux usage found.")
+        elif self.role == AgentRole.QA_ENGINEER:
+            if not any(fn.startswith("test") or "spec" in fn or "test" in fn for fn in files):
+                missing.append("QA role requires test artifacts.")
+        elif self.role == AgentRole.ML_ENGINEER:
+            if not self._contains_any(all_text + " " + " ".join(files), ["inference", "pipeline", "model", "predict"]):
+                missing.append("ML role requires pipeline/inference artifacts.")
+
+        return len(missing) == 0, missing
+
+    async def execute_iteratively(self, task_context: Dict) -> Dict:
+        """
+        Execute the agent in an iterative loop with error recovery and persistent state.
+        Agents loop until they explicitly output [COMPLETED].
+        """
+        self.status = AgentStatus.IN_PROGRESS
+        max_iterations = MAX_AGENT_ITERATIONS
         
+        while self.status == AgentStatus.IN_PROGRESS and self.iteration_count < max_iterations:
+            self.iteration_count += 1
+            logger.info(f"🔄 Agent {self.agent_id} iteration {self.iteration_count}/{max_iterations}")
+            
+            try:
+                # Step 0a: Check for completed dependencies - AUTO-WAKE if dependencies finished
+                dependencies_ready = await self._check_and_report_dependencies()
+                if dependencies_ready and self.status == AgentStatus.PAUSED:
+                    logger.info(f"🔄 ⚡ {self.agent_id} dependencies completed - RESUMING WORK")
+                    self.status = AgentStatus.IN_PROGRESS
+                    # Add dependency completion notice to context
+                    self.message_history.append({
+                        "role": "system",
+                        "content": "Your dependencies have completed. You can now proceed with your work."
+                    })
+                
+                # Step 0b: Check blackboards for critical messages
+                critical_msgs = await self.blackboard_manager.get_critical_messages(self.agent_id)
+                if critical_msgs:
+                    logger.info(f"🔔 {self.agent_id} received {len(critical_msgs)} critical message(s)")
+                    for msg in critical_msgs:
+                        self.message_history.append({
+                            "role": "system",
+                            "content": f"CRITICAL UPDATE FROM TEAM: {msg['message']}"
+                        })
+                
+                # Step 1: Check for pending handoffs to process
+                pending = await self.collaboration_bus.get_pending_handoffs(self.agent_id)
+                if pending:
+                    logger.info(f"📨 {self.agent_id} has {len(pending)} pending handoff(s)")
+                    for handoff in pending:
+                        await self._process_handoff(handoff)
+                    continue  # Re-evaluate after handling handoff
+                
+                # Step 2: Generate next step with AI
+                execution_contract = self._build_execution_contract(task_context)
+                if not self.message_history or self.message_history[-1].get("content", "") != execution_contract:
+                    self.message_history.append({
+                        "role": "system",
+                        "content": execution_contract
+                    })
+                response_text = await self._get_ai_response(task_context)
+                trace_payload: Dict[str, Any] = {"iteration": self.iteration_count, "chars": len(response_text)}
+                if AGENT_TRACE_MODE in {"code", "raw"}:
+                    trace_payload["code_excerpt"] = response_text[:2000]
+                self._trace("ai_response", trace_payload)
+                
+                # Step 3: Check for explicit completion directive
+                if "[COMPLETED]" in response_text or "TASK_COMPLETED:" in response_text:
+                    if REQUIRE_OUTPUT_FOR_COMPLETION and self._is_coding_role() and len(self.generated_code) == 0:
+                        self.message_history.append({
+                            "role": "system",
+                            "content": (
+                                "Completion rejected: coding role cannot complete with zero generated files. "
+                                "Generate at least one concrete artifact before [COMPLETED]."
+                            ),
+                        })
+                        self._trace(
+                            "completion_rejected",
+                            {"reason": "no_output", "role": self.role.value, "files": len(self.generated_code)},
+                        )
+                        continue
+                    ready, missing = self._check_completion_readiness(task_context)
+                    if not ready:
+                        self.message_history.append({
+                            "role": "system",
+                            "content": (
+                                "Completion rejected. Missing required deliverables:\n- " +
+                                "\n- ".join(missing) +
+                                "\nContinue implementation and only then output [COMPLETED]."
+                            ),
+                        })
+                        self._trace(
+                            "completion_rejected",
+                            {"reason": "deliverables_missing", "missing": len(missing)},
+                        )
+                        continue
+                    logger.info(f"✅ Agent {self.agent_id} explicitly marked task completed")
+                    self._trace("directive_detected", {"directive": "COMPLETED"})
+                    self.work_completed = True
+                    self.status = AgentStatus.COMPLETED
+                    
+                    # Post completion to blackboard so dependent agents can wake up
+                    try:
+                        completion_msg = {
+                            "title": f"[COMPLETED] {self.role.value} task",
+                            "body": f"Agent {self.agent_id} ({self.role.value}) has completed its work after {self.iteration_count} iterations with {len(self.generated_code)} files generated.",
+                            "from_agent": self.agent_id,
+                            "role": self.role.value,
+                            "files_generated": len(self.generated_code),
+                            "agent_id": self.agent_id,
+                            "status": "COMPLETED"
+                        }
+                        await self.blackboard_manager.broadcast_to_central(self.agent_id, completion_msg, priority="high")
+                        logger.info(f"📢 Posted completion message to blackboard for {self.role.value}")
+                    except Exception as e:
+                        logger.warning(f"Could not post completion to blackboard: {e}")
+                    
+                    break
+                
+                # Step 4: Parse response for control flow
+                if "PAUSE_FOR_USER:" in response_text:
+                    self._trace("directive_detected", {"directive": "PAUSE_FOR_USER"})
+                    pause_reason = response_text.split("PAUSE_FOR_USER:")[-1].split("\n")[0].strip()
+                    logger.info(f"⏸️  Agent {self.agent_id} paused: {pause_reason}")
+                    self.status = AgentStatus.PAUSED
+                    await self._save_checkpoint(pause_reason)
+                    break
+                
+                elif "HANDOFF_TO:" in response_text:
+                    self._trace("directive_detected", {"directive": "HANDOFF_TO"})
+                    target_agent = await self._extract_handoff_target(response_text)
+                    if target_agent:
+                        logger.info(f"🤝 Agent {self.agent_id} requesting handoff to {target_agent}")
+                        handoff = Handoff(
+                            from_agent=self.agent_id,
+                            to_agent=target_agent,
+                            context={"iteration": self.iteration_count, "message": response_text}
+                        )
+                        await self.collaboration_bus.post_handoff(handoff)
+                        self.status = AgentStatus.WAITING_FOR_RESPONSE
+                        break
+                    
+                elif "REQUEST_COMMENT:" in response_text or "[RFC]" in response_text:
+                    # Block RFC posting until iteration 4+ to force code generation first
+                    if self.iteration_count <= 3:
+                        self.message_history.append({
+                            "role": "system",
+                            "content": (
+                                "RFC blocked: Cannot post [RFC] during iterations 1-3. "
+                                "Focus on generating actual code first. After iteration 3, RFCs are allowed."
+                            ),
+                        })
+                        self._trace("rfc_blocked", {"reason": "too_early", "iteration": self.iteration_count})
+                        continue  # Skip RFC and go to next iteration to generate code
+                    
+                    self._trace("directive_detected", {"directive": "RFC"})
+                    rfc_title = await self._extract_rfc_title(response_text)
+                    rfc = RequestForComment(
+                        author=self.agent_id,
+                        title=rfc_title,
+                        description=response_text,
+                        tags=[self.role.value]
+                    )
+                    await self.collaboration_bus.post_rfc(rfc)
+                    logger.info(f"📝 Agent {self.agent_id} posted RFC: {rfc_title}")
+                    if RFC_BLOCKING_MODE:
+                        self.status = AgentStatus.WAITING_FOR_RESPONSE
+                        break
+                    self.message_history.append({
+                        "role": "system",
+                        "content": "RFC posted. Continue implementing deliverables unless explicitly blocked."
+                    })
+                    continue
+                
+                # Step 5: Normal execution - parse code and validate (with error recovery)
+                # FIRST: Check for placeholder code
+                has_placeholder, placeholder_msg = PlaceholderDetector.check_for_placeholders(response_text)
+                if has_placeholder:
+                    error_msg = PlaceholderDetector.get_placeholder_error_message()
+                    self.message_history.append({
+                        "role": "system",
+                        "content": error_msg
+                    })
+                    logger.warning(f"⚠️  {placeholder_msg} in {self.agent_id}")
+                    continue  # Skip to next iteration and ask for real code
+                
+                try:
+                    parse_info = self._parse_and_save_code(response_text)
+                    self.last_error = None  # Clear error on success
+                    self._trace("parse_result", parse_info)
+                except Exception as e:
+                    logger.warning(f"⚠️  Error parsing code for {self.agent_id}: {e}")
+                    self.last_error = str(e)
+                    # Provide specific feedback to agent about the error
+                    error_feedback = f"""ERROR in code processing:
+Type: {type(e).__name__}
+Details: {str(e)}
+
+CORRECTIVE ACTION REQUIRED:
+1. Review the code block formatting - ensure each file is wrapped in triple backticks
+2. Format: ```filename.ext
+3. Include the complete, valid code
+4. End with closing backticks ```
+5. Retry the code generation with proper formatting"""
+                    self.message_history.append({
+                        "role": "system",
+                        "content": error_feedback
+                    })
+                    continue  # Skip to next iteration
+                
+                self._extract_metadata_and_communicate(response_text)
+                
+                # PERSIST MESSAGE HISTORY after successful code generation
+                project_id = self.project_context.get("project_id", "unknown")
+                if hasattr(self, 'cosmos_manager') and self.cosmos_manager:
+                    await self.cosmos_manager.save_message_history(
+                        project_id,
+                        self.agent_id,
+                        self.iteration_count,
+                        self.message_history
+                    )
+                    
+                    # PERSIST FILE CHANGE LOGS for audit trail and undo capability
+                    for filename, changelog in self.change_logs.items():
+                        await self.cosmos_manager.save_file_change_log(
+                            project_id,
+                            self.agent_id,
+                            filename,
+                            changelog
+                        )
+                
+                # Step 6: Run validation
+                validation_result = await self._run_validation()
+                self._trace(
+                    "validation",
+                    {
+                        "success": validation_result.get("success"),
+                        "issues": len(validation_result.get("issues", [])),
+                    },
+                )
+                if not validation_result["success"]:
+                    # Provide validation feedback to agent
+                    issues_text = "\n".join([
+                        f"  - {issue['file']}: {issue['message']}"
+                        for issue in validation_result.get('issues', [])
+                    ])
+                    validation_feedback = f"""VALIDATION ISSUES FOUND:
+{issues_text}
+
+REQUIRED ACTIONS:
+1. Review each issue carefully
+2. Fix syntax errors and import problems
+3. Ensure all code follows Python best practices
+4. Regenerate the code in the next iteration"""
+                    self.message_history.append({
+                        "role": "system",
+                        "content": validation_feedback
+                    })
+                    logger.info(f"ℹ️  Validation note: {validation_result.get('feedback', 'continue')}")
+                else:
+                    logger.info(f"✓ Validation passed for {self.agent_id}")
+
+                
+                # Step 7: Continue to next iteration for refinement
+                logger.info(f"→ Agent {self.agent_id} continuing to refine work...")
+                    
+            except Exception as e:
+                logger.error(f"❌ Agent {self.agent_id} error in iteration {self.iteration_count}: {str(e)}")
+                self.last_error = str(e)
+                # Provide error context to agent for recovery
+                error_context = f"""ITERATION ERROR - Agent recovery required:
+Error Type: {type(e).__name__}
+Message: {str(e)}
+
+RECOVERY INSTRUCTIONS:
+1. The previous operation failed unexpectedly
+2. Review your last response for issues
+3. Try a different approach in the next iteration
+4. If the issue persists, simplify your approach
+
+You have {max_iterations - self.iteration_count} iterations remaining."""
+                self.message_history.append({
+                    "role": "system",
+                    "content": error_context
+                })
+                # Continue to next iteration instead of failing immediately
+                if self.iteration_count < max_iterations:
+                    logger.info(f"→ Agent {self.agent_id} will attempt recovery in next iteration...")
+                    continue
+                else:
+                    self.status = AgentStatus.FAILED
+                    break
+        
+        if self.iteration_count >= max_iterations and self.status == AgentStatus.IN_PROGRESS:
+            logger.warning(f"⚠️  Agent {self.agent_id} reached max iterations ({max_iterations})")
+            ready, missing = self._check_completion_readiness(task_context)
+            if ready:
+                logger.info(f"   NOTE: Max iterations reached with deliverables satisfied. Marking completed.")
+                self.status = AgentStatus.COMPLETED
+                self.work_completed = True
+            else:
+                logger.warning(f"   Incomplete deliverables at max iterations: {missing}")
+                self.status = AgentStatus.FAILED
+                self.work_completed = False
+        
+        # Post completion to team if work done
+        if self.work_completed:
+            await self.blackboard_manager.broadcast_to_central(
+                self.agent_id,
+                {
+                    "title": f"{self.role.value} work completed",
+                    "files": list(self.generated_code.keys()),
+                    "iterations": self.iteration_count
+                },
+                priority="high"
+            )
+        
+        return {
+            "status": self.status.value,
+            "agent_id": self.agent_id,
+            "files_generated": list(self.generated_code.keys()),
+            "role": self.role.value,
+            "iterations": self.iteration_count,
+            "work_completed": self.work_completed,
+            "last_error": self.last_error
+        }
+    
+    async def _get_ai_response(self, task_context: Dict) -> str:
+        """Get AI response with full context from message history and project."""
         profile = AgentRegistry.get_agent_profile(self.role)
         
-        # Get messages from other agents
-        messages = await self.comm_hub.get_messages(self.agent_id)
-        context_from_agents = "\n".join([f"From {m['from']}: {m['content']}" for m in messages]) if messages else "None"
+        # Build context from previous iterations
+        history_context = ""
+        if self.message_history:
+            history_context = "\n\nPREVIOUS ITERATIONS:\n"
+            for i, msg in enumerate(self.message_history[-5:], 1):  # Last 5 iterations
+                history_context += f"  {i}. {msg.get('content', '')[:200]}...\n"
         
-        # Get published artifacts from other agents
-        artifacts = await self.comm_hub.get_all_artifacts()
-        available_artifacts = "\n".join([f"  - {name}" for name in artifacts.keys()]) if artifacts else "None available yet"
+        role_display = self.role.value.replace('_', ' ').title()
         
-        system_prompt = profile["system_prompt_template"].format(
-            context=json.dumps(task_context, indent=2)
+        # Determine MODE based on iteration number
+        mode_guidance = "MODE 1: FULL FILE" if self.iteration_count == 1 else "MODE 2: SEARCH/REPLACE (atomic edits - MUCH FASTER)"
+        
+        # For first 3 iterations, COMPLETELY OMIT collaboration mandates to avoid confusion
+        # Only include them AFTER code generation is done (iteration 4+)
+        collaboration_section = ""
+        if self.iteration_count <= 3:
+            collaboration_section = f"""
+⛔ CRITICAL - ITERATIONS 1-3 ARE FOR CODE GENERATION ONLY ⛔
+- You must NOT post [RFC], REQUEST_COMMENT, or ask for feedback
+- You must NOT delegate (no HANDOFF_TO)
+- You must NOT pause for user input
+- Your ONLY job: Generate actual, complete, production-ready code
+- After iteration 3, collaboration becomes available
+"""
+        else:
+            collaboration_mandate = self._get_collaboration_mandate()
+            collaboration_section = f"""
+COLLABORATION MANDATE (After Code Generation):
+{collaboration_mandate}"""
+        
+        system_prompt = f"""You are a {role_display} in Agentic Nexus (Copilot Mode).
+
+{profile["system_prompt_template"].format(context=json.dumps(task_context, indent=2))}
+
+🚨 CRITICAL - ITERATION {self.iteration_count} MODE: {mode_guidance}
+{collaboration_section}
+
+⛔ PLACEHOLDER REJECTION POLICY - MANDATORY ⛔
+You will NOT output:
+- "..." or ellipsis in code blocks (IMMEDIATE REJECTION)
+- "<complete ...>" or "<implementation ...>"
+- "TODO:" or "FIXME:" comments
+- "[Your code here]" or "[implementation here]"
+- "pass" statements with TODO
+- Incomplete functions with only docstrings
+
+IF YOU OUTPUT ANY PLACEHOLDER: System rejects it, forces retry.
+Every line must be COMPLETE and FUNCTIONAL.
+
+ITERATIVE EXECUTION MODE - How to exit:
+When you have finished ALL assigned work:
+1. Verify all deliverables are generated
+2. Check team feedback on blackboard
+3. Output [COMPLETED] on its own line to signal task completion
+
+ITERATION {self.iteration_count} PRIORITY:
+{"🔴 GENERATE CODE FIRST - DO NOT POST [RFC] YET" if self.iteration_count <= 3 else "You can post [RFC] for team feedback after generating code"}
+
+{history_context}
+
+CODE GENERATION RULES FOR ITERATION {self.iteration_count}:
+- Use {"FULL FILE format (complete files)" if self.iteration_count == 1 else "SEARCH/REPLACE format (atomic edits only)"}
+- All code MUST be ACTUAL, PRODUCTION-READY (zero placeholders)
+- Complete, functional, ready to run
+- Proper error handling, logging, documentation
+- Follow best practices for your role
+- Copilot-like atomic edits reduce errors and token waste
+- Each SEARCH/REPLACE block = ONE surgical edit
+- SEARCH text MUST EXACTLY match existing code (whitespace matters)
+
+⚠️ WARNING: Output of "..." = IMMEDIATE REJECTION AND RETRY
+You will not advance until code is complete and real.
+
+{"⛔ CRITICAL: You MUST include code blocks (```filename```) in this iteration. Failing to do so will restart the entire iteration." if self.iteration_count <= 3 else ""}"""
+        
+        response = self.client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(task_context, indent=2)}
+            ] + self.message_history,
+            temperature=0.7
         )
         
-        # Modify system prompt to request actual code
-        code_generation_prompt = f"""You are a {self.role.value.replace('_', ' ').title()} in Agentic Nexus.
-
-{system_prompt}
-
-YOUR TASK: Generate ACTUAL, PRODUCTION-READY CODE for your role.
-
-DEPENDENCIES COMPLETED:
-Your agent dependencies: {', '.join(self.dependencies) if self.dependencies else 'None (you are first)'}
-
-COMMUNICATIONS FROM OTHER AGENTS:
-{context_from_agents}
-
-AVAILABLE CODE ARTIFACTS FROM OTHER AGENTS:
-{available_artifacts}
-
-INSTRUCTIONS:
-1. Generate complete, functional, production-ready code
-2. Follow best practices for your domain and role
-3. Include proper error handling and documentation
-4. Code must be executable and well-structured
-5. Create all necessary files for your domain
-
-FORMAT YOUR RESPONSE:
-First, provide all code files in this format (one or more):
-
-```filename1.py
-<complete code content>
-```
-
-```filename2.ts
-<complete code content>
-```
-
-Then provide metadata:
-
-```json
-{{
-  "role_summary": "Brief description of what you implemented",
-  "files_created": ["filename1.py", "filename2.ts"],
-  "key_features": ["feature1", "feature2"],
-  "next_steps": "What other agents should do with your code",
-  "ready_for": ["list of roles that depend on this"]
-}}
-```"""
+        response_text = response.choices[0].message.content
         
-        try:
-            response = self.client.chat.completions.create(
-                model=AZURE_OPENAI_DEPLOYMENT,
-                messages=[
-                    {"role": "system", "content": "You are an expert code generation specialist. Generate complete, functional, production-ready code."},
-                    {"role": "user", "content": code_generation_prompt}
-                ],
-                temperature=0.7
-            )
-            
-            response_text = response.choices[0].message.content
-            
-            # Parse code blocks and save locally
-            self._parse_and_save_code(response_text)
-            
-            # Extract JSON metadata and communicate
-            self._extract_metadata_and_communicate(response_text)
-            
-            self.status = "COMPLETED"
-            logger.info(f"✅ Agent {self.agent_id} generated {len(self.generated_code)} file(s)")
-            return {
-                "status": "success",
-                "agent_id": self.agent_id,
-                "files_generated": list(self.generated_code.keys()),
-                "role": self.role.value
-            }
-            
-        except Exception as e:
-            self.status = "FAILED"
-            logger.error(f"❌ Agent {self.agent_id} failed: {str(e)}")
-            return {"error": str(e), "agent_id": self.agent_id, "status": "failed"}
+        # Store in message history for next iteration
+        self.message_history.append({
+            "role": "assistant",
+            "content": response_text[:500]  # Store summary
+        })
+        
+        return response_text
     
-    def _parse_and_save_code(self, response_text: str):
-        """Parse code blocks from response and save to local files."""
+    def _get_collaboration_mandate(self) -> str:
+        """Return role-specific collaboration mandates that force agents to collaborate."""
+        mandates = {
+            AgentRole.BACKEND_ENGINEER: """REQUIRED COLLABORATION:
+  - MUST post [RFC] requesting confirmation from database_architect on schema before finalizing models
+  - MUST post [RFC] requesting endpoint validation from frontend_engineer before API finalization
+  - MUST include authentication with [RFC] to security_engineer for auth approach review""",
+            
+            AgentRole.FRONTEND_ENGINEER: """REQUIRED COLLABORATION:
+  - MUST post [RFC] requesting API endpoint confirmation from backend_engineer
+  - MUST post [RFC] requesting auth flow validation from security_engineer
+  - MUST request ML analysis features list from ml_engineer before building UI components""",
+            
+            AgentRole.DATABASE_ARCHITECT: """REQUIRED COLLABORATION:
+  - MUST post [RFC] on final schema for backend_engineer review before finalization
+  - MUST coordinate with security_engineer on data encryption/access patterns""",
+            
+            AgentRole.QA_ENGINEER: """REQUIRED COLLABORATION:
+  - MUST wait for backend_engineer and frontend_engineer code before creating tests
+  - MUST post [RFC] requesting test strategy approval from solution_architect""",
+            
+            AgentRole.SECURITY_ENGINEER: """REQUIRED COLLABORATION:
+  - MUST post [RFC] on authentication/encryption approach for backend_engineer review
+  - MUST coordinate with devops_engineer on secrets management in deployment""",
+            
+            AgentRole.ML_ENGINEER: """REQUIRED COLLABORATION:
+  - MUST post [RFC] on ML pipeline integration points for backend_engineer review
+  - MUST post [RFC] on feature requirements to guide frontend_engineer UI design""",
+            
+            AgentRole.DEVOPS_ENGINEER: """REQUIRED COLLABORATION:
+  - MUST post [RFC] on deployment pipeline for security_engineer secrets review
+  - MUST coordinate infrastructure with backend_engineer on runtime requirements""",
+            
+            AgentRole.SOLUTION_ARCHITECT: """REQUIRED COLLABORATION:
+  - MUST coordinate with all agents to ensure aligned architecture
+  - MUST post [RFC] on system design decisions for team review before implementation""",
+            
+            AgentRole.API_DESIGNER: """REQUIRED COLLABORATION:
+  - MUST post [RFC] on API specification for backend_engineer implementation review
+  - MUST post [RFC] requesting SDKs review from backend_engineer""",
+        }
+        
+        mandate = mandates.get(self.role, "Collaborate with team on critical decisions using [RFC].")
+        return mandate
+    
+    async def _process_handoff(self, handoff: Handoff):
+        """Process an incoming handoff by incorporating its results."""
+        logger.info(f"🔄 Processing handoff from {handoff.from_agent}")
+        if handoff.result:
+            self.message_history.append({
+                "role": "system",
+                "content": f"Handoff result from {handoff.from_agent}: {json.dumps(handoff.result)[:200]}"
+            })
+        await self.collaboration_bus.complete_handoff(handoff.id, {"processed": True})
+    
+    async def _extract_handoff_target(self, response_text: str) -> Optional[str]:
+        """Extract the target agent from HANDOFF_TO directive."""
+        match = re.search(r"HANDOFF_TO:\s*(\w+(?:_\w+)?)", response_text)
+        if match:
+            return match.group(1)
+        return None
+    
+    async def _extract_rfc_title(self, response_text: str) -> str:
+        """Extract RFC title from REQUEST_COMMENT directive."""
+        match = re.search(r"REQUEST_COMMENT:\s*([^\n]+)", response_text)
+        if match:
+            return match.group(1).strip()
+        return f"RFC from {self.agent_id}"
+    
+    async def _check_and_report_dependencies(self) -> bool:
+        """
+        Check if all dependencies for this agent have completed.
+        Returns True if all dependencies are done, False otherwise.
+        Monitors the blackboard for dependency completion posts.
+        """
+        if not self.dependencies:
+            return True  # No dependencies = ready to go
+        
+        completed_deps = set()
+        
+        # Check 1: Local blackboard for completion messages from dependencies
+        all_central_msgs = self.blackboard_manager.central_blackboard.messages
+        for msg in all_central_msgs:
+            from_agent = msg.get("from_agent", "").lower()
+            msg_content = str(msg.get("message", {})).lower()
+            msg_title = msg.get("message", {}).get("title", "").lower()
+            
+            for dep_role in self.dependencies:
+                dep_role_lower = dep_role.lower()
+                
+                # Check if message is from this dependency role
+                is_from_dep = (
+                    dep_role_lower in from_agent or 
+                    dep_role_lower in msg_content or
+                    dep_role_lower in msg_title
+                )
+                
+                # Check if message indicates completion
+                is_completion = (
+                    "[completed]" in msg_title or
+                    "completed" in msg_title or
+                    msg.get("message", {}).get("status") == "COMPLETED"
+                )
+                
+                if is_from_dep and is_completion:
+                    completed_deps.add(dep_role)
+                    if dep_role not in getattr(self, '_logged_deps', set()):
+                        logger.info(f"✅ {self.agent_id} detected dependency '{dep_role}' completed from blackboard")
+                        if not hasattr(self, '_logged_deps'):
+                            self._logged_deps = set()
+                        self._logged_deps.add(dep_role)
+                    break
+        
+        # Check if all dependencies are satisfied
+        deps_satisfied = len(completed_deps) == len(self.dependencies)
+        
+        if deps_satisfied and self.status == AgentStatus.WAITING_FOR_RESPONSE:
+            logger.info(f"🚀 {self.agent_id} all dependencies satisfied - AUTO-RESUMING")
+            self.status = AgentStatus.IN_PROGRESS
+            return True
+        
+        if deps_satisfied and self.status == AgentStatus.PAUSED:
+            logger.info(f"🚀 {self.agent_id} all dependencies satisfied - RESUMING FROM PAUSE")
+            self.status = AgentStatus.IN_PROGRESS
+            return True
+        
+        return deps_satisfied
+    
+    async def _save_checkpoint(self, reason: str):
+        """Save current agent state to Cosmos DB for later resumption."""
+        checkpoint_state = {
+            "agent_id": self.agent_id,
+            "role": self.role.value,
+            "status": self.status.value,
+            "iteration": self.iteration_count,
+            "message_history": self.message_history,
+            "generated_code": self.generated_code,
+            "pause_reason": reason,
+            "project_context": self.project_context
+        }
+        await self.checkpoint_manager.save_checkpoint(self.agent_id, checkpoint_state)
+    
+    async def _run_validation(self) -> Dict:
+        """Run validation tests on generated code - syntax, imports, basic linting."""
+        issues = []
+        success = True
+        
+        # Validate Python files for syntax errors
+        for filename, code in self.generated_code.items():
+            if filename.endswith('.py'):
+                try:
+                    ast.parse(code)
+                except SyntaxError as e:
+                    issues.append({
+                        "file": filename,
+                        "type": "syntax_error",
+                        "message": f"Line {e.lineno}: {e.msg}"
+                    })
+                    success = False
+                    logger.warning(f"⚠️  Syntax error in {filename}: Line {e.lineno}: {e.msg}")
+                
+                # Check for common import issues
+                try:
+                    tree = ast.parse(code)
+                    imports = []
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Import):
+                            for alias in node.names:
+                                imports.append(alias.name.split('.')[0])
+                        elif isinstance(node, ast.ImportFrom):
+                            if node.module:
+                                imports.append(node.module.split('.')[0])
+                    
+                    # Check standard library and common packages (basic validation)
+                    problematic = []
+                    for imp in set(imports):
+                        if imp not in ('os', 'sys', 'json', 're', 'asyncio', 'logging', 
+                                      'datetime', 'uuid', 'pathlib', 'typing', 'enum',
+                                      'fastapi', 'pydantic', 'sqlalchemy', 'pytest',
+                                      'numpy', 'pandas', 'sklearn', 'react', 'typescript',
+                                      'docker', 'kubernetes', '__future__'):
+                            pass  # Don't fail on unknown imports, just log
+                except Exception as e:
+                    logger.warning(f"⚠️  Could not validate imports in {filename}: {e}")
+
+            # Validate JS/TS relative imports for missing generated modules
+            if filename.endswith(('.js', '.jsx', '.ts', '.tsx')):
+                try:
+                    relative_imports = re.findall(r"from\s+['\"](\./[^'\"]+)['\"]", code)
+                    relative_imports += re.findall(r"require\(\s*['\"](\./[^'\"]+)['\"]\s*\)", code)
+                    for rel in relative_imports:
+                        base = rel[2:]  # strip "./"
+                        candidates = [
+                            base,
+                            f"{base}.js",
+                            f"{base}.jsx",
+                            f"{base}.ts",
+                            f"{base}.tsx",
+                            f"{base}/index.js",
+                            f"{base}/index.ts",
+                            f"{base}/index.tsx",
+                        ]
+                        if not any(c in self.generated_code for c in candidates):
+                            issues.append({
+                                "file": filename,
+                                "type": "missing_import_target",
+                                "message": f"Relative import '{rel}' has no generated target file"
+                            })
+                            success = False
+                except Exception as e:
+                    logger.warning(f"⚠️  Could not validate JS/TS imports in {filename}: {e}")
+        
+        if issues:
+            logger.warning(f"⚠️  Validation found {len(issues)} issue(s)")
+        
+        return {
+            "success": success,
+            "issues": issues,
+            "feedback": "Code validation complete" if success else f"{len(issues)} issue(s) found"
+        }
+
+    # Legacy execute method for backward compatibility
+    async def execute(self, task_context: Dict) -> Dict:
+        """Legacy method - delegates to iterative execution."""
+        return await self.execute_iteratively(task_context)
+    
+    def _parse_and_save_code(self, response_text: str) -> Dict[str, Any]:
+        """
+        Parse code blocks from response and save to files.
+        DUAL MODE:
+        1. PATCH MODE (Copilot-like): Detects SEARCH/REPLACE blocks for atomic edits
+        2. FULL FILE MODE (Legacy): Handles code blocks for new files
+        """
+        # Create (or reuse) a role-based directory so all agents of the same
+        # role share a single folder. This ensures backend artifacts end up
+        # in one place instead of per-agent folders, and allows agents to
+        # read/modify files created by other instances of the same role.
+        if self.agent_dir is None:
+            # e.g. ./generated_code/backend_engineer/
+            self.agent_dir = OUTPUT_DIR / f"{self.role.value}"
+            self.agent_dir.mkdir(exist_ok=True, parents=True)
+        
+        # === MODE 1: CHECK FOR ATOMIC EDITS (PATCH MODE) ===
+        search_replace_blocks = PatchApplier.detect_search_replace_blocks(response_text)
+        
+        if search_replace_blocks:
+            logger.info(f"🔧 [PATCH MODE] {self.agent_id} applying {len(search_replace_blocks)} atomic edit(s)")
+            patches_applied = 0
+            patch_failures = 0
+            malformed_blocks = 0
+            
+            for filename, search_text, replace_text in search_replace_blocks:
+                if not PatchApplier.is_valid_patch_filename(filename):
+                    malformed_blocks += 1
+                    patch_failures += 1
+                    warning = (
+                        "Malformed SEARCH/REPLACE block detected. "
+                        f"Filename '{filename}' is invalid. Use format: <<<<<<< SEARCH\\nfilename.ext"
+                    )
+                    logger.warning(f"❌ [PATCH MALFORMED] {warning}")
+                    self.message_history.append({"role": "system", "content": warning})
+                    continue
+
+                file_path = self.agent_dir / filename
+                
+                # Create change log entry
+                operation = EditOperation(
+                    agent_id=self.agent_id,
+                    iteration=self.iteration_count,
+                    filename=filename,
+                    operation_type="PATCH"
+                )
+                
+                # Apply patch
+                success, old_content, new_content = PatchApplier.apply_patch(file_path, search_text, replace_text)
+                
+                if success:
+                    operation.status = "APPLIED"
+                    operation.old_content = old_content
+                    operation.new_content = new_content
+                    self.generated_code[filename] = new_content
+                    patches_applied += 1
+                    logger.info(f"✅ [PATCH] {filename}: {len(search_text)} chars → {len(replace_text)} chars")
+                    if self.cosmos_manager and PERSIST_CODE_TO_DB:
+                        self.cosmos_manager.save_code_artifact(
+                            project_id=self.project_context.get("project_id", "unknown"),
+                            agent_id=self.agent_id,
+                            role=self.role.value,
+                            filename=filename,
+                            content=new_content,
+                            source="patch",
+                        )
+                else:
+                    operation.status = "FAILED"
+                    operation.error_message = new_content  # Contains error message
+                    logger.warning(f"❌ [PATCH FAILED] {filename}: {new_content}")
+                    patch_failures += 1
+                    # Don't raise - continue with other patches
+                
+                # Store operation for audit trail
+                if hasattr(self, 'change_logs'):
+                    if filename not in self.change_logs:
+                        self.change_logs[filename] = FileChangeLog(filename, self.agent_id, 
+                                                                   self.project_context.get("project_id"))
+                    self.change_logs[filename].add_change(operation)
+            
+            if patches_applied > 0:
+                logger.info(f"✅ [PATCHES APPLIED] {self.agent_id}: {patches_applied}/{len(search_replace_blocks)}")
+                asyncio.create_task(self.blackboard_manager.broadcast_to_central(
+                    self.agent_id,
+                    {
+                        "title": f"Code patched by {self.role.value}",
+                        "patches": patches_applied,
+                        "files": [fn for fn, _, _ in search_replace_blocks]
+                    },
+                    priority="high"
+                ))
+            return {
+                "mode": "patch",
+                "patches_detected": len(search_replace_blocks),
+                "patches_applied": patches_applied,
+                "patch_failures": patch_failures,
+                "malformed_blocks": malformed_blocks,
+                "files": [fn for fn, _, _ in search_replace_blocks],
+            }
+        
+        # === MODE 2: FULL FILE GENERATION (LEGACY) ===
+        logger.info(f"📝 [FULL FILE MODE] {self.agent_id} generating new code")
+        
         # Find all code blocks: ```filename.ext\n...\n```
         pattern = r'```([^\n]+)\n(.*?)\n```'
-        matches = re.finditer(pattern, response_text, re.DOTALL)
+        matches = list(re.finditer(pattern, response_text, re.DOTALL))
         
-        agent_dir = OUTPUT_DIR / "agents" / self.role.value
-        agent_dir.mkdir(exist_ok=True, parents=True)
+        # Validate that response contains at least one code block
+        if not matches:
+            raise ValueError(f"No code blocks found in response. Response must include at least one code block formatted as: ```filename.ext\ncode here\n```")
         
+        files_saved = 0
+        saved_files: List[str] = []
         for match in matches:
             filename = match.group(1).strip()
             # Skip JSON blocks (those are metadata)
@@ -672,16 +2545,63 @@ Then provide metadata:
             code_content = match.group(2)
             
             # Save to local file
-            filepath = agent_dir / filename
+            filepath = self.agent_dir / filename
             filepath.parent.mkdir(exist_ok=True, parents=True)
             filepath.write_text(code_content)
             
             self.generated_code[filename] = code_content
-            logger.info(f"  📄 Saved: {self.role.value}/{filename}")
+            files_saved += 1
+            saved_files.append(filename)
+            logger.info(f"💾 [CODE] {self.role.value[:15]} saved: {filename} ({len(code_content)} bytes)")
             
-            # Publish to shared artifacts
+            # Publish to shared artifacts under role namespace (no per-agent folders)
             artifact_name = f"{self.role.value}/{filename}"
             self.comm_hub.shared_artifacts[artifact_name] = code_content
+            
+            # Create change log entry for full file creation
+            operation = EditOperation(
+                agent_id=self.agent_id,
+                iteration=self.iteration_count,
+                filename=filename,
+                operation_type="CREATE",
+                new_content=code_content
+            )
+            operation.status = "APPLIED"
+            
+            if not hasattr(self, 'change_logs'):
+                self.change_logs = {}
+            if filename not in self.change_logs:
+                self.change_logs[filename] = FileChangeLog(filename, self.agent_id,
+                                                          self.project_context.get("project_id"))
+            self.change_logs[filename].add_change(operation)
+
+            if self.cosmos_manager and PERSIST_CODE_TO_DB:
+                self.cosmos_manager.save_code_artifact(
+                    project_id=self.project_context.get("project_id", "unknown"),
+                    agent_id=self.agent_id,
+                    role=self.role.value,
+                    filename=filename,
+                    content=code_content,
+                    source="full_file",
+                )
+        
+        if files_saved > 0:
+            logger.info(f"✅ [GENERATED] {self.role.value[:15]} created {files_saved} file(s)")
+            # Broadcast to team that files are ready
+            asyncio.create_task(self.blackboard_manager.broadcast_to_central(
+                self.agent_id,
+                {
+                    "title": f"Code generated by {self.role.value}",
+                    "files": list(self.generated_code.keys()),
+                    "count": files_saved
+                },
+                priority="high"
+            ))
+        return {
+            "mode": "full_file",
+            "files_saved": files_saved,
+            "files": saved_files,
+        }
     
     def _extract_metadata_and_communicate(self, response_text: str):
         """Extract JSON metadata and send communications to other agents."""
@@ -700,25 +2620,412 @@ Then provide metadata:
         return {
             "agent_id": self.agent_id,
             "role": self.role.value,
-            "status": self.status,
+            "status": self.status.value,
             "created_at": self.created_at,
             "dependencies": self.dependencies,
             "files_generated": list(self.generated_code.keys()),
-            "metadata": self.outputs
+            "metadata": self.outputs,
+            "iterations": self.iteration_count,
+            "message_history_length": len(self.message_history)
         }
 
 # ==========================================
-# 7. AGENT SPAWNER & ORCHESTRATOR
+# 6.5. COPILOT-LIKE EDIT SYSTEM [NEW]
+# ==========================================
+class SearchReplaceBlock:
+    """
+    Represents an atomic edit (search/replace) operation.
+    Enables Copilot-like surgical edits instead of full file regeneration.
+    """
+    def __init__(self, filename: str, search_text: str, replace_text: str):
+        self.filename = filename
+        self.search_text = search_text
+        self.replace_text = replace_text
+        self.applied = False
+        self.error = None
+    
+    def to_dict(self) -> Dict:
+        return {
+            "filename": self.filename,
+            "search_text_length": len(self.search_text),
+            "replace_text_length": len(self.replace_text),
+            "applied": self.applied,
+            "error": self.error
+        }
+
+class EditOperation:
+    """
+    Represents a single edit operation with metadata for undo/redo.
+    Tracks agent, iteration, timestamp, and full change details.
+    """
+    def __init__(self, agent_id: str, iteration: int, filename: str, 
+                 operation_type: str, old_content: str = "", new_content: str = ""):
+        self.id = str(uuid.uuid4())[:8]
+        self.agent_id = agent_id
+        self.iteration = iteration
+        self.filename = filename
+        self.operation_type = operation_type  # "CREATE", "PATCH", "REPLACE"
+        self.old_content = old_content
+        self.new_content = new_content
+        self.timestamp = datetime.now(timezone.utc).isoformat()
+        self.status = "PENDING"  # PENDING, APPLIED, FAILED
+        self.error_message = None
+    
+    def to_dict(self) -> Dict:
+        return {
+            "id": self.id,
+            "agent_id": self.agent_id,
+            "iteration": self.iteration,
+            "filename": self.filename,
+            "operation_type": self.operation_type,
+            "timestamp": self.timestamp,
+            "status": self.status,
+            "error_message": self.error_message,
+            "old_content_hash": hash(self.old_content) if self.old_content else None,
+            "new_content_hash": hash(self.new_content) if self.new_content else None
+        }
+
+class FileChangeLog:
+    """
+    Maintains history of all changes to a file.
+    Enables undo/redo and debugging of file evolution.
+    """
+    def __init__(self, filename: str, agent_id: str, project_id: str):
+        self.filename = filename
+        self.agent_id = agent_id
+        self.project_id = project_id
+        self.changes: List[EditOperation] = []
+        self.current_content = ""
+        self.created_at = datetime.now(timezone.utc).isoformat()
+    
+    def add_change(self, operation: EditOperation):
+        """Record a change operation."""
+        self.changes.append(operation)
+    
+    def get_history(self) -> List[Dict]:
+        """Get all changes for audit trail."""
+        return [op.to_dict() for op in self.changes]
+    
+    def can_undo(self) -> bool:
+        """Check if undo is available."""
+        return len(self.changes) > 0 and self.changes[-1].status == "APPLIED"
+    
+    def undo_last(self) -> Optional[EditOperation]:
+        """Return the last change for potential undo."""
+        if self.can_undo():
+            return self.changes[-1]
+        return None
+    
+    def to_dict(self) -> Dict:
+        return {
+            "filename": self.filename,
+            "agent_id": self.agent_id,
+            "project_id": self.project_id,
+            "created_at": self.created_at,
+            "change_count": len(self.changes),
+            "changes": self.get_history()
+        }
+
+class PatchApplier:
+    """
+    Applies atomic edits (patches) to files.
+    Handles search/replace blocks and validates results.
+    """
+    
+    @staticmethod
+    def detect_search_replace_blocks(response_text: str) -> List[Tuple[str, str, str]]:
+        """
+        Detect SEARCH/REPLACE blocks in agent response.
+        Returns: List of (filename, search_text, replace_text)
+        
+        Expected format:
+        <<<<<<< SEARCH
+        filename.py
+            def old():
+                pass
+        =======
+            def new():
+                pass
+        >>>>>>> REPLACE
+        """
+        pattern = r'<<<<<<< SEARCH\s+([^\n]+)\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE'
+        matches = re.finditer(pattern, response_text, re.DOTALL | re.MULTILINE)
+        
+        blocks = []
+        for match in matches:
+            filename = match.group(1).strip()
+            search_text = match.group(2)
+            replace_text = match.group(3)
+            blocks.append((filename, search_text, replace_text))
+        
+        return blocks
+
+    @staticmethod
+    def is_valid_patch_filename(filename: str) -> bool:
+        """Basic filename validation for SEARCH/REPLACE blocks."""
+        name = filename.strip()
+        if not name or name.startswith("/") or ".." in name:
+            return False
+        if any(ch in name for ch in ("(", ")", "{", "}", ":", ";")):
+            return False
+        # Require likely file shape for patch target.
+        return "." in name
+    
+    @staticmethod
+    def apply_patch(file_path: Path, search_text: str, replace_text: str) -> Tuple[bool, str, str]:
+        """
+        Apply a single search/replace patch to a file.
+        Returns: (success, old_content, new_content)
+        """
+        try:
+            if not file_path.exists():
+                return False, "", f"File not found: {file_path}"
+            
+            with open(file_path, 'r') as f:
+                old_content = f.read()
+            
+            # Check if search_text exists
+            if search_text not in old_content:
+                # Try to find similar content (fuzzy match)
+                logger.warning(f"⚠️  Exact search text not found in {file_path.name}. Attempting fuzzy match...")
+                return False, old_content, f"Search text not found in file"
+            
+            # Apply patch
+            new_content = old_content.replace(search_text, replace_text, 1)  # Replace only first occurrence
+            
+            # Validate syntax for Python files
+            if file_path.suffix == '.py':
+                try:
+                    ast.parse(new_content)
+                except SyntaxError as e:
+                    return False, old_content, f"Syntax error after patch: {e}"
+            
+            # Write back
+            with open(file_path, 'w') as f:
+                f.write(new_content)
+            
+            return True, old_content, new_content
+        
+        except Exception as e:
+            return False, "", f"Error applying patch: {str(e)}"
+
+# ==========================================
+# 7. SWARM ORCHESTRATOR (Replaces DAG) [NEW]
+# ==========================================
+class SwarmOrchestrator:
+    """
+    Orchestrates agents in a swarm pattern instead of rigid DAG.
+    Agents can handoff work dynamically, pause for user input, and iterate.
+    Replaces the old parallel_execution_groups approach.
+    """
+    
+    def __init__(self, collaboration_bus: CollaborationBus, checkpoint_manager: CheckpointManager):
+        self.collaboration_bus = collaboration_bus
+        self.checkpoint_manager = checkpoint_manager
+        self.role_resolver: Optional[RoleResolver] = None
+        self.active_agents: Dict[str, Agent] = {}
+        self.completed_agents: Dict[str, Agent] = {}
+        self.paused_agents: Dict[str, Agent] = {}
+        self.execution_log: List[Dict] = []
+        self.running_tasks: Dict[str, asyncio.Task] = {}
+    
+    async def launch_swarm(self, agents: Dict[str, Agent], task_context: Dict, 
+                          max_concurrent: int = 5, timeout_per_agent: float = 300) -> Dict:
+        """
+        Launch agents in a swarm. They coordinate dynamically via handoffs and RFCs.
+        No predetermined execution order - agents decide what they need from each other.
+        """
+        logger.info(f"🐝 Launching swarm of {len(agents)} agents...")
+        self.active_agents = agents.copy()
+        
+        # Initialize RoleResolver for handoff routing
+        self.role_resolver = RoleResolver(agents)
+        self.collaboration_bus.set_role_resolver(self.role_resolver)
+        logger.info("🔀 Role resolver initialized for intelligent handoff routing")
+
+        setup_agents = {
+            agent_id: agent for agent_id, agent in agents.items()
+            if agent.role.value in SETUP_PHASE_ROLES
+        }
+        coding_agents = {
+            agent_id: agent for agent_id, agent in agents.items()
+            if agent.role.value in CODING_PHASE_ROLES
+        }
+        other_agents = {
+            agent_id: agent for agent_id, agent in agents.items()
+            if agent.role.value not in SETUP_PHASE_ROLES and agent.role.value not in CODING_PHASE_ROLES
+        }
+
+        logger.info(
+            f"🚦 Strict phase execution: setup={len(setup_agents)}, coding={len(coding_agents)}, other={len(other_agents)}"
+        )
+        if setup_agents:
+            await self._execute_batch(setup_agents, task_context, timeout_per_agent, "setup")
+        setup_failed = any(agent.status == AgentStatus.FAILED for agent in setup_agents.values())
+
+        if setup_failed:
+            logger.error("❌ Setup phase failed. Coding phase blocked.")
+        else:
+            to_run = {}
+            to_run.update(coding_agents)
+            to_run.update(other_agents)
+            if to_run:
+                await self._execute_batch(to_run, task_context, timeout_per_agent, "coding")
+
+        for agent_id, agent in agents.items():
+            self._record_agent_result(agent_id, agent)
+        logger.info(f"📡 Service Bus publish health: {ServiceBusPublisher.health_snapshot()}")
+        
+        return {
+            "completed": len(self.completed_agents),
+            "paused": len(self.paused_agents),
+            "failed": len([a for a in agents.values() if a.status == AgentStatus.FAILED]),
+            "execution_log": self.execution_log,
+            "collaboration_bus": {
+                "handoffs": len(self.collaboration_bus.handoffs),
+                "rfcs": len(self.collaboration_bus.rfcs)
+            },
+            "setup_phase_failed": setup_failed,
+        }
+
+    async def _execute_batch(
+        self,
+        batch_agents: Dict[str, Agent],
+        task_context: Dict,
+        timeout_per_agent: float,
+        phase_name: str,
+    ):
+        tasks = [self._run_agent_with_timeout(agent, task_context, timeout_per_agent) for agent in batch_agents.values()]
+        logger.info(f"🚀 Executing {len(tasks)} agent(s) in {phase_name} phase...")
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _record_agent_result(self, agent_id: str, agent: Agent):
+        if agent.status == AgentStatus.COMPLETED:
+            self.completed_agents[agent_id] = agent
+        elif agent.status == AgentStatus.PAUSED:
+            self.paused_agents[agent_id] = agent
+
+        self.execution_log.append({
+            "agent_id": agent_id,
+            "status": agent.status.value,
+            "iterations": agent.iteration_count,
+            "files_generated": len(agent.generated_code),
+        })
+    
+    async def _run_agent_with_timeout(self, agent: Agent, task_context: Dict, timeout: float) -> Dict:
+        """Run a single agent with timeout protection."""
+        self.running_tasks[agent.agent_id] = asyncio.current_task()
+        try:
+            result = await asyncio.wait_for(
+                agent.execute_iteratively(task_context),
+                timeout=timeout
+            )
+            return result
+        except asyncio.TimeoutError:
+            logger.warning(f"⏱️  Agent {agent.agent_id} timed out after {timeout}s")
+            agent.status = AgentStatus.BLOCKED
+            return {"status": "timeout", "agent_id": agent.agent_id}
+        except Exception as e:
+            logger.error(f"❌ Agent {agent.agent_id} error: {e}")
+            agent.status = AgentStatus.FAILED
+            return {"status": "failed", "agent_id": agent.agent_id, "error": str(e)}
+        finally:
+            self.running_tasks.pop(agent.agent_id, None)
+
+    async def rerun_agents(
+        self,
+        agents: Dict[str, Agent],
+        task_context: Dict,
+        timeout_per_agent: float,
+        instruction: str,
+        target_roles: Optional[Set[str]] = None,
+        selector: Optional[str] = None,
+    ) -> Dict[str, int]:
+        """Re-activate selected agents and schedule fresh iterative runs."""
+        target_roles = target_roles or set()
+        matched: List[Agent] = []
+        for agent in agents.values():
+            by_selector = bool(selector and (selector == agent.agent_id or selector == agent.role.value))
+            by_role = bool(target_roles and agent.role.value in target_roles)
+            if by_selector or by_role:
+                matched.append(agent)
+
+        scheduled = 0
+        for agent in matched:
+            if agent.agent_id in self.running_tasks:
+                continue
+            if agent.status not in {AgentStatus.COMPLETED, AgentStatus.WAITING_FOR_RESPONSE, AgentStatus.PAUSED, AgentStatus.FAILED}:
+                continue
+            # Exhausted agents must be reset, otherwise they immediately re-hit max-iteration guard.
+            if agent.iteration_count >= MAX_AGENT_ITERATIONS:
+                agent.iteration_count = 0
+                agent.last_error = None
+                agent.status = AgentStatus.CREATED
+                agent.message_history.append({
+                    "role": "system",
+                    "content": f"Rerun reset applied after max iterations ({MAX_AGENT_ITERATIONS}). Continue with clean filenames and required deliverables.",
+                })
+            agent.message_history.append({
+                "role": "user",
+                "content": f"Runtime instruction: {instruction}",
+            })
+            agent.status = AgentStatus.IN_PROGRESS
+            agent.work_completed = False
+            task = asyncio.create_task(self._run_agent_with_timeout(agent, task_context, timeout_per_agent))
+            self.running_tasks[agent.agent_id] = task
+            scheduled += 1
+        return {"matched_agents": len(matched), "scheduled_agents": scheduled}
+    
+    async def resume_paused_agents(self, user_responses: Dict[str, str]) -> Dict:
+        """
+        Resume paused agents after receiving user feedback.
+        user_responses: {agent_id: "user's response to the pause question"}
+        """
+        logger.info(f"🔄 Resuming {len(user_responses)} paused agent(s)...")
+        
+        results = {}
+        for agent_id, response in user_responses.items():
+            if agent_id not in self.paused_agents:
+                logger.warning(f"⚠️  Agent {agent_id} not found in paused agents")
+                continue
+            
+            agent = self.paused_agents[agent_id]
+            logger.info(f"▶️  Resuming {agent_id}...")
+            
+            # Add user response to message history
+            agent.message_history.append({
+                "role": "user",
+                "content": f"User feedback: {response}"
+            })
+            
+            # Resume execution
+            agent.status = AgentStatus.IN_PROGRESS
+            result = await agent.execute_iteratively({})
+            results[agent_id] = result
+            
+            if agent.status == AgentStatus.COMPLETED:
+                del self.paused_agents[agent_id]
+                self.completed_agents[agent_id] = agent
+        
+        return results
+
+# ==========================================
+# 7. AZURE INFRASTRUCTURE MANAGERS
 # ==========================================
 class AgentSpawner:
     """
     Responsible for instantiating agents based on task ledger specifications
-    and managing their lifecycle in the system.
+    and managing their lifecycle in the system. Updated for swarm mode.
     """
     
-    def __init__(self, cosmos_manager, comm_hub: AgentCommunicationHub):
+    def __init__(self, cosmos_manager, comm_hub: AgentCommunicationHub, 
+                 collaboration_bus: CollaborationBus, checkpoint_manager: CheckpointManager,
+                 blackboard_manager: BlackboardManager):
         self.cosmos_manager = cosmos_manager
         self.comm_hub = comm_hub
+        self.collaboration_bus = collaboration_bus
+        self.checkpoint_manager = checkpoint_manager
+        self.blackboard_manager = blackboard_manager
         self.agents: Dict[str, Agent] = {}
         self.agent_counter = {}
 
@@ -754,6 +3061,10 @@ class AgentSpawner:
                             "tech_stack": ledger.data.get("technology_stack", {})
                         },
                         comm_hub=self.comm_hub,
+                        collaboration_bus=self.collaboration_bus,
+                        checkpoint_manager=self.checkpoint_manager,
+                        blackboard_manager=self.blackboard_manager,
+                        cosmos_manager=self.cosmos_manager,
                         dependencies=agent_spec.get("dependencies", [])
                     )
                     self.agents[agent_id] = agent
@@ -777,21 +3088,14 @@ class AgentSpawner:
 
     async def execute_agents_with_dag(self, dag: Dict[str, List[str]], parallel_groups: List[List[str]]) -> Dict:
         """
+        LEGACY METHOD - Kept for backward compatibility.
+        Use SwarmOrchestrator.launch_swarm() for new swarm-based execution.
+        
         Execute agents respecting their dependencies using the DAG structure.
-        
-        ARCHITECTURAL TRANSLATION:
-        - parallel_groups contains ROLE NAMES (e.g., "backend_engineer")
-        - self.agents dict uses INSTANCE IDs (e.g., "backend_engineer_0_xyz")
-        - dag uses ROLE NAMES for dependencies
-        
-        This method translates between abstraction levels:
-        Role (DAG) → Multiple Instances (Registry) → Execution
-        
-        Returns execution results for all agents.
         """
-        logger.info("⚙️  Starting agent execution with dependency graph...")
+        logger.info("⚙️  WARNING: Using legacy DAG execution. Consider using SwarmOrchestrator instead.")
         execution_results = {}
-        executed_roles: Set[str] = set()  # Track completed ROLES, not instances
+        executed_roles: Set[str] = set()
         
         for group in parallel_groups:
             logger.info(f"🔄 Executing parallel group: {group}")
@@ -799,7 +3103,6 @@ class AgentSpawner:
             group_agents = []
             
             for role_name in group:
-                # Find all agent instances matching this role name
                 agents_for_role = [
                     agent for agent in self.agents.values()
                     if agent.role.value == role_name
@@ -809,41 +3112,34 @@ class AgentSpawner:
                     logger.warning(f"⚠️  No agents found for role: {role_name}")
                     continue
                 
-                # Check if all dependencies (role-level) are satisfied
                 role_dependencies = dag.get(role_name, [])
                 if not all(dep_role in executed_roles for dep_role in role_dependencies):
                     logger.warning(f"⚠️  Skipping {role_name} - dependencies not satisfied: {role_dependencies}")
                     continue
                 
-                # Execute all agent instances with this role in parallel
                 for agent in agents_for_role:
-                    # Collect outputs from all dependent role instances
                     dependencies_output = {}
                     for dep_role in role_dependencies:
                         dep_agents = [a for a in self.agents.values() if a.role.value == dep_role]
-                        # Store outputs from all instances of dependent role
                         dependencies_output[dep_role] = [a.outputs for a in dep_agents]
                     
                     task_context = {
                         "agent_role": role_name,
                         "dependencies_output": dependencies_output
                     }
-                    tasks.append(agent.execute(task_context))
+                    tasks.append(agent.execute_iteratively(task_context))
                     group_agents.append(agent)
             
-            # Execute all tasks in parallel for this group
             if tasks:
                 logger.info(f"🚀 Executing {len(tasks)} agent(s) in parallel...")
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for agent, result in zip(group_agents, results):
                     execution_results[agent.agent_id] = result
-                    # Mark this role as executed (once per role per group)
                     executed_roles.add(agent.role.value)
         
         logger.info(f"✅ Agent execution completed. Executed roles: {executed_roles}")
         logger.info(f"\n📁 Generated code saved to: {OUTPUT_DIR.absolute()}")
         
-        # Print summary of generated files
         logger.info("\n📋 Generated Code Summary:")
         total_files = 0
         for agent in self.agents.values():
@@ -871,7 +3167,24 @@ class CosmosManager:
             id=AGENT_CONTAINER,
             partition_key=PartitionKey(path="/project_id")
         )
+        self.exchange_log_container = self.db.create_container_if_not_exists(
+            id=EXCHANGE_LOG_CONTAINER,
+            partition_key=PartitionKey(path="/project_id")
+        )
         logger.info("✔️  Cosmos DB initialized")
+
+    def _make_doc_id(self, prefix: str, *parts: str) -> str:
+        clean = "_".join(str(p).replace("/", "_").replace(" ", "_") for p in parts if p is not None)
+        return f"{prefix}_{clean}"
+
+    def _base_doc(self, project_id: str, doc_type: str, doc_name: str) -> Dict[str, Any]:
+        return {
+            "project_id": project_id,
+            "type": doc_type,  # backward-compatible field
+            "doc_type": doc_type,
+            "doc_name": doc_name,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
     def save_ledger(self, ledger_data: Dict):
         self.ledger_container.upsert_item(ledger_data)
@@ -880,43 +3193,188 @@ class CosmosManager:
     def save_agent_registry(self, project_id: str, agents: Dict[str, Agent]):
         """Save agent registry to Cosmos DB for future reference."""
         agent_records = {
-            "id": f"agents_{project_id}",
-            "project_id": project_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "id": self._make_doc_id("log_agent_registry", project_id),
+            **self._base_doc(project_id, "log.agent_registry", "agent_registry"),
             "agents": [agent.to_dict() for agent in agents.values()],
             "total_agents": len(agents)
         }
         self.agent_container.upsert_item(agent_records)
         logger.info(f"✔️  Agent registry saved for project {project_id}")
 
+    def save_blackboard_message(self, project_id: str, blackboard_name: str, message: Dict):
+        """Save blackboard message to exchange log."""
+        exchange_record = {
+            "id": self._make_doc_id("log_blackboard", project_id, message.get("id")),
+            **self._base_doc(project_id, "log.blackboard", f"blackboard_{blackboard_name}"),
+            "blackboard_name": blackboard_name,
+            "from_agent": message.get("from_agent"),
+            "timestamp": message.get("timestamp"),
+            "priority": message.get("priority"),
+            "content": message.get("message"),
+            "message_id": message.get("id")
+        }
+        self.exchange_log_container.upsert_item(exchange_record)
+
+    def save_handoff(self, project_id: str, handoff: 'Handoff'):
+        """Save handoff communication to exchange log."""
+        exchange_record = {
+            "id": self._make_doc_id("log_handoff", project_id, handoff.id),
+            **self._base_doc(project_id, "log.handoff", "handoff_event"),
+            "from_agent": handoff.from_agent,
+            "to_agent": handoff.to_agent,
+            "timestamp": handoff.created_at,
+            "status": handoff.status,
+            "context": handoff.context,
+            "handoff_id": handoff.id
+        }
+        self.exchange_log_container.upsert_item(exchange_record)
+
+    def save_rfc(self, project_id: str, rfc: 'RequestForComment'):
+        """Save RFC communication to exchange log."""
+        exchange_record = {
+            "id": self._make_doc_id("log_rfc", project_id, rfc.id),
+            **self._base_doc(project_id, "log.rfc", "rfc_event"),
+            "author": rfc.author,
+            "timestamp": rfc.created_at,
+            "title": rfc.title,
+            "description": rfc.description,
+            "tags": rfc.tags,
+            "rfc_id": rfc.id
+        }
+        self.exchange_log_container.upsert_item(exchange_record)
+
+    async def save_blackboard_post(self, project_id: str, post: Dict):
+        """Save a blackboard post to Cosmos DB."""
+        try:
+            post_record = {
+                "id": self._make_doc_id("log_blackboard_post", project_id, post.get("id")),
+                **self._base_doc(project_id, "log.blackboard_post", "blackboard_post"),
+                "sender_id": post.get("sender_id"),
+                "sender_role": post.get("sender_role"),
+                "target_group": post.get("target_group"),
+                "content": post.get("content"),
+                "post_type": post.get("post_type"),
+                "timestamp": post.get("timestamp"),
+                "visible_to_roles": post.get("visible_to_roles", [])
+            }
+            self.exchange_log_container.upsert_item(post_record)
+            logger.debug(f"💾 Blackboard post saved: {post.get('id')}")
+        except Exception as e:
+            logger.warning(f"⚠️  Error saving blackboard post: {e}")
+
+    async def save_message_history(self, project_id: str, agent_id: str, iteration: int, messages: List[Dict]):
+        """Save agent message history after each iteration to enable resumption."""
+        try:
+            history_doc = {
+                "id": self._make_doc_id("log_message_history", project_id, agent_id, str(iteration)),
+                **self._base_doc(project_id, "log.message_history", f"message_history_{agent_id}"),
+                "agent_id": agent_id,
+                "iteration": iteration,
+                "message_count": len(messages)
+            }
+            self.exchange_log_container.upsert_item(history_doc)
+            logger.debug(f"💾 Message history saved for {agent_id} iteration {iteration}")
+        except Exception as e:
+            logger.warning(f"⚠️  Error saving message history: {e}")
+
+    async def save_file_change_log(self, project_id: str, agent_id: str, filename: str, change_log: 'FileChangeLog'):
+        """Save file change history for audit trail and undo capability."""
+        try:
+            changelog_doc = {
+                "id": self._make_doc_id("log_file_change", project_id, agent_id, filename),
+                **self._base_doc(project_id, "log.file_change", f"file_change_{filename}"),
+                "agent_id": agent_id,
+                "filename": filename,
+                "created_at": change_log.created_at,
+                "change_count": len(change_log.changes),
+                "changes": change_log.get_history()[-10:]  # Keep last 10 for brevity
+            }
+            self.exchange_log_container.upsert_item(changelog_doc)
+            logger.debug(f"💾 File changelog saved for {agent_id}: {filename}")
+        except Exception as e:
+            logger.warning(f"⚠️  Error saving file changelog: {e}")
+
+    def save_code_artifact(
+        self,
+        project_id: str,
+        agent_id: str,
+        role: str,
+        filename: str,
+        content: str,
+        source: str,
+    ):
+        """Persist generated code artifact with explicit artifact typing."""
+        try:
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+            # Determine semantic artifact prefix based on file extension
+            ext = filename.split('.')[-1].lower() if '.' in filename else ''
+            if ext in ('py', 'js', 'ts', 'jsx', 'tsx', 'java', 'go', 'cs', 'rb'):
+                prefix = 'code'
+            elif ext in ('yml', 'yaml', 'json', 'tf', 'dockerfile'):
+                prefix = 'config'
+            elif ext in ('md', 'rst', 'txt', 'adoc'):
+                prefix = 'docs'
+            elif ext in ('sql', 'ddl'):
+                prefix = 'schema'
+            elif ext in ('log',):
+                prefix = 'log'
+            elif ext in ('spec', 'test') or filename.lower().startswith('test_'):
+                prefix = 'test'
+            else:
+                prefix = 'artifact'
+
+            artifact_name = f"{prefix}_{filename}"
+            artifact_doc = {
+                "id": self._make_doc_id("artifact", project_id, agent_id, artifact_name, source),
+                **self._base_doc(project_id, f"artifact.{prefix}", artifact_name),
+                "agent_id": agent_id,
+                "role": role,
+                "filename": filename,
+                "artifact_name": artifact_name,
+                "prefix": prefix,
+                "source": source,
+                "content_hash": content_hash,
+                "content": content,
+            }
+            self.exchange_log_container.upsert_item(artifact_doc)
+        except Exception as e:
+            logger.warning(f"⚠️  Error saving code artifact {filename}: {e}")
+
 class Orchestrator:
     """Handles Ghost Handshakes and agent coordination via Service Bus [cite: 431, 432]."""
     
     @staticmethod
     async def publish_ghost_handshake(agent_name: str, schema_stub: Dict):
-        async with ServiceBusClient.from_connection_string(SERVICE_BUS_STR) as sb:
-            async with sb.get_queue_sender(GHOST_HANDSHAKE_QUEUE) as sender:
-                message = ServiceBusMessage(json.dumps({
-                    "type": "GHOST_HANDSHAKE",
-                    "source_agent": agent_name,
-                    "stub": schema_stub,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }))
-                await sender.send_messages(message)
-                logger.info(f"👻 Ghost Handshake published for {agent_name}.")
+        published = await ServiceBusPublisher.publish_json(
+            "queue",
+            GHOST_HANDSHAKE_QUEUE,
+            {
+                "type": "GHOST_HANDSHAKE",
+                "source_agent": agent_name,
+                "stub": schema_stub,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        if published:
+            logger.info(f"👻 Ghost Handshake published for {agent_name}.")
+        else:
+            logger.info(f"ℹ️  Ghost Handshake queue publish skipped/unavailable for {agent_name}.")
 
     @staticmethod
     async def publish_agent_coordination_event(event_type: str, data: Dict):
         """Publish agent coordination events for cross-team communication."""
-        async with ServiceBusClient.from_connection_string(SERVICE_BUS_STR) as sb:
-            async with sb.get_queue_sender(AGENT_EXECUTION_QUEUE) as sender:
-                message = ServiceBusMessage(json.dumps({
-                    "event_type": event_type,
-                    "data": data,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }))
-                await sender.send_messages(message)
-                logger.info(f"📢 Coordination event published: {event_type}")
+        published = await ServiceBusPublisher.publish_json(
+            "queue",
+            AGENT_EXECUTION_QUEUE,
+            {
+                "event_type": event_type,
+                "data": data,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        if published:
+            logger.info(f"📢 Coordination event published: {event_type}")
 
 # ==========================================
 # 9. MAIN EXECUTION FLOW
@@ -924,71 +3382,110 @@ class Orchestrator:
 async def main():
     logger.info("🚀 Initializing Agentic Nexus Platform...")
     
-    # 1. Capture User Intent
-    user_input = """I want to build a multi-tenant SaaS platform for law firms to manage legal documents and case files. 
-    
-    Requirements:
-    - Support for multiple law firm tenants with complete data isolation
-    - Document management system (upload, store, organize, retrieve)
-    - AI-powered document analysis using GPT-4o (extract key info, summarize contracts)
-    - Role-based access control (attorney, paralegal, admin, client)
-    - Real-time collaboration features for document annotation
-    - Secure document sharing with external parties
-    - Full audit logs for compliance (HIPAA, attorney-client privilege protection)
-    - Search and indexing for fast retrieval across thousands of documents
-    - Mobile-friendly interface
-    - Scales to thousands of users across multiple firms
-    
-    Tech preferences:
-    - Azure cloud platform
-    - Azure SQL for structured data
-    - Azure Blob Storage for document storage
-    - GPT-4o for AI features
-    - React for frontend
-    - Microservices architecture
-    
-    Timeline: Complete MVP in 3 months"""
+    # 1. Capture User Intent (SIMPLIFIED PROJECT SCOPE)
+    user_input = """Build a collaborative platform where users can share, view, analyse and upload legal documents. Please choose and decide appropriate architecture and tech stack."""
     
     owner_id = "user_nexus_2026"
     
-    # Initialize systems
+    # Initialize systems with NEW SWARM ARCHITECTURE
     ledger = TaskLedger(user_input, owner_id)
     director = DirectorAI()
     cosmos = CosmosManager()
-    comm_hub = AgentCommunicationHub(cosmos)  # Agent communication hub
-    spawner = AgentSpawner(cosmos, comm_hub)
+    comm_hub = AgentCommunicationHub(cosmos)
+    
+    # Get project_id early (generated by ledger)
+    ledger_data = await director.clarify_intent(ledger)
+    project_id = ledger_data.get("project_id")
+    
+    collaboration_bus = CollaborationBus(cosmos_manager=cosmos, project_id=project_id)  # NEW: Shared bus with persistence
+    checkpoint_manager = CheckpointManager(cosmos)  # NEW: State persistence
+    blackboard_manager = BlackboardManager(cosmos_manager=cosmos, project_id=project_id)  # NEW: Central + group messaging with persistence
+    spawner = AgentSpawner(cosmos, comm_hub, collaboration_bus, checkpoint_manager, blackboard_manager)
+    swarm_orchestrator = SwarmOrchestrator(collaboration_bus, checkpoint_manager)  # NEW: Swarm orchestration
     
     try:
         # 2. Director AI analyzes intent and creates comprehensive task ledger
         logger.info("🧠 Director AI analyzing requirements...")
-        structured_data = await director.clarify_intent(ledger)
-        ledger.data.update(structured_data)
+        ledger.data.update(ledger_data)
         ledger.add_revision("Initial intent decomposition and agent planning completed.")
         
         logger.info(f"📋 Task Ledger populated with {len(ledger.data.get('agent_specifications', {}).get('required_agents', []))} agent specifications")
         
         # 3. Save the comprehensive task ledger to Cosmos DB
         cosmos.save_ledger(ledger.data)
-        
-        # 4. Spawn agents based on ledger specifications
-        logger.info("\n👥 Spawning specialized agents...")
-        agents = await spawner.spawn_agents_from_ledger(ledger)
-        
-        # 5. Generate agent execution DAG
-        logger.info("📊 Building agent dependency graph...")
+
+        # 4. Build dependency graph before spawn so dependencies are available for setup
+        logger.info("📊 Building initial dependency graph...")
         dag, parallel_groups = await director.generate_agent_dag(ledger)
         ledger.data["agent_specifications"]["agent_dependencies"] = dag
         ledger.data["agent_specifications"]["parallel_execution_groups"] = parallel_groups
         cosmos.save_ledger(ledger.data)
+
+        # 5. Spawn agents based on ledger specifications
+        logger.info("\n👥 Spawning specialized agents (Swarm Mode)...")
+        agents = await spawner.spawn_agents_from_ledger(ledger)
         
-        # 6. Execute agents in parallel respecting dependencies
-        logger.info("⚙️  Starting agent execution phase...")
-        execution_results = await spawner.execute_agents_with_dag(dag, parallel_groups)
+        # 6. Optional Service Bus consumer for sync into central blackboard
+        await blackboard_manager.start_service_bus_sync()
+
+        # 7. Create GROUP BLACKBOARDS for dependent agents using real agent IDs
+        logger.info("🔌 Setting up group blackboards for agent dependencies...")
+        role_to_agent_ids: Dict[str, Set[str]] = {}
+        for aid, agent in agents.items():
+            role_to_agent_ids.setdefault(agent.role.value, set()).add(aid)
+        for role, dependencies in dag.items():
+            if dependencies:  # If this role has dependencies
+                group_name = f"{role}_team"
+                member_ids: Set[str] = set()
+                member_ids.update(role_to_agent_ids.get(role, set()))
+                for dep_role in dependencies:
+                    member_ids.update(role_to_agent_ids.get(dep_role, set()))
+                if member_ids:
+                    await blackboard_manager.create_group_blackboard(group_name, member_ids)
+                    logger.info(f"  ✓ Created group blackboard: {group_name}")
+                else:
+                    logger.warning(f"  ⚠️ Skipped group blackboard {group_name} (no matching agent IDs)")
+        
+        # 8. Publish PROJECT METADATA to central blackboard
+        logger.info("📢 Broadcasting project metadata to all agents...")
+        await blackboard_manager.broadcast_to_central(
+            "system",
+            {
+                "title": "Project Initialization",
+                "tech_stack": ledger.data.get("technology_stack", {}),
+                "requirements": ledger.data.get("functional_requirements", []),
+                "project_name": ledger.data.get("project_name", ""),
+                "project_id": ledger.data["project_id"]
+            },
+            priority="critical"
+        )
+
+        # 9. Execute agents in SWARM MODE with strict setup->coding phases
+        logger.info("\n⚙️  Starting SWARM execution phase...")
+        logger.info("💬 Agents will now coordinate dynamically:")
+        logger.info("   - Handoff work to other agents as needed")
+        logger.info("   - Pause for user input when ambiguous")
+        logger.info("   - Post RFCs for team review")
+        logger.info("   - Iterate until task completion")
+        
+        swarm_results = await swarm_orchestrator.launch_swarm(
+            agents=agents,
+            task_context=ledger.data,
+            max_concurrent=MAX_PARALLEL_AGENTS,
+            timeout_per_agent=AGENT_TIMEOUT_SECONDS
+        )
         
         # 7. Save agent registry and results
         cosmos.save_agent_registry(ledger.data["project_id"], agents)
         
-        # 8. Publish ghost handshake for backend preparation (pre-emptive stubbing)
+        # 8. Check for paused agents (awaiting user feedback)
+        if swarm_orchestrator.paused_agents:
+            logger.info(f"\n⏸️  {len(swarm_orchestrator.paused_agents)} agent(s) paused and awaiting user input:")
+            for agent_id in swarm_orchestrator.paused_agents.keys():
+                logger.info(f"   - {agent_id}")
+            logger.info("\nYou can resume these agents by providing feedback via the collaboration bus or API.")
+        
+        # 9. Publish ghost handshake for backend preparation (pre-emptive stubbing)
         api_stub = {
             "endpoint": "/api/documents",
             "methods": ["GET", "POST", "PUT", "DELETE"],
@@ -997,17 +3494,23 @@ async def main():
         }
         await Orchestrator.publish_ghost_handshake("BackendEngineer", api_stub)
         
-        # Print comprehensive summary
+        # Print comprehensive summary with NEW SWARM METRICS
         logger.info("\n" + "="*70)
-        logger.info("✅ AGENTIC NEXUS EXECUTION COMPLETE")
+        logger.info("✅ AGENTIC NEXUS SWARM EXECUTION COMPLETE")
         logger.info("="*70)
         logger.info(f"Project ID: {ledger.data['project_id']}")
         logger.info(f"Project Name: {ledger.data.get('project_name', 'N/A')}")
         logger.info(f"Agents Spawned: {len(agents)}")
-        logger.info(f"Agents Executed: {len([a for a in agents.values() if a.status == 'COMPLETED'])}")
+        logger.info(f"Agents Completed: {len(swarm_orchestrator.completed_agents)}")
+        logger.info(f"Agents Paused: {len(swarm_orchestrator.paused_agents)}")
         logger.info(f"Total Files Generated: {sum(len(a.generated_code) for a in agents.values())}")
         logger.info("="*70)
         
+        logger.info("\n📊 --- SWARM COORDINATION METRICS ---")
+        logger.info(f"Total Handoffs Posted: {len(collaboration_bus.handoffs)}")
+        logger.info(f"Total RFCs Posted: {len(collaboration_bus.rfcs)}")
+        logger.info(f"Total Agent Iterations: {sum(a.iteration_count for a in agents.values())}")
+        logger.info(f"Execution Log Entries: {len(swarm_results.get('execution_log', []))}")
         
         logger.info("\n📋 --- UPDATED TASK LEDGER SUMMARY ---")
         summary = {
@@ -1018,16 +3521,16 @@ async def main():
             "required_agents": ledger.data["agent_specifications"]["required_agents"],
             "technology_stack": ledger.data.get("technology_stack", {}),
             "non_functional_requirements": ledger.data["non_functional_requirements"],
-            "parallel_execution_groups": parallel_groups,
+            "swarm_execution_mode": True,
             "revision_history": ledger.data["revision_history"]
         }
         logger.info("\n" + json.dumps(summary, indent=2))
         
-        logger.info("\n👥 --- AGENT EXECUTION RESULTS ---")
+        logger.info("\n👥 --- AGENT EXECUTION RESULTS (SWARM MODE) ---")
         for agent_id, agent in agents.items():
-            status_icon = "✅" if agent.status == "COMPLETED" else "❌"
+            status_emoji = {"completed": "✅", "paused": "⏸️", "failed": "❌", "in_progress": "🔄"}.get(agent.status.value, "❓")
             files_count = len(agent.generated_code)
-            logger.info(f"  {status_icon} {agent_id}: {files_count} file(s) generated")
+            logger.info(f"  {status_emoji} {agent_id} ({agent.status.value}): {files_count} file(s), {agent.iteration_count} iteration(s)")
         
         logger.info(f"\n🏗️  Generated Code Directory Structure:")
         logger.info(f"   📦 {OUTPUT_DIR}/")
@@ -1036,15 +3539,37 @@ async def main():
                 if role_dir.is_dir():
                     files = list(role_dir.glob("*"))
                     logger.info(f"      📁 {role_dir.name}/ ({len(files)} file(s))")
-                    for f in sorted(files):
+                    for f in sorted(files)[:5]:  # Show first 5 files
                         logger.info(f"         └─ {f.name}")
+                    if len(files) > 5:
+                        logger.info(f"         └─ ... and {len(files) - 5} more file(s)")
         
-        logger.info(f"\n🎉 All agents generated production-ready code!")
+        logger.info(f"\n🐝 SWARM EXECUTION SUMMARY:")
+        logger.info(f"   Execution Model: Swarm (Dynamic Coordination)")
+        logger.info(f"   Handoff Mechanism: Enabled")
+        logger.info(f"   RFC Collaboration: Enabled")
+        logger.info(f"   Checkpoint/Pause: Enabled")
+        logger.info(f"   Iterative Loops: Enabled")
+        logger.info(f"\n🎉 All agents executed in swarm mode with dynamic coordination!")
         logger.info(f"📂 Review: {OUTPUT_DIR.absolute()}")
+        
+        # LAUNCH INTERACTIVE SHELL FOR REAL-TIME FEEDBACK
+        logger.info("\n" + "="*70)
+        logger.info("🎮 LAUNCHING INTERACTIVE CONTROL SHELL")
+        logger.info("="*70)
+        await run_interactive_shell(
+            agents=agents,
+            ledger=ledger,
+            blackboard_manager=blackboard_manager,
+            swarm_orchestrator=swarm_orchestrator,
+            project_id=ledger.data["project_id"],
+        )
         
     except Exception as e:
         logger.error(f"❌ Fatal error in Agentic Nexus: {e}", exc_info=True)
         raise
+    finally:
+        await blackboard_manager.stop_service_bus_sync()
 
 if __name__ == "__main__":
     asyncio.run(main())
