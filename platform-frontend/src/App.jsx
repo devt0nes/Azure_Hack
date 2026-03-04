@@ -8,6 +8,7 @@ import LogStream from './components/LogStream.jsx'
 import FeedbackPanel from './components/FeedbackPanel.jsx'
 import LearningMode from './components/LearningMode.jsx'
 import { createSignalRConnection } from './services/signalr.js'
+import BlueprintExport from './components/BlueprintExport.jsx'
 
 const INITIAL_AGENTS = [
   {
@@ -208,6 +209,16 @@ export default function App() {
                 >
                   Learning
                 </button>
+                <button
+                  onClick={() => setActiveTab('blueprint')}
+                  className={`mono flex-1 rounded-full px-4 py-2 text-xs font-semibold uppercase tracking-[0.2em] transition ${
+                    activeTab === 'blueprint'
+                      ? 'bg-ember text-white'
+                      : 'bg-transparent text-ink/50 hover:text-ink'
+                  }`}
+                >
+                  Blueprint
+                </button>
               </div>
 
               {activeTab === 'conversation' && (
@@ -222,6 +233,12 @@ export default function App() {
               {activeTab === 'learning' && (
                 <div className="flex flex-1 flex-col">
                   <LearningMode projectId="demo-project" />
+                </div>
+              )}
+
+              {activeTab === 'blueprint' && (
+                <div className="flex flex-1 flex-col overflow-y-auto">
+                  <BlueprintExport projectId="demo-project" />
                 </div>
               )}
             </section>
