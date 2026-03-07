@@ -1,9 +1,0 @@
-{
-  "test_environment": "Dockerized PostgreSQL and FastAPI setup",
-  "test_database_url": "postgresql://test_user:test_password@localhost/test_db",
-  "test_api_base_url": "http://localhost:8000",
-  "test_user_credentials": {
-    "email": "testuser@example.com",
-    "password": "testpassword"
-  }
-}

@@ -166,7 +166,7 @@ The Agent Library contains 8 specialized agent types, each with specific experti
 ```
 
 ---
-
+c
 ### 5. **DevOps Engineer**
 **Role**: `devops_engineer`  
 **Description**: Handles infrastructure, deployment, and CI/CD pipelines

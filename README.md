@@ -1,339 +1,453 @@
-# Agentic Nexus - No-Code/Low-Code Application Builder
+# 🚀 Agentic Nexus - AI-Powered Code Generation & Deployment
 
-## Overview
+![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Status](https://img.shields.io/badge/status-production--ready-green)
+![Python](https://img.shields.io/badge/Python-3.11+-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green)
+![Azure](https://img.shields.io/badge/Azure-Container%20Apps-blue)
 
-Agentic Nexus is an AI-powered platform that transforms natural language descriptions into fully functional applications by spawning specialized AI agents that collaborate to design and build projects.
+## 🎯 Overview
 
-## Architecture
+Agentic Nexus is an enterprise-grade AI system that automatically generates complete, production-ready applications from natural language requirements. It features:
 
-### 1. **Director AI** - The Orchestrator
-- Analyzes user intent and transforms it into structured requirements
-- Creates comprehensive Task Ledgers containing all project metadata
-- Determines which specialized agents are needed
-- Builds the Directed Acyclic Graph (DAG) for agent execution
-- Coordinates risk assessment and guardrail checking
+- **🤖 AI Agent Orchestration** - Multiple specialized agents (Backend, Frontend, DevOps, QA, etc.)
+- **📝 Code Generation** - Generates full-stack applications with best practices
+- **🐳 Deployment Automation** - Docker, Bicep, and GitHub Actions artifacts
+- **💰 Cost Intelligence** - Monthly Azure cost estimation
+- **☁️ Azure-Native** - Container Apps, Static Web Apps, Cosmos DB integration
+- **📊 Comprehensive Logging** - Full audit trail of all agent activities
+- **🔄 Async Architecture** - Background processing with progress tracking
 
-### 2. **Agent Library** - Specialized Workers
-The system includes the following agent roles:
+## 📋 Table of Contents
 
-- **Backend Engineer**: API development, microservices, business logic
-- **Frontend Engineer**: UI/UX design, responsive interfaces, client-side logic
-- **Database Architect**: Schema design, optimization, data strategies
-- **Security Engineer**: Compliance, threat assessment, encryption strategies
-- **DevOps Engineer**: CI/CD, infrastructure, deployment automation
-- **QA Engineer**: Testing strategies, automation, quality assurance
-- **Solution Architect**: Overall system design, technology decisions
-- **API Designer**: API contracts, specifications, SDK design
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [API Documentation](#api-documentation)
+- [Deployment](#deployment)
+- [Development](#development)
+- [Contributing](#contributing)
 
-### 3. **Task Ledger** - Comprehensive Project Specification
-Contains:
-- User intent and extracted requirements
-- Functional & non-functional requirements
-- Technology stack specifications
-- Agent specifications and dependencies
-- Directed Acyclic Graph (DAG) for execution order
-- Design principles and security requirements
-- API specifications and database schemas
-- Testing strategy and timeline
+## 🚀 Quick Start
 
-### 4. **Agent Spawner & Orchestrator**
-- Spawns agents based on task ledger specifications
-- Manages agent lifecycle
-- Coordinates parallel execution respecting dependencies
-- Persists agent registry to Cosmos DB
-- Publishes coordination events via Azure Service Bus
+### Local Development
 
-## Project Structure
-
-```
-/home/frozer/Desktop/nexus/
-├── main.py                 # Main application with all components
-├── .env                    # Configuration file (not in git)
-├── requirements.txt        # Python dependencies
-└── README.md              # This file
-```
-
-## Configuration
-
-All configuration is managed via `.env` file:
-
-```env
-# Azure OpenAI
-AZURE_OPENAI_ENDPOINT=<your-endpoint>
-AZURE_OPENAI_KEY=<your-key>
-AZURE_OPENAI_DEPLOYMENT=gpt-4o
-AZURE_OPENAI_API_VERSION=2024-05-01-preview
-
-# Cosmos DB
-COSMOS_CONNECTION_STR=<your-connection-string>
-DATABASE_NAME=agentic-nexus-db
-LEDGER_CONTAINER=TaskLedgers
-AGENT_CONTAINER=AgentRegistry
-
-# Service Bus
-SERVICE_BUS_STR=<your-connection-string>
-GHOST_HANDSHAKE_QUEUE=agent-handshake-stubs
-AGENT_COORDINATION_TOPIC=agent-coordination-events
-AGENT_EXECUTION_QUEUE=agent-execution-queue
-
-# Application
-LOG_LEVEL=INFO
-MAX_PARALLEL_AGENTS=5
-AGENT_TIMEOUT_SECONDS=300
-ENVIRONMENT=development
-```
-
-## Key Components
-
-### TaskLedger
-Comprehensive data structure containing:
-- Project metadata (id, owner, collaborators)
-- Requirements (functional & non-functional)
-- Technology constraints and stack
-- Agent specifications with dependencies
-- Parallel execution groups
-- Design principles and security requirements
-
-### DirectorAI
-```python
-async def clarify_intent(ledger: TaskLedger) -> Dict
-```
-- Transforms user intent into structured requirements
-- Populates all fields in the task ledger
-- Performs risk assessment
-
-```python
-async def generate_agent_dag(ledger: TaskLedger) -> Tuple[Dict, List[List[str]]]
-```
-- Generates dependency graph between agents
-- Creates parallel execution groups
-
-### Agent
-Base class for all specialized agents:
-```python
-async def execute(task_context: Dict) -> Dict
-```
-- Executes agent-specific tasks
-- Returns results in JSON format
-- Reports status and errors
-
-### AgentRegistry
-Contains profiles for all 8 specialized agent types with:
-- Role descriptions
-- Specialties and capabilities
-- System prompts for LLM interactions
-- Best practices and guidelines
-
-### AgentSpawner
-```python
-async def spawn_agents_from_ledger(ledger: TaskLedger) -> Dict[str, Agent]
-```
-- Creates agent instances based on task ledger
-- Manages agent lifecycle
-
-```python
-async def execute_agents_with_dag(dag, parallel_groups) -> Dict
-```
-- Executes agents respecting dependencies
-- Runs independent agents in parallel
-- Collects and aggregates results
-
-## Execution Flow
-
-1. **Intent Capture**: User provides natural language description
-2. **Analysis**: Director AI analyzes and creates comprehensive task ledger
-3. **Agent Planning**: Director determines required agents and dependencies
-4. **Agent Spawning**: AgentSpawner creates agent instances
-5. **DAG Generation**: Dependency graph and parallel groups created
-6. **Parallel Execution**: Agents execute respecting dependencies
-7. **Result Aggregation**: Results collected from all agents
-8. **Persistence**: Task ledger and agent registry saved to Cosmos DB
-
-## Data Persistence
-
-### Cosmos DB Schema
-
-**TaskLedgers Container**:
-```json
-{
-  "id": "project_id",
-  "project_id": "...",
-  "owner_id": "...",
-  "user_intent": "...",
-  "functional_requirements": [...],
-  "non_functional_requirements": {...},
-  "technology_stack": {...},
-  "agent_specifications": {...},
-  "status": "DRAFT|IN_PROGRESS|COMPLETED",
-  ...
-}
-```
-
-**AgentRegistry Container**:
-```json
-{
-  "id": "agents_project_id",
-  "project_id": "...",
-  "timestamp": "...",
-  "agents": [
-    {
-      "agent_id": "...",
-      "role": "backend_engineer",
-      "status": "COMPLETED",
-      "outputs": {...}
-    }
-  ],
-  "total_agents": 5
-}
-```
-
-## Service Bus Events
-
-### Ghost Handshake
-Pre-emptive API stub notification:
-```json
-{
-  "type": "GHOST_HANDSHAKE",
-  "source_agent": "BackendEngineer",
-  "stub": {
-    "endpoint": "/api/documents",
-    "methods": ["GET", "POST"],
-    "auth": "Bearer JWT"
-  },
-  "timestamp": "..."
-}
-```
-
-### Agent Coordination Events
-```json
-{
-  "event_type": "AGENT_READY|AGENT_COMPLETED|AGENT_FAILED",
-  "data": {...},
-  "timestamp": "..."
-}
-```
-
-## Usage
-
-### Installation
+#### 1. Clone and Setup
 
 ```bash
-cd /home/frozer/Desktop/nexus
+git clone <repository>
+cd agentic-nexus
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### Running the Application
+#### 2. Configure Environment
 
 ```bash
-python main.py
+cp .env.example .env
+# Edit .env with your Azure credentials
 ```
 
-### Example Output
+#### 3. Run Backend API
 
-```
-🚀 Initializing Agentic Nexus Platform...
-🧠 Director AI analyzing requirements...
-📋 Task Ledger populated with 5 agent specifications
-👥 Spawning specialized agents...
-✨ backend_engineer_0_abc123: backend_engineer (Status: CREATED)
-✨ frontend_engineer_0_def456: frontend_engineer (Status: CREATED)
-...
-📊 Building agent dependency graph...
-⚙️  Starting agent execution phase...
-🔄 Executing parallel group: ['backend_engineer_0_abc123', 'database_architect_0_ghi789']
-🔄 Agent backend_engineer_0_abc123 executing task...
-✅ Agent backend_engineer_0_abc123 completed successfully
-...
-✅ AGENTIC NEXUS SETUP COMPLETE
-Project ID: a1b2c3d4
-Agents Spawned: 5
-Parallel Execution Groups: 3
+```bash
+uvicorn app:app --reload --host 0.0.0.0 --port 8000
 ```
 
-## Advanced Features
+API will be available at: `http://localhost:8000/api/docs`
 
-### Risk Assessment & Guardrails
-Director AI flags high-risk technical decisions:
-- High-cost Azure services
-- Security anti-patterns
-- Scalability concerns
-- Compliance violations
+### Docker Deployment
 
-### Parallel Execution
-- Agents execute in parallel respecting DAG dependencies
-- Independent agents run simultaneously
-- Results aggregated for dependent agents
+#### Build Image
 
-### Extensibility
-Add new agent types by:
-1. Define new `AgentRole` in `AgentRole` enum
-2. Create profile in `AgentRegistry.AGENT_PROFILES`
-3. System automatically spawns and coordinates
+```bash
+docker build -t agentic-nexus:latest .
+```
 
-## Monitoring & Logging
+#### Run Container
 
-All operations logged with structured format:
-- Agent spawning
-- Execution flow
-- Error handling
-- Performance metrics
+```bash
+docker run -p 8000:8000 \
+  --env-file .env \
+  agentic-nexus:latest
+```
 
-Set `LOG_LEVEL` in `.env` to control verbosity.
+### Azure Container Apps Deployment
 
-## Future Enhancements
+See [AZURE_DEPLOYMENT_GUIDE.md](AZURE_DEPLOYMENT_GUIDE.md) for complete instructions.
 
-1. **Agent Learning**: Agents learn from past projects
-2. **Real-time Coordination**: WebSocket-based agent communication
-3. **Custom Agents**: User-defined agent roles
-4. **Feedback Loop**: Human feedback integration
-5. **Incremental Build**: Progressive generation with checkpoints
-6. **Agent Persistence**: Save/restore agent state
-7. **Cost Optimization**: Automatic cost monitoring
-8. **Performance Tuning**: Agent optimization suggestions
+Quick version:
+```bash
+az containerapp create \
+  --name agentic-nexus-api \
+  --resource-group my-rg \
+  --environment my-env \
+  --image my-registry.azurecr.io/agentic-nexus:latest \
+  --target-port 8000 \
+  --ingress external
+```
 
-## Security Considerations
+## 🏗️ Architecture
 
-- All credentials in `.env` (never commit to git)
-- Azure managed identities for authentication
-- Cosmos DB encryption at rest
-- Service Bus encrypted communication
-- OpenAI API key rotation recommended
-- RBAC for multi-tenant isolation
+### System Components
 
-## Troubleshooting
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Azure Static Web App                        │
+│                    (React Frontend)                          │
+└────────────────────────┬────────────────────────────────────┘
+                         │ CORS-enabled HTTPS
+                         │
+┌────────────────────────▼────────────────────────────────────┐
+│            Azure Container Apps (FastAPI Backend)            │
+├─────────────────────────────────────────────────────────────┤
+│ ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│ │  Health API  │  │  Projects    │  │  Artifacts       │   │
+│ │  (/health)   │  │  (/projects) │  │  (/artifacts)    │   │
+│ └──────────────┘  └──────────────┘  └──────────────────┘   │
+│                                                               │
+│ ┌──────────────────────────────────────────────────────┐    │
+│ │    Agentic Nexus Orchestrator (Python)              │    │
+│ │  • Director AI (Task Distribution)                  │    │
+│ │  • Swarm Orchestrator (Agent Coordination)          │    │
+│ │  • 9 Specialized Agents (Code Generation)           │    │
+│ │  • Deployment Integration (Docker/Bicep/CICD)      │    │
+│ └──────────────────────────────────────────────────────┘    │
+└──────────────┬──────────────────────────┬────────────────────┘
+               │                          │
+    ┌──────────▼────────────┐  ┌─────────▼──────────┐
+    │   Azure Cosmos DB     │  │  Azure Service Bus │
+    │   (Data Storage)      │  │  (Messaging)       │
+    └───────────────────────┘  └────────────────────┘
+```
 
-### Agent Spawning Issues
-- Check Agent roles are defined in `AgentRole` enum
-- Verify agent profiles exist in `AgentRegistry`
-- Check Cosmos DB connectivity
+### Agent Types
 
-### DAG Dependency Issues
-- Ensure cyclic dependencies don't exist
-- Verify all referenced agents are spawned
-- Check parallel group definitions
+| Agent | Role |
+|-------|------|
+| **Backend Engineer** | REST APIs, microservices, business logic |
+| **Frontend Engineer** | React/Vue components, UI/UX |
+| **Database Architect** | Schema design, optimization, migrations |
+| **DevOps Engineer** | Infrastructure, CI/CD, deployment |
+| **Security Engineer** | Authentication, encryption, compliance |
+| **QA Engineer** | Test automation, quality assurance |
+| **Solution Architect** | System design, technology stack |
+| **API Designer** | OpenAPI specs, contract design |
+| **ML Engineer** | Model integration, inference, NLP |
 
-### Execution Failures
-- Check Azure OpenAI quota and rate limits
-- Verify Service Bus connection strings
-- Review agent-specific error logs
+## 📚 API Documentation
 
-## Performance Metrics
+### Base URL
+```
+https://<container-app-url>/api
+```
 
-- Average agent spawn time: ~500ms
-- Average task execution: ~5-10s per agent
-- Parallel execution speedup: 2-5x for independent agents
-- Cosmos DB throughput: Configured for multi-agent writes
+### Main Endpoints
 
-## Support & Contribution
+#### Create Project
+```bash
+POST /api/projects
+Content-Type: application/json
 
-For issues or enhancements:
-1. Check logs for detailed error messages
-2. Verify Azure service connectivity
-3. Review agent-specific documentation
-4. Check Service Bus event logs
+{
+  "project_name": "My API",
+  "user_intent": "Create a FastAPI backend for document management",
+  "azure_resources": ["cosmos_db", "blob_storage"]
+}
+```
+
+#### Check Status
+```bash
+GET /api/projects/{project_id}
+```
+
+#### Download Artifacts
+```bash
+GET /api/projects/{project_id}/artifacts
+GET /api/projects/{project_id}/artifacts/{artifact_name}
+```
+
+#### Trigger Deployment
+```bash
+POST /api/projects/{project_id}/deploy
+```
+
+#### Get Cost Estimate
+```bash
+GET /api/projects/{project_id}/cost-estimate
+```
+
+Full API documentation: See [API_DOCUMENTATION.md](API_DOCUMENTATION.md)
+
+Interactive Swagger UI: `https://<api-url>/api/docs`
+
+## 🔧 Configuration
+
+### Environment Variables
+
+**Azure Credentials:**
+```bash
+AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com/
+AZURE_OPENAI_KEY=<your-key>
+AZURE_OPENAI_DEPLOYMENT=gpt-4o
+```
+
+**Container Configuration:**
+```bash
+AZURE_CONTAINER_APP_NAME=agentic-nexus-api
+AZURE_RESOURCE_GROUP=agentic-nexus-rg
+CONTAINER_PORT=8000
+CONTAINER_CPU=0.5
+CONTAINER_MEMORY=1Gi
+```
+
+**Frontend Integration:**
+```bash
+FRONTEND_URL=https://<your-static-web-app>.azurestaticapps.net
+API_BASE_URL=https://<container-app-url>
+```
+
+See `.env.example` for complete list.
+
+## 📦 Generated Artifacts
+
+After code generation, the system produces:
+
+### Code Files
+- Backend implementation (Python/Node.js)
+- Frontend components (React/Vue)
+- Database schemas (SQL/NoSQL)
+- Test files (unit, integration, E2E)
+
+### Deployment Artifacts
+```
+generated_code/
+├── deployment/
+│   ├── Dockerfile              # Container image definition
+│   ├── infrastructure.bicep    # Azure IaC template
+│   ├── github-actions.yml     # CI/CD pipeline
+│   └── README.md              # Deployment guide
+├── blueprint.json             # System architecture
+├── cost_estimate.json        # Monthly costs
+└── agents/
+    ├── backend_engineer/
+    ├── frontend_engineer/
+    ├── database_architect/
+    └── ...
+```
+
+## 🚀 Deployment
+
+### Option 1: Azure Container Apps (Recommended)
+
+```bash
+# See AZURE_DEPLOYMENT_GUIDE.md for detailed steps
+az containerapp create \
+  --name agentic-nexus-api \
+  --resource-group my-rg \
+  --environment my-env \
+  --image my-registry.azurecr.io/agentic-nexus:latest \
+  --target-port 8000 \
+  --ingress external
+```
+
+### Option 2: Docker Compose (Development)
+
+```bash
+docker-compose up --build
+```
+
+### Option 3: Kubernetes (AKS)
+
+```bash
+kubectl apply -f k8s/deployment.yaml
+```
+
+## 💻 Development
+
+### Running Tests
+
+```bash
+pytest tests/ -v
+pytest tests/ --cov=app --cov-report=html
+```
+
+### Code Quality
+
+```bash
+# Linting
+pylint app.py
+
+# Formatting
+black app.py
+
+# Type checking
+mypy app.py
+```
+
+### Local Development with Docker
+
+```bash
+docker build -t agentic-nexus:dev --target builder .
+docker run -it -v $(pwd):/app agentic-nexus:dev bash
+```
+
+## 📊 Monitoring & Logging
+
+### Real-time Logs
+
+```bash
+# Docker
+docker logs -f <container-id>
+
+# Azure Container Apps
+az containerapp logs show \
+  --name agentic-nexus-api \
+  --resource-group my-rg \
+  --follow
+```
+
+### Audit Logs
+
+```bash
+# View project logs via API
+curl https://<api-url>/api/projects/{project_id}/logs
+```
+
+Logs are stored in `./agent_logs/`:
+- `ai_responses/` - All LLM responses
+- `communications/` - Agent-to-agent messages
+- `requirements/` - Dependency tracking
+- `master_audit.log` - Complete audit trail
+
+## 🔐 Security
+
+### Authentication (Production)
+
+Enable Azure AD authentication:
+
+```bash
+ENABLE_AUTH=true
+AUTH_PROVIDER=azure-ad
+```
+
+### Secrets Management
+
+Store secrets in Azure Key Vault:
+
+```bash
+az keyvault secret set --vault-name my-kv \
+  --name azure-openai-key \
+  --value <key>
+```
+
+### CORS Configuration
+
+Configure for your frontend domain:
+
+```python
+# In app.py
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://your-domain.azurestaticapps.net"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+## 📈 Performance
+
+### Scaling
+
+Auto-scaling is configured via `azure_config.py`:
+
+```bash
+CONTAINER_REPLICAS_MIN=1
+CONTAINER_REPLICAS_MAX=10
+```
+
+### Timeouts
+
+```bash
+MAX_PROJECT_TIMEOUT_SECONDS=3600    # 1 hour
+AGENT_TIMEOUT_SECONDS=300            # 5 minutes per agent
+```
+
+## 🤝 Contributing
+
+### Development Workflow
+
+1. Create feature branch: `git checkout -b feature/my-feature`
+2. Make changes and test locally
+3. Run tests and quality checks
+4. Push to GitHub: `git push origin feature/my-feature`
+5. Create Pull Request
+
+### Code Standards
+
+- Python 3.11+
+- FastAPI async patterns
+- Type hints on all functions
+- Comprehensive docstrings
+- 80% test coverage minimum
+
+## 📝 License
+
+MIT License - See LICENSE file
+
+## 🆘 Support
+
+### Documentation
+
+- [API Documentation](API_DOCUMENTATION.md)
+- [Azure Deployment Guide](AZURE_DEPLOYMENT_GUIDE.md)
+- [Deployment Integration Summary](DEPLOYMENT_INTEGRATION_SUMMARY.md)
+- [Quick Reference](DEPLOYMENT_QUICK_REFERENCE.md)
+
+### Issues
+
+Open an issue on GitHub with:
+- Description of problem
+- Error logs (from `/api` endpoint)
+- Steps to reproduce
+- Expected behavior
+
+### Contact
+
+- Email: support@agentic-nexus.io
+- GitHub: https://github.com/nexus-agentic/backend
+
+## 🗺️ Roadmap
+
+### v1.1 (Q2 2024)
+- [ ] WebSocket support for real-time updates
+- [ ] Multi-project templates
+- [ ] Advanced cost analysis
+- [ ] Team collaboration features
+
+### v1.2 (Q3 2024)
+- [ ] GitHub Copilot integration
+- [ ] Custom agent creation
+- [ ] API marketplace
+- [ ] Advanced monitoring dashboards
+
+### v2.0 (Q4 2024)
+- [ ] Distributed agent system
+- [ ] Multi-cloud support (AWS, GCP)
+- [ ] Advanced security (RBAC, MFA)
+- [ ] Enterprise features
+
+## 🎓 Learning Resources
+
+- [FastAPI Documentation](https://fastapi.tiangolo.com/)
+- [Azure Container Apps Docs](https://learn.microsoft.com/azure/container-apps/)
+- [OpenAI API Guide](https://platform.openai.com/docs/)
+- [Pydantic Documentation](https://docs.pydantic.dev/)
 
 ---
 
-**Version**: 1.0  
-**Last Updated**: 2026-03-02  
-**Architecture**: Directed Acyclic Graph (DAG) with Parallel Execution
+**Made with ❤️ by the Agentic Nexus Team**
+
+**Last Updated**: March 2024  
+**Version**: 1.0.0
