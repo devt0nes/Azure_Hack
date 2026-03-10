@@ -1,5 +1,4 @@
 import { useEffect, useState } from 'react'
-import { getTunnelUrl } from '../services/tunnel.js'
 import { getProject } from '../services/api.js'
 
 export default function Preview({ currentProjectId, projectData }) {
@@ -39,8 +38,13 @@ export default function Preview({ currentProjectId, projectData }) {
       // Only construct preview URL if project is completed
       // This prevents 404 errors from trying to load non-existent files
       if (projectStatus?.status === 'completed') {
-        const info = await getTunnelUrl(currentProjectId)
-        setTunnelInfo(info)
+        // Construct the preview URL directly - tunnel service just formats it
+        const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+        setTunnelInfo({
+          url: `${apiBase}/api/preview/${currentProjectId}/index.html`,
+          status: 'ready',
+          projectId: currentProjectId
+        })
       }
     } catch (err) {
       console.error('Preview load error:', err)

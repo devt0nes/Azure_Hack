@@ -14,7 +14,7 @@ from pathlib import Path
 from enum import Enum
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -612,37 +612,31 @@ class ClarifyRequest(BaseModel):
 async def clarify_intent(request: ClarifyRequest, background_tasks: BackgroundTasks):
     """
     Legacy Director clarification endpoint (compatibility layer)
-    Maps to new project creation workflow and triggers code generation
+    Always creates a NEW project for each clarification request and triggers code generation
     """
     try:
-        # Check if project exists
-        project = project_manager.get_project(request.project_id)
+        # Always create a new project for new clarification requests
+        # This ensures each request gets fresh generation, not reuse of completed projects
+        project_id = project_manager.create_project(
+            name=f"Project from clarification",
+            intent=request.user_input,
+            description=None
+        )
+        project = project_manager.get_project(project_id)
         
-        if not project:
-            # Create new project from clarification
-            project_id = project_manager.create_project(
-                name=f"Project from clarification",
-                intent=request.user_input,
-                description=None
-            )
-            project = project_manager.get_project(project_id)
-            
-            # Update status to queued and trigger code generation
-            project_manager.update_project_status(project_id, ProjectStatus.QUEUED, progress=5)
-            
-            # Queue code generation as background task
-            background_tasks.add_task(
-                OrchestrationService.generate_code,
-                project_id,
-                project
-            )
-            
-            logger.info(f"Clarify: Created project {project_id} and queued code generation")
-        else:
-            # Project already exists, use its ID
-            project_id = request.project_id
+        # Update status to queued and trigger code generation
+        project_manager.update_project_status(project_id, ProjectStatus.QUEUED, progress=5)
         
-        # Return director-style response with the actual project ID
+        # Queue code generation as background task
+        background_tasks.add_task(
+            OrchestrationService.generate_code,
+            project_id,
+            project
+        )
+        
+        logger.info(f"Clarify: Created NEW project {project_id} and queued code generation")
+        
+        # Return director-style response with the new project ID
         return {
             "director_reply": f"I understand you want to: {request.user_input}. I'll create a task breakdown and coordinate the agents.",
             "project_id": project_id,
@@ -650,9 +644,11 @@ async def clarify_intent(request: ClarifyRequest, background_tasks: BackgroundTa
         }
     except Exception as e:
         logger.error(f"Clarify error: {str(e)}")
+        # Generate a new project ID for error response
+        error_project_id = str(uuid.uuid4())
         return {
             "director_reply": "I'm processing your request. The orchestration will begin shortly.",
-            "project_id": request.project_id,
+            "project_id": error_project_id,
             "status": "processing"
         }
 
@@ -763,7 +759,6 @@ async def serve_preview(project_id: str, path: str = ""):
         # Try Cosmos DB first
         try:
             cosmos_manager = orchestrator_module.CosmosManager()
-            cosmos_manager.initialize()
             
             # Query for the artifact in Cosmos DB
             query = f"""
@@ -822,7 +817,37 @@ async def serve_preview(project_id: str, path: str = ""):
             raise HTTPException(status_code=403, detail="Access denied")
         
         if not generated_path.exists():
-            raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+            # Return a helpful HTML error message instead of 404
+            logger.warning(f"Preview file not found: {filename} for project {project_id}")
+            error_html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Preview Not Available</title>
+                <style>
+                    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; margin: 0; padding: 20px; }}
+                    .container {{ max-width: 600px; margin: 50px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center; }}
+                    h1 {{ color: #333; margin: 0 0 10px 0; }}
+                    p {{ color: #666; margin: 10px 0; line-height: 1.6; }}
+                    .code {{ background: #f0f0f0; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 12px; overflow-x: auto; }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>⏳ Preview Not Available</h1>
+                    <p>The generated code for this project hasn't been created yet.</p>
+                    <p style="color: #999; font-size: 14px;">
+                        This happens when:<br>
+                        • Code generation is still in progress<br>
+                        • The generation was cancelled<br>
+                        • Files were deleted after generation
+                    </p>
+                    <p>Try generating a new project or refreshing the page.</p>
+                </div>
+            </body>
+            </html>
+            """
+            return HTMLResponse(content=error_html, status_code=200)
         
         # Determine content type
         suffix = generated_path.suffix.lower()

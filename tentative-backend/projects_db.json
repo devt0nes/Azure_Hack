@@ -11,5 +11,18 @@
     "error": null,
     "artifacts": [],
     "ledger_data": null
+  },
+  "07acbb5e-b015-4904-80ba-86f2b63aef04": {
+    "project_id": "07acbb5e-b015-4904-80ba-86f2b63aef04",
+    "project_name": "Project from clarification",
+    "user_intent": "I want you to create a simple website with no backend, no ml, no devops, no database. Just a front page. Very nice looking front page. Thats it",
+    "description": null,
+    "status": "completed",
+    "created_at": "2026-03-10T07:31:02.933571",
+    "updated_at": "2026-03-10T07:33:16.767796",
+    "progress": 100,
+    "error": null,
+    "artifacts": [],
+    "ledger_data": null
   }
 }
