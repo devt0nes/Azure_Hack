@@ -118,11 +118,32 @@ class HealthResponse(BaseModel):
 class ProjectManager:
     """
     Manages project state and execution tracking.
-    In production, this should use Cosmos DB.
+    Persists projects to disk for recovery across restarts.
     """
-    def __init__(self):
+    def __init__(self, storage_file: str = "./projects_db.json"):
         self.projects: Dict[str, Dict[str, Any]] = {}
         self.tasks: Dict[str, asyncio.Task] = {}
+        self.storage_file = Path(storage_file)
+        self._load_projects()
+
+    def _load_projects(self):
+        """Load projects from storage file"""
+        try:
+            if self.storage_file.exists():
+                with open(self.storage_file, 'r') as f:
+                    self.projects = json.load(f)
+                logger.info(f"Loaded {len(self.projects)} projects from {self.storage_file}")
+        except Exception as e:
+            logger.error(f"Failed to load projects: {e}")
+            self.projects = {}
+
+    def _save_projects(self):
+        """Save projects to storage file"""
+        try:
+            with open(self.storage_file, 'w') as f:
+                json.dump(self.projects, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save projects: {e}")
 
     def create_project(self, name: str, intent: str, description: str = None) -> str:
         """Create a new project and return its ID"""
@@ -140,6 +161,7 @@ class ProjectManager:
             "artifacts": [],
             "ledger_data": None,
         }
+        self._save_projects()
         return project_id
 
     def get_project(self, project_id: str) -> Optional[Dict]:
@@ -155,6 +177,7 @@ class ProjectManager:
                 self.projects[project_id]["progress"] = progress
             if error:
                 self.projects[project_id]["error"] = error
+            self._save_projects()
 
     def register_task(self, project_id: str, task: asyncio.Task):
         """Register a background task"""
@@ -164,6 +187,7 @@ class ProjectManager:
         """Add artifact to project"""
         if project_id in self.projects:
             self.projects[project_id]["artifacts"].append(artifact.dict())
+            self._save_projects()
 
 
 # Global project manager
@@ -181,33 +205,69 @@ class OrchestrationService:
     @staticmethod
     async def generate_code(project_id: str, project_data: Dict) -> Dict:
         """
-        Run the code generation pipeline asynchronously
+        Run the code generation pipeline asynchronously with timeout protection
         """
         try:
             project_manager.update_project_status(project_id, ProjectStatus.GENERATING_CODE, progress=10)
             
             logger.info(f"Starting code generation for project {project_id}")
             
-            # Run the main orchestration in a thread to avoid blocking
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: asyncio.run(
-                    orchestrator_module.main()
+            # Extract user intent and project name from project data
+            user_input = project_data.get("user_intent", "Create a web application")
+            project_name = project_data.get("project_name", f"Project-{project_id[:8]}")
+            owner_id = project_data.get("owner_id", project_id)
+            
+            logger.info(f"Project Intent: {user_input}")
+            logger.info(f"Project Name: {project_name}")
+            
+            # Run the main orchestration with a timeout (300 seconds = 5 minutes max per request)
+            try:
+                # Set timeout for orchestration
+                orchestration_task = orchestrator_module.main(
+                    user_input=user_input,
+                    project_name=project_name,
+                    owner_id=owner_id
                 )
-            )
-            
-            project_manager.update_project_status(project_id, ProjectStatus.COMPLETED, progress=100)
-            logger.info(f"Code generation completed for project {project_id}")
-            
-            return {
-                "status": "success",
-                "project_id": project_id,
-                "message": "Code generation completed"
-            }
+                
+                # Execute with timeout
+                result = await asyncio.wait_for(orchestration_task, timeout=300.0)
+                
+                logger.info(f"Orchestration completed. Result: {result}")
+                
+                # Update progress to 90% after orchestration completes
+                project_manager.update_project_status(project_id, ProjectStatus.GENERATING_CODE, progress=90)
+                
+                # Mark as completed
+                project_manager.update_project_status(project_id, ProjectStatus.COMPLETED, progress=100)
+                logger.info(f"Code generation completed for project {project_id}")
+                
+                return {
+                    "status": "success",
+                    "project_id": project_id,
+                    "message": "Code generation completed"
+                }
+            except asyncio.TimeoutError:
+                error_msg = "Code generation timed out after 5 minutes"
+                logger.error(f"{error_msg} for project {project_id}")
+                project_manager.update_project_status(
+                    project_id,
+                    ProjectStatus.FAILED,
+                    error=error_msg,
+                    progress=10
+                )
+                raise
+            except Exception as e:
+                logger.error(f"Orchestration failed for project {project_id}: {str(e)}", exc_info=True)
+                project_manager.update_project_status(
+                    project_id,
+                    ProjectStatus.FAILED,
+                    error=f"Orchestration failed: {str(e)}",
+                    progress=10
+                )
+                raise
         
         except Exception as e:
-            logger.error(f"Code generation failed for project {project_id}: {str(e)}")
+            logger.error(f"Code generation error for project {project_id}: {str(e)}", exc_info=True)
             project_manager.update_project_status(
                 project_id,
                 ProjectStatus.FAILED,
@@ -535,6 +595,343 @@ async def list_projects():
             }
             for p in project_manager.projects.values()
         ]
+    }
+
+
+# ==========================================
+# COMPATIBILITY ENDPOINTS (Legacy Frontend Support)
+# ==========================================
+
+class ClarifyRequest(BaseModel):
+    """Legacy clarify request"""
+    project_id: str
+    user_input: str
+
+
+@app.post("/clarify", tags=["Compatibility"])
+async def clarify_intent(request: ClarifyRequest, background_tasks: BackgroundTasks):
+    """
+    Legacy Director clarification endpoint (compatibility layer)
+    Maps to new project creation workflow and triggers code generation
+    """
+    try:
+        # Check if project exists
+        project = project_manager.get_project(request.project_id)
+        
+        if not project:
+            # Create new project from clarification
+            project_id = project_manager.create_project(
+                name=f"Project from clarification",
+                intent=request.user_input,
+                description=None
+            )
+            project = project_manager.get_project(project_id)
+            
+            # Update status to queued and trigger code generation
+            project_manager.update_project_status(project_id, ProjectStatus.QUEUED, progress=5)
+            
+            # Queue code generation as background task
+            background_tasks.add_task(
+                OrchestrationService.generate_code,
+                project_id,
+                project
+            )
+            
+            logger.info(f"Clarify: Created project {project_id} and queued code generation")
+        else:
+            # Project already exists, use its ID
+            project_id = request.project_id
+        
+        # Return director-style response with the actual project ID
+        return {
+            "director_reply": f"I understand you want to: {request.user_input}. I'll create a task breakdown and coordinate the agents.",
+            "project_id": project_id,
+            "status": "clarified"
+        }
+    except Exception as e:
+        logger.error(f"Clarify error: {str(e)}")
+        return {
+            "director_reply": "I'm processing your request. The orchestration will begin shortly.",
+            "project_id": request.project_id,
+            "status": "processing"
+        }
+
+
+@app.get("/aeg", tags=["Compatibility"])
+async def get_aeg(project_id: str = "default"):
+    """
+    Legacy AEG endpoint (compatibility layer)
+    Returns agent execution graph structure with real-time updates
+    """
+    try:
+        project = project_manager.get_project(project_id)
+        
+        if not project:
+            raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+        
+        user_intent = project.get("user_intent", "Create a web application")
+        status = project.get("status", "created")
+        
+        # If ledger_data exists (from actual generation), return it with real task info
+        if project.get("ledger_data"):
+            ledger_data = project["ledger_data"]
+            # Enhance with current status and progress
+            return {
+                **ledger_data,
+                "project_id": project_id,
+                "status": "COMPLETED" if status == "completed" else "IN_PROGRESS",
+                "progress": project.get("progress", 0)
+            }
+        
+        # For projects in progress, generate task structure based on intent
+        agents = ["frontend_engineer"]
+        if "backend" in user_intent.lower() or "api" in user_intent.lower():
+            agents.insert(0, "backend_engineer")
+        if "database" in user_intent.lower() or "db" in user_intent.lower():
+            agents.append("database_architect")
+        if "test" in user_intent.lower() or "qa" in user_intent.lower():
+            agents.append("qa_engineer")
+        if "deploy" in user_intent.lower() or "devops" in user_intent.lower():
+            agents.append("devops_engineer")
+        
+        dependencies = {
+            "backend_engineer": [],
+            "frontend_engineer": [d for d in ["backend_engineer"] if d in agents],
+            "database_architect": [],
+            "qa_engineer": ["backend_engineer", "frontend_engineer"],
+            "devops_engineer": ["backend_engineer", "frontend_engineer"],
+        }
+        
+        filtered_deps = {agent: [d for d in dependencies.get(agent, []) if d in agents] for agent in agents}
+        
+        # Group agents by dependency level
+        level_0 = [a for a in agents if not filtered_deps[a]]
+        level_1 = [a for a in agents if filtered_deps[a]]
+        parallel_groups = [level_0] + ([level_1] if level_1 else [])
+        
+        # Build task ledger with real task structure
+        task_ledger = []
+        task_names = ["Frontend Development", "Backend Development", "Database Setup", "QA Testing", "Deployment"]
+        task_id = 1
+        for group_idx, group in enumerate(parallel_groups):
+            for agent in group:
+                task_name = f"{agent.replace('_', ' ').title()}: {task_names[min(task_id-1, len(task_names)-1)]}"
+                task_ledger.append({
+                    "id": task_id,
+                    "name": task_name,
+                    "agent": agent,
+                    "status": "IN_PROGRESS" if status == "generating_code" else "PENDING",
+                    "progress": project.get("progress", 0) if status == "generating_code" else 0,
+                    "estimated_duration": "5-10 minutes",
+                    "dependencies": filtered_deps.get(agent, [])
+                })
+                task_id += 1
+        
+        return {
+            "project_id": project_id,
+            "project_name": project.get("project_name", f"Project {project_id[:8]}"),
+            "status": "IN_PROGRESS" if status == "generating_code" else "DRAFT",
+            "progress": project.get("progress", 0),
+            "user_intent": user_intent,
+            "task_ledger": task_ledger,
+            "agent_specifications": {
+                "required_agents": agents,
+                "agent_dependencies": filtered_deps,
+                "parallel_execution_groups": parallel_groups
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"AEG error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch AEG")
+
+
+@app.get("/api/preview/{project_id}/{path:path}", tags=["Preview"])
+async def serve_preview(project_id: str, path: str = ""):
+    """
+    Serve generated frontend code for preview
+    Fetches from Cosmos DB (preferred) or falls back to disk
+    """
+    try:
+        from fastapi.responses import StreamingResponse
+        import io
+        
+        # Determine filename - if path is empty or ends with /, try index.html
+        filename = path.strip("/") if path and path.strip() != "/" else "index.html"
+        
+        # Try Cosmos DB first
+        try:
+            cosmos_manager = orchestrator_module.CosmosManager()
+            cosmos_manager.initialize()
+            
+            # Query for the artifact in Cosmos DB
+            query = f"""
+                SELECT c.content, c.filename FROM c 
+                WHERE c.project_id = @project_id 
+                AND c.type = 'artifact.code' 
+                AND c.filename = @filename
+            """
+            items = list(cosmos_manager.exchange_log_container.query_items(
+                query=query,
+                parameters=[
+                    {"name": "@project_id", "value": project_id},
+                    {"name": "@filename", "value": filename}
+                ]
+            ))
+            
+            if items:
+                content = items[0].get('content')
+                if content:
+                    # Determine content type
+                    suffix = filename.lower()
+                    content_types = {
+                        '.html': 'text/html',
+                        '.css': 'text/css',
+                        '.js': 'application/javascript',
+                        '.json': 'application/json',
+                        '.png': 'image/png',
+                        '.jpg': 'image/jpeg',
+                        '.gif': 'image/gif',
+                        '.svg': 'image/svg+xml',
+                    }
+                    
+                    # Match by extension
+                    content_type = 'application/octet-stream'
+                    for ext, ctype in content_types.items():
+                        if suffix.endswith(ext):
+                            content_type = ctype
+                            break
+                    
+                    # Return content as stream
+                    return StreamingResponse(
+                        iter([content.encode('utf-8') if isinstance(content, str) else content]),
+                        media_type=content_type
+                    )
+        except Exception as cosmos_error:
+            logger.warning(f"Could not fetch from Cosmos DB: {cosmos_error}, falling back to disk")
+        
+        # Fallback to disk
+        generated_path = Path("./generated_code") / "frontend_engineer" / filename
+        
+        # Security check: ensure path doesn't escape the frontend_engineer directory
+        base_path = Path("./generated_code") / "frontend_engineer"
+        try:
+            generated_path.resolve().relative_to(base_path.resolve())
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Access denied")
+        
+        if not generated_path.exists():
+            raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+        
+        # Determine content type
+        suffix = generated_path.suffix.lower()
+        content_types = {
+            '.html': 'text/html',
+            '.css': 'text/css',
+            '.js': 'application/javascript',
+            '.json': 'application/json',
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.svg': 'image/svg+xml',
+        }
+        content_type = content_types.get(suffix, 'application/octet-stream')
+        
+        return FileResponse(generated_path, media_type=content_type)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Preview error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to serve preview")
+
+
+class ExecuteRequest(BaseModel):
+    """Legacy execute request"""
+    project_id: str
+
+
+@app.post("/execute", tags=["Compatibility"])
+async def execute_project_compat(request: ExecuteRequest, background_tasks: BackgroundTasks):
+    """
+    Legacy execution endpoint (compatibility layer)
+    Triggers code generation for existing or new project
+    """
+    try:
+        project = project_manager.get_project(request.project_id)
+        
+        if not project:
+            # Create placeholder project
+            project_id = project_manager.create_project(
+                name=f"Project {request.project_id[:8]}",
+                intent="User initiated execution",
+                description=None
+            )
+            project = project_manager.get_project(project_id)
+        
+        # Queue generation if not already running
+        if project["status"] in [ProjectStatus.CREATED, ProjectStatus.FAILED]:
+            project_manager.update_project_status(request.project_id, ProjectStatus.QUEUED, progress=5)
+            background_tasks.add_task(
+                OrchestrationService.generate_code,
+                request.project_id,
+                project
+            )
+        
+        return {
+            "message": "Execution started",
+            "project_id": request.project_id,
+            "status": "running"
+        }
+    except Exception as e:
+        logger.error(f"Execute error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to start execution")
+
+
+class TutorRequest(BaseModel):
+    """Legacy tutor request"""
+    project_id: str
+    question: str
+    context: Optional[Dict] = {}
+
+
+@app.post("/tutor/ask", tags=["Compatibility"])
+async def tutor_ask(request: TutorRequest):
+    """
+    Legacy Learning Mode tutor endpoint (compatibility layer)
+    """
+    # For now, return helpful explanations about the system
+    question_lower = request.question.lower()
+    
+    response_text = "I'm the Agentic Nexus learning assistant. "
+    
+    if "explain" in question_lower or "what is" in question_lower:
+        response_text += "The Agentic Nexus uses specialized AI agents to collaboratively build full-stack applications. Each agent has a specific role (Backend, Frontend, DevOps, QA) and they coordinate through a shared task ledger."
+    elif "aeg" in question_lower or "graph" in question_lower:
+        response_text += "The Agent Execution Graph (AEG) shows dependencies between agents. Agents with no dependencies run first, while dependent agents wait for their prerequisites to complete."
+    elif "cost" in question_lower:
+        response_text += "Cost tracking monitors token usage from AI calls. Each agent reports tokens consumed, which is converted to estimated cost based on the model pricing."
+    else:
+        response_text += "Ask me about: agent execution, the AEG (graph), cost tracking, or how the orchestration works."
+    
+    return {
+        "response": response_text,
+        "level": "overview",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@app.get("/api/tunnel-status", tags=["Compatibility"])
+async def tunnel_status():
+    """
+    Legacy tunnel status endpoint (compatibility layer)
+    Returns localhost info for preview functionality
+    """
+    return {
+        "status": "local",
+        "tunnel_url": "http://localhost:5173",
+        "port": 5173,
+        "message": "Running on localhost (no tunnel configured)"
     }
 
 
