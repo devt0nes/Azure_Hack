@@ -1,0 +1,36 @@
+# Core FastAPI (upgraded for Python 3.13 compatibility)
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.6
+pydantic-settings==2.7.1
+
+# Azure Services
+azure-cosmos==4.5.1
+azure-servicebus==7.11.0
+azure-storage-blob==12.19.0
+azure-keyvault-secrets==4.7.0
+azure-identity==1.14.0
+
+# OpenAI (upgraded for compatibility)
+openai==1.59.6
+python-dotenv==1.0.0
+
+# Async support
+aiofiles==23.2.1
+
+# HTTP/Web
+httpx==0.25.1
+requests==2.31.0
+
+# Utilities
+python-multipart==0.0.6
+typing-extensions>=4.12.2
+
+# Logging & Monitoring
+python-json-logger==2.0.7
+
+# Development (optional, remove from production)
+pytest==7.4.3
+pytest-asyncio==0.21.1
+black==23.11.0
+pylint==3.0.3

@@ -47,9 +47,9 @@ Creates Azure Dev Tunnel for public preview access.
 
 **Output:**
 ```
-✨ Tunnel active!
-📡 Public URL: https://abc123-5173.devtunnels.ms
-🔗 Forwarding to: http://localhost:5173
+Tunnel active!
+Public URL: https://abc123-5173.devtunnels.ms
+Forwarding to: http://localhost:5173
 ```
 
 ---

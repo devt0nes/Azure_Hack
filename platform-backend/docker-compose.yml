@@ -1,0 +1,83 @@
+version: '3.9'
+
+services:
+  # FastAPI Backend
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+      - AZURE_OPENAI_KEY=${AZURE_OPENAI_KEY}
+      - AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT:-gpt-4o}
+      - AZURE_OPENAI_API_VERSION=${AZURE_OPENAI_API_VERSION:-2024-05-01-preview}
+      - COSMOS_CONNECTION_STR=${COSMOS_CONNECTION_STR}
+      - SERVICE_BUS_STR=${SERVICE_BUS_STR}
+      - DATABASE_NAME=agentic-nexus-db
+      - MAX_PARALLEL_AGENTS=5
+      - AGENT_TIMEOUT_SECONDS=300
+    volumes:
+      - ./generated_code:/app/generated_code
+      - ./agent_logs:/app/agent_logs
+      - /app/__pycache__
+      - /app/.pytest_cache
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --log-level info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - nexus-network
+    depends_on:
+      - cosmos_emulator
+
+  # Azure Cosmos DB Emulator (Optional - for local testing)
+  cosmos_emulator:
+    image: mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:latest
+    environment:
+      - COSMOS_DB=true
+    ports:
+      - "8081:8081"
+      - "10251:10251"
+      - "10252:10252"
+      - "10253:10253"
+      - "10254:10254"
+    volumes:
+      - cosmos-data:/data/db
+    networks:
+      - nexus-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "https://localhost:8081/_dbs"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # Optional: Redis for caching/rate limiting (future feature)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - nexus-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+networks:
+  nexus-network:
+    driver: bridge
+
+volumes:
+  cosmos-data:
+  redis-data:

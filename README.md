@@ -2,6 +2,319 @@
 
 ---
 
+## Backend Integration & Migration — March 7, 2026
+
+### Platform Backend (Production)
+Integrated full Agentic Nexus backend to replace placeholder API:
+
+**Backend Replacement**
+- **Deleted**: Minimal `platform-backend` with placeholder endpoints
+- **Activated**: Full-featured backend from `tentative-backend` (now `platform-backend`)
+- Comprehensive FastAPI application with:
+  - Project lifecycle management (`/api/projects`)
+  - Real-time status tracking
+  - Artifact generation and download
+  - Deployment integration (Docker, Bicep, GitHub Actions)
+  - Cost estimation
+  - Audit logging
+
+**Compatibility Layer**
+Added legacy endpoint adapters for seamless frontend integration:
+- `POST /clarify` - Director clarification (maps to project creation)
+- `GET /aeg` - Agent Execution Graph (returns task ledger structure)
+- `POST /execute` - Project execution trigger
+- `POST /tutor/ask` - Learning assistant responses
+- `GET /api/tunnel-status` - Preview tunnel status
+
+**Architecture Improvements**
+- **Orchestration Engine**: Full multi-agent system with swarm coordination
+  - 9 specialized agents (Backend, Frontend, Database, DevOps, Security, QA, etc.)
+  - Dynamic task distribution and dependency management
+  - Parallel execution with smart coordination
+  - Checkpoint/resume capability
+- **Azure Integration**:
+  - Azure OpenAI (GPT-4o/GPT-4o-mini)
+  - Cosmos DB for persistence
+  - Service Bus for agent coordination
+  - Container Apps deployment ready
+- **Deployment Automation**:
+  - Automatic Dockerfile generation
+  - Bicep infrastructure templates
+  - GitHub Actions CI/CD pipelines
+  - Monthly cost estimation
+
+**Bug Fixes**
+- Fixed `deployment_integration.py` class scoping issues
+- Corrected language inference logic (TypeScript detection)
+- Made orchestrator accept API-driven project requests (removed hardcoded input)
+
+**Running the Backend**
+```bash
+cd platform-backend
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Configure Azure credentials
+cp .env.example .env
+# Edit .env with your Azure OpenAI/Cosmos/Service Bus credentials
+
+# Run locally
+uvicorn app:app --reload --port 8000
+
+# Or use Docker
+docker-compose up --build
+```
+
+**API Documentation**
+- Interactive docs: `http://localhost:8000/api/docs`
+- OpenAPI schema: `http://localhost:8000/api/openapi.json`
+- See `platform-backend/API_DOCUMENTATION.md` for detailed endpoint reference
+
+**Frontend Configuration**
+Updated `.env` to point to integrated backend:
+```env
+VITE_API_BASE_URL=http://localhost:8000
+VITE_TUTOR_API_URL=http://localhost:8000
+```
+
+### Quick Start Guide
+
+**1. Start Backend**
+```bash
+# Terminal 1
+cd platform-backend
+
+# Install dependencies (one-time)
+pip install -r requirements.txt
+
+# Configure Azure credentials
+cp .env.example .env
+# Edit .env with Azure credentials (OpenAI endpoint, key, etc.)
+
+# Start server (use python -m if uvicorn not on PATH)
+python -m uvicorn app:app --reload --port 8000
+```
+
+**2. Start Frontend**
+```bash
+# Terminal 2
+cd platform-frontend
+npm install  # one-time
+npm run dev
+# Opens at http://localhost:5173 (or next available port)
+```
+
+**3. Access Application**
+- Frontend UI: `http://localhost:5173`
+- Backend API Docs: `http://localhost:8000/api/docs`
+- Login with any button (hardcoded auth, no real credentials needed)
+
+**4. Create a Project**
+- Use Director chat to describe your project
+- System generates Agent Execution Graph
+- Monitor progress in real-time
+- Download generated code artifacts
+
+### Project Structure (Simplified)
+```
+Azure_Hack/
+├── platform-backend/     # FastAPI + Orchestration Engine (production)
+├── platform-frontend/    # React + Vite UI
+└── infrastructure/       # Bicep templates, deployment scripts
+```
+
+---
+
+## Landing Page & Authentication Flow — March 7, 2026
+
+### Landing Page
+Created complete marketing landing page that serves as the entry point:
+
+**Hero Section**
+- Large title and tagline explaining the platform
+- "Get Started" call-to-action button
+- Animated gradient backgrounds and floating elements
+- Navigation bar with Login and Sign Up buttons
+
+**How It Works Section**
+- 3-step workflow explanation:
+  1. **Direct & Clarify** - Communicate with Director Agent
+  2. **Orchestrate Agents** - System generates Agent Execution Graph
+  3. **Monitor & Execute** - Real-time tracking with logs and cost monitoring
+- Glassmorphic cards with gradient icons
+- Hover effects for visual feedback
+
+**Subscription Plans**
+- **Starter ($0/month)**: 5 projects, basic orchestration, community support
+- **Professional ($49/month)**: Unlimited projects, priority support, advanced analytics (Popular badge)
+- **Enterprise (Custom)**: Everything + dedicated infrastructure, SLA guarantees, white-label
+
+**Footer**
+- Copyright and branding information
+
+### Authentication Flow (Hardcoded)
+- **Default state**: Shows landing page
+- **Login/Signup actions**: All buttons (Nav Login, Nav Sign Up, Get Started, plan buttons) trigger hardcoded login
+- **Post-login**: Redirects to full Command Center application with all current features
+- **State management**: `isLoggedIn` boolean in App.jsx (currently no real auth)
+
+### Technical Implementation
+- Created `LandingPage.jsx` component
+- App.jsx conditionally renders: `!isLoggedIn ? <LandingPage /> : <CommandCenter />`
+- `handleLogin()` function toggles state (hardcoded, no real authentication)
+- Landing page uses same design system (glassmorphism, gradients, animations)
+- All existing features remain behind the "login" wall
+
+### User Flow
+1. User lands on marketing page with platform info
+2. User clicks any login/signup/CTA button
+3. State changes to logged in (instant, no backend call)
+4. App shows full Command Center interface with all features
+
+---
+
+## Prominent Director & Side-Panel Assistant — March 7, 2026
+
+### Director Agent - Main Focus
+Made Director Agent the primary, most prominent element:
+- **Larger layout**: Changed grid from `[1fr_2fr_1fr]` to `[300px_1fr_300px]` giving Director maximum space
+- **Enhanced styling**: 
+  - Border changed to `border-2` with ember accent color (`border-ember/30`)
+  - Stronger background gradient (`from-white/90`)
+  - Larger shadow (`shadow-xl` → `shadow-2xl` on hover)
+  - Min-height increased to 700px
+- **Visual accent bar**: Added vertical ember gradient bar next to title
+- **Larger title**: Text-xl with ember gradient coloring
+- **Better padding**: Increased to p-8 for spacious feel
+
+### Learning Assistant - Side Panel
+Converted from full-screen modal to helpful side panel:
+- **Side panel design**: Slides in from right at 500px width
+- **Backdrop**: Semi-transparent overlay with backdrop-blur
+- **Emerald theming**: Green gradient accent to differentiate from Director (orange/ember)
+- **Compact header**: Shows "Learning Assistant" with subtitle "Ask questions and get contextual help"
+- **Easy dismiss**: Click backdrop or close button (Close)
+- **Smooth animation**: Uses existing slide-in-right animation
+- **Non-intrusive**: Appears alongside content, doesn't cover main Director view
+- **Fixed positioning**: Right-aligned panel stays on screen while scrolling
+
+### UX Improvements
+- Director always visible and takes center stage
+- Learning Assistant renamed to "Assistant" on button (shorter, clearer)
+- Better visual hierarchy with color-coded sections (ember = Director, emerald = Assistant)
+- Side panel design keeps focus on main Director workflow
+- Assistant panel doesn't compete for attention—it's a helpful sidebar
+
+---
+
+## Header & Learning Modal Updates — March 7, 2026
+
+### Prominent Header Design
+Enhanced the header to be more prominent and informative:
+- **Larger title**: Increased from text-4xl to text-5xl/6xl (responsive)
+- **Tagline/Description**: Added descriptive paragraph explaining the platform's purpose ("Orchestrate multi-agent AI workflows...")
+- **Better spacing**: Increased vertical padding (py-12) and margin-bottom (mb-12)
+- **Improved typography**: Larger tracking on brand label, better line-height on description
+- **Enhanced layout**: Uses flex-1 with min-width to maintain responsive flexibility
+
+### Learning Agent Modal
+Converted Learning Agent from tab to popup modal:
+- **Icon Button**: Replaced Learning tab with a prominent button next to "Director Agent" header
+- **Full-screen Modal**: Opens 85vh modal overlay with glassmorphic background blur
+- **Easy Access**: Click "Learning" button to open, "Close" to dismiss
+- **Better UX**: Learning content no longer competes for space in main layout
+- **Smooth Animation**: Modal uses fade-in animation on open
+- **Responsive**: Modal adapts to screen size with max-w-6xl constraint
+
+### Layout Improvements
+- **Director Section**: Now always visible (no tab switching needed)
+- **Content Flow**: Director conversation + Preview always shown side-by-side
+- **Cleaner Navigation**: Simpler interface without tab switching for main workflow
+- **Modal State**: Added `showLearningModal` state for popup control
+
+---
+
+## Visual Enhancements — March 7, 2026
+
+### Latest changes
+Elevated UI to React Bits-inspired glassmorphism and animations for modern, premium aesthetic:
+
+**Tailwind Config Upgrades**
+- Added custom animations: `fade-in`, `fade-in-up`, `slide-in-right`, `glow-pulse`, `float`, `shimmer`
+- Extended keyframes for smooth motion effects
+- New box-shadow variants: `glow-sm` (20px), `glass` (8px depth effect)
+- Backdrop blur variant: `blur-xs` for fine-grained frosted glass effects
+
+**AgentCard Enhancement**
+- Gradient backgrounds tied to state (blue/amber/green/rose gradients)
+- Glassmorphic design with backdrop blur and semi-transparent layers
+- Gradient progress bars with color-coded animations
+- Shimmer effect on active progress (0-100%)
+- Hover scale effect (`group-hover:scale-105`) with glass depth shadow
+- Glow effects for RUNNING state with shadow pulsing
+- Progress percentage display + status indicator ("In Progress" / "Waiting" / "Done")
+
+**CostTicker Animation**
+- Smooth number counter animation (cost increments with 0.1 lerp, tokens tick up)
+- Gradient text color: ember → orange → amber gradient
+- Glassmorphic background with radial gradient overlay
+- Subtle glow shadow effect
+- Indicators: cost and token count
+
+**LogStream Styling**
+- Animated fade-in for each log entry on scroll
+- Glassmorphic card background with gradient (sand → white → haze)
+- Individual log items: rounded border, backdrop blur, hover brightness increase
+- Bold emoji bullets (›) with proper spacing
+- Semi-transparent white cards with hover effect
+
+**Main App Layout**
+- Dynamic gradient background: sand → white → haze (left-to-right)
+- Floating animated blobs in background (2 elements, staggered animation)
+- Header animation: fade-in on mount
+- Gradient text for title and labels
+- Animated connection status indicator with glow pulse when connected
+- Connected state: emerald with green glow shadow
+
+**Component Panels (Glassmorphic)**
+- All sections: white/glass backgrounds with backdrop blur
+- Rounded borders: 3xl (24px) for generous curves
+- Hover states: border brightness + shadow enhancement
+- Gradient underlay on hover for subtle depth
+- Tab buttons: Gradient backgrounds for active states (ember/emerald)
+- Shadow handling: glass shadow instead of plain shadow-sm
+
+**Button Styling**
+- Tab buttons now use full gradient backgrounds when active
+- Director tab: ember → orange gradient
+- Learning tab: emerald → teal gradient
+- Transitions smooth with 300ms duration
+- Enhanced visual hierarchy with proper spacing
+
+### Technical Details
+- Animations use CSS-in-Tailwind with cubic-bezier timing for natural motion
+- Float animation: 6s cycle, 20px Y-axis travel
+- Shimmer effect: 2s background-position animation
+- All transitions: 0.3s ease-out for responsive feel
+- Glow effects use rgba shadows for soft, modern look
+
+### Notes
+- Design inspiration: React Bits (reactbits.dev) aesthetic patterns
+- Glassmorphism + backdrop blur requires modern browser support
+- CSS animations run at 60fps with GPU acceleration (transform/opacity)
+- Gradient text uses `bg-clip-text` for clean, sharp color transitions
+- All enhancements are production-ready with smooth performance
+
+### Next steps
+1. Test on actual device with frontend `npm run dev`
+2. Fine-tune animation timings if needed
+3. Add dark mode variant (optional enhancement)
+4. Wire up real data to see animations in action during agent execution
+5. Consider adding stagger delays to card animations for sequence effect
+
+---
+
 ## 📅 Day 1 — February 27, 2026
 
 ### Latest changes
@@ -269,7 +582,7 @@ Implemented local preview with Docker Compose and Azure Dev Tunnels:
 7. Share tunnel URL with team for collaborative preview
 
 ---
-## 📊 Day 4 Enhancement — March 3, 2026
+## Day 4 Enhancement — March 3, 2026
 
 ### Latest changes
 Enhanced AEG visualization with task-ledger format support and focused preview:

@@ -6,7 +6,6 @@ export default function Preview() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [refreshKey, setRefreshKey] = useState(0)
-  const [isExpanded, setIsExpanded] = useState(false)
 
   useEffect(() => {
     loadTunnelInfo()
@@ -35,14 +34,10 @@ export default function Preview() {
     }
   }
 
-  const toggleExpanded = () => {
-    setIsExpanded((prev) => !prev)
-  }
-
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
-      <div className="mb-3 flex items-center justify-between">
+      <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <p className="text-sm font-semibold text-ink/70">Local Preview</p>
           <p className="mt-1 text-xs text-ink/50">
@@ -54,26 +49,20 @@ export default function Preview() {
         </div>
 
         {/* Controls */}
-        <div className="flex gap-2">
-          <button
-            onClick={toggleExpanded}
-            className="rounded-md bg-ink/5 px-3 py-1.5 text-xs font-medium text-ink/70 transition hover:bg-ink/10"
-          >
-            {isExpanded ? '🗕 Collapse' : '🗖 Expand'}
-          </button>
+        <div className="flex w-full flex-wrap gap-2 sm:w-auto sm:justify-end">
           <button
             onClick={handleRefresh}
             className="rounded-md bg-ink/5 px-3 py-1.5 text-xs font-medium text-ink/70 transition hover:bg-ink/10"
             disabled={loading}
           >
-            🔄 Refresh
+            Refresh
           </button>
           <button
             onClick={handleOpenExternal}
             className="rounded-md bg-ember px-3 py-1.5 text-xs font-medium text-white transition hover:bg-ember/90"
             disabled={!tunnelInfo?.url || loading}
           >
-            🔗 Open External
+            Open External
           </button>
         </div>
       </div>
@@ -86,7 +75,7 @@ export default function Preview() {
           </p>
           {tunnelInfo.status === 'local' && (
             <p className="mt-1 text-xs text-ink/50">
-              💡 Run <code className="rounded bg-ink/10 px-1 py-0.5">start-devtunnel.ps1</code> to
+              Run <code className="rounded bg-ink/10 px-1 py-0.5">start-devtunnel.ps1</code> to
               expose via public URL
             </p>
           )}
@@ -94,11 +83,7 @@ export default function Preview() {
       )}
 
       {/* Preview iframe */}
-      <div
-        className={`min-h-[320px] transition-all duration-200 ${
-          isExpanded ? 'h-[560px]' : 'h-[380px]'
-        }`}
-      >
+      <div className="h-[380px] min-h-[320px] transition-all duration-200">
         {loading && (
           <div className="flex h-full items-center justify-center rounded-lg border border-ink/10 bg-white/60">
             <p className="text-sm text-ink/50">Loading preview...</p>
@@ -128,7 +113,7 @@ export default function Preview() {
       {/* Docker hint */}
       <div className="mt-3 rounded-lg border border-ink/10 bg-haze/50 px-3 py-2">
         <p className="text-xs text-ink/60">
-          🐳 <span className="font-semibold">Docker Compose:</span> Run{' '}
+          <span className="font-semibold">Docker Compose:</span> Run{' '}
           <code className="rounded bg-ink/10 px-1 py-0.5">
             docker-compose -f infrastructure/docker-compose.template.yml up
           </code>{' '}

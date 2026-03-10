@@ -10,7 +10,7 @@ const initialMessages = [
   },
 ]
 
-export default function Conversation({ projectId }) {
+export default function Conversation({ projectId, onProjectChange }) {
   const [messages, setMessages] = useState(initialMessages)
   const [input, setInput] = useState('')
   const [isSending, setIsSending] = useState(false)
@@ -34,10 +34,15 @@ export default function Conversation({ projectId }) {
     setIsSending(true)
 
     try {
+      const requestProjectId = projectId || `project-${Date.now()}`
       const response = await clarify({
-        projectId,
+        projectId: requestProjectId,
         userInput: userMessage.content,
       })
+
+      if (response?.project_id && onProjectChange) {
+        onProjectChange(response.project_id)
+      }
 
       const directorMessage = {
         id: `director-${Date.now()}`,

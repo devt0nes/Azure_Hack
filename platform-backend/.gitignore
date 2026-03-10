@@ -1,13 +1,17 @@
-# Byte-compiled / optimized / DLL files
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
-
-# Distribution / packaging
 .Python
+env/
+venv/
+ENV/
 build/
 develop-eggs/
 dist/
@@ -20,57 +24,40 @@ parts/
 sdist/
 var/
 wheels/
-pip-wheel-metadata/
-share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
 MANIFEST
 
-# PyInstaller
-*.manifest
-*.spec
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-
-# Virtual environments
-venv/
-env/
-ENV/
-env.bak/
-venv.bak/
-
-# Environment variables
-.env
-.env.local
-*.env
-
-# IDEs
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
 
-# Pyre type checker
-.pyre/
+# Logs
+*.log
+logs/
 
-# Azure
-.azure/
+# IDE specific
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+*.bak
+*.tmp
+/data/
+/output/
