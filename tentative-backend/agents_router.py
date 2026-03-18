@@ -80,7 +80,7 @@ def _enrich(agent: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
-@router.get("/", summary="List all agents in the catalog")
+@router.get("", summary="List all agents in the catalog")
 def list_agents(
     tier: Optional[int] = Query(None, description="Filter by tier: 1 (Module) or 2 (Support)"),
     role: Optional[str] = Query(None, description="Case-insensitive role name substring filter"),

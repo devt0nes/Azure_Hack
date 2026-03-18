@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
+from agents_router import router as agents_router
 # Import main orchestration
 import main as orchestrator_module
 
@@ -51,6 +51,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(agents_router)
 
 # ==========================================
 # DATA MODELS
