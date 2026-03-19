@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="A simple, visually appealing single-page website.">
+    <meta http-equiv="X-UA-Compatible" content="ie=edge">
+    <title>Project from Clarification</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Additional custom styles */
+        .hero {
+            background-image: url('assets/images/hero-bg.jpg');
+            background-size: cover;
+            background-position: center;
+            height: 100vh;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 text-gray-800">
+
+    <!-- Header Section -->
+    <header class="bg-white shadow-lg">
+        <div class="container mx-auto px-4 py-4 flex justify-between items-center">
+            <h1 class="text-2xl font-bold text-blue-600">Project Clarification</h1>
+            <nav>
+                <ul class="flex space-x-6 text-gray-600">
+                    <li><a href="#about" class="hover:text-blue-600">About</a></li>
+                    <li><a href="#features" class="hover:text-blue-600">Features</a></li>
+                    <li><a href="#contact" class="hover:text-blue-600">Contact</a></li>
+                </ul>
+            </nav>
+        </div>
+    </header>
+
+    <!-- Hero Section -->
+    <section class="hero flex items-center justify-center text-center text-white">
+        <div>
+            <h2 class="text-4xl font-bold">Welcome to Our Project</h2>
+            <p class="mt-4 text-lg">A simple, visually appealing front page built with modern design principles.</p>
+            <a href="#about" class="mt-6 inline-block px-6 py-3 bg-blue-600 text-white rounded-lg shadow-md hover:bg-blue-700">Learn More</a>
+        </div>
+    </section>
+
+    <!-- About Section -->
+    <section id="about" class="py-20">
+        <div class="container mx-auto px-4 text-center">
+            <h2 class="text-3xl font-bold">About This Project</h2>
+            <p class="mt-4 text-gray-600">This is a single-page website focusing on high-quality design, responsiveness, and usability. Built without backend or database, it is optimized for performance and simplicity.</p>
+        </div>
+    </section>
+
+    <!-- Features Section -->
+    <section id="features" class="py-20 bg-gray-50">
+        <div class="container mx-auto px-4 text-center">
+            <h2 class="text-3xl font-bold">Features</h2>
+            <div class="mt-8 grid grid-cols-1 md:grid-cols-3 gap-8">
+                <div class="bg-white p-6 shadow-lg rounded-lg">
+                    <h3 class="text-xl font-semibold text-blue-600">Responsive Design</h3>
+                    <p class="mt-2 text-gray-600">Works seamlessly across devices of all sizes.</p>
+                </div>
+                <div class="bg-white p-6 shadow-lg rounded-lg">
+                    <h3 class="text-xl font-semibold text-blue-600">Minimalist Aesthetics</h3>
+                    <p class="mt-2 text-gray-600">Clean and simple design for better usability.</p>
+                </div>
+                <div class="bg-white p-6 shadow-lg rounded-lg">
+                    <h3 class="text-xl font-semibold text-blue-600">Performance Focused</h3>
+                    <p class="mt-2 text-gray-600">Optimized for fast loading and smooth interactions.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Contact Section -->
+    <section id="contact" class="py-20">
+        <div class="container mx-auto px-4 text-center">
+            <h2 class="text-3xl font-bold">Contact Us</h2>
+            <p class="mt-4 text-gray-600">Have questions or feedback? Feel free to reach out!</p>
+            <a href="mailto:contact@example.com" class="mt-6 inline-block px-6 py-3 bg-blue-600 text-white rounded-lg shadow-md hover:bg-blue-700">Email Us</a>
+        </div>
+    </section>
+
+    <!-- Footer Section -->
+    <footer class="bg-gray-800 text-white py-6">
+        <div class="container mx-auto px-4 text-center">
+            <p>&copy; 2026 Project Clarification. All rights reserved.</p>
+        </div>
+    </footer>
+
+</body>
+</html>

@@ -25,6 +25,18 @@ export default function LearningMode({ projectId }) {
     event.preventDefault()
     if (!input.trim() || isAsking) return
 
+    if (!projectId) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `tutor-${Date.now()}`,
+          role: 'tutor',
+          content: 'Select or create a project first so I can fetch project-aware guidance.',
+        },
+      ])
+      return
+    }
+
     const userMessage = {
       id: `user-${Date.now()}`,
       role: 'user',

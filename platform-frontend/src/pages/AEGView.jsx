@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from 'react'
+import { createPortal } from 'react-dom'
 import ReactFlow, {
   Background,
   Controls,
@@ -17,53 +18,6 @@ const STATE_COLORS = {
 }
 
 const nodeTypes = {}
-
-const SAMPLE_TASK_LEDGER = {
-  id: '4aceb9c6',
-  project_id: '4aceb9c6',
-  project_name: 'LegalDocs SaaS Platform',
-  status: 'DRAFT',
-  agent_specifications: {
-    required_agents: [
-      'backend_engineer',
-      'frontend_engineer',
-      'database_architect',
-      'devops_engineer',
-      'security_engineer',
-      'qa_engineer',
-      'solution_architect',
-      'api_designer',
-      'ml_engineer',
-    ],
-    agent_dependencies: {
-      solution_architect: [
-        'backend_engineer',
-        'frontend_engineer',
-        'database_architect',
-        'api_designer',
-      ],
-      backend_engineer: ['ml_engineer', 'database_architect', 'security_engineer'],
-      frontend_engineer: ['backend_engineer', 'security_engineer'],
-      api_designer: ['backend_engineer'],
-      ml_engineer: ['backend_engineer'],
-      database_architect: ['security_engineer'],
-      security_engineer: [],
-      devops_engineer: ['backend_engineer', 'database_architect'],
-      qa_engineer: ['backend_engineer', 'frontend_engineer'],
-    },
-    parallel_execution_groups: [
-      ['solution_architect'],
-      [
-        'backend_engineer',
-        'frontend_engineer',
-        'database_architect',
-        'security_engineer',
-      ],
-      ['api_designer', 'ml_engineer'],
-      ['qa_engineer', 'devops_engineer'],
-    ],
-  },
-}
 
 function titleCaseAgent(agentName) {
   return agentName
@@ -219,7 +173,7 @@ function toFlowGraph(payload) {
   throw new Error('Unsupported AEG payload format')
 }
 
-export default function AEGView({ projectId = 'demo-project' }) {
+export default function AEGView({ projectId }) {
   const [nodes, setNodes, onNodesChange] = useNodesState([])
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
   const [isLoading, setIsLoading] = useState(true)
@@ -228,29 +182,33 @@ export default function AEGView({ projectId = 'demo-project' }) {
   const [isFocused, setIsFocused] = useState(false)
 
   const fetchAEG = useCallback(async () => {
+    if (!projectId) {
+      setNodes([])
+      setEdges([])
+      setGraphMeta({ projectName: '', source: '' })
+      setError('No project selected yet.')
+      setIsLoading(false)
+      return
+    }
+
     try {
       setIsLoading(true)
       setError('')
-      let data
-      let source = 'api'
-
-      if (!import.meta.env.VITE_API_BASE_URL) {
-        data = SAMPLE_TASK_LEDGER
-        source = 'sample'
-      } else {
-        data = await getAEG({ projectId })
-      }
-
+      const data = await getAEG({ projectId })
       const { flowNodes, flowEdges } = toFlowGraph(data)
+
       setNodes(flowNodes)
       setEdges(flowEdges)
       setGraphMeta({
-        projectName: data.project_name || data.project_id || projectId,
-        source,
+        projectName: data?.project_name || data?.projectId || projectId,
+        source: 'api',
       })
-    } catch (err) {
-      setError('Unable to load AEG graph from payload')
-      console.error('AEG fetch failed:', err)
+    } catch (fetchError) {
+      console.error(fetchError)
+      setError('Unable to load AEG. Ensure backend is running and a project exists.')
+      setNodes([])
+      setEdges([])
+      setGraphMeta({ projectName: '', source: '' })
     } finally {
       setIsLoading(false)
     }
@@ -313,7 +271,7 @@ export default function AEGView({ projectId = 'demo-project' }) {
       <div className="flex items-center justify-between border-b border-ink/10 bg-sand/30 px-3 py-2 text-[11px]">
         <p className="text-ink/70">Project: {graphMeta.projectName || projectId}</p>
         <p className="uppercase tracking-wider text-ink/50">
-          Source: {graphMeta.source === 'sample' ? 'Sample Ledger' : 'Backend API'}
+          Source: Backend API
         </p>
       </div>
       <div className="group relative h-[300px] min-h-[260px]">
@@ -328,24 +286,32 @@ export default function AEGView({ projectId = 'demo-project' }) {
         </div>
       </div>
 
-      {isFocused && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-midnight/70 p-6">
-          <div className="w-full max-w-7xl rounded-2xl border border-ink/20 bg-white p-4 shadow-2xl">
-            <div className="mb-3 flex items-center justify-between">
-              <p className="text-sm font-semibold text-ink/70">Focused AEG Preview</p>
-              <button
-                onClick={closeFocusedGraph}
-                className="rounded-md bg-ink/5 px-3 py-1.5 text-xs font-medium text-ink/70 transition hover:bg-ink/10"
-              >
-                ✕ Close
-              </button>
+      {isFocused &&
+        typeof document !== 'undefined' &&
+        createPortal(
+          <div className="fixed inset-0 z-[120] flex items-center justify-center bg-midnight/75 p-4 backdrop-blur-sm">
+            <button
+              aria-label="Close focused AEG preview"
+              className="absolute inset-0"
+              onClick={closeFocusedGraph}
+            />
+            <div className="relative flex h-[92vh] w-full max-w-[96vw] flex-col rounded-2xl border border-ink/20 bg-white p-6 shadow-2xl">
+              <div className="mb-4 flex items-center justify-between">
+                <p className="text-sm font-semibold text-ink/70">Focused AEG Preview</p>
+                <button
+                  onClick={closeFocusedGraph}
+                  className="rounded-md bg-ink/5 px-3 py-1.5 text-xs font-medium text-ink/70 transition hover:bg-ink/10"
+                >
+                  Close
+                </button>
+              </div>
+              <div className="min-h-0 flex-1 rounded-lg border border-ink/10">
+                {renderGraph({ className: 'h-full w-full' })}
+              </div>
             </div>
-            <div className="h-[72vh] min-h-[520px] rounded-lg border border-ink/10">
-              {renderGraph({ className: 'h-full w-full' })}
-            </div>
-          </div>
-        </div>
-      )}
+          </div>,
+          document.body
+        )}
     </div>
   )
 }
