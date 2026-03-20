@@ -1,0 +1,16 @@
+// Purpose: Page for displaying detailed cookie policy information.
+// Dependencies: React
+import React from 'react';
+
+const CookiePolicy = () => {
+  return (
+    <div className="cookie-policy">
+      <h1>Cookie Policy</h1>
+      <p>
+        This is where your detailed cookie policy will be displayed.
+      </p>
+    </div>
+  );
+};
+
+export default CookiePolicy;

@@ -1,0 +1,838 @@
+﻿AGENTIC NEXUS
+End-to-End Design Document
+Unified Multi-Agent Builder Platform for the Next Billion Builders
+
+Microsoft Hackathon 2026  |  Azure AI Foundry  |  Agent Framework  |  MCP
+Track: The Next Billion Builders
+
+Version 1.0  |  2026
+1. Executive Summary
+Agentic Nexus is a hierarchical multi-agent orchestration platform designed to democratize software development. A citizen developer, armed only with an idea described in plain language, can walk away with a containerized, fully tested, production-ready application deployed on Azure — without writing a single line of infrastructure code.
+
+The platform is structured as a directed graph of intelligent agents managed by a central Director AI. The Director interprets user intent, creates a formal project plan, provisions specialized agents from an Azure AI Foundry Agent Catalog, and supervises their parallel execution while keeping the user informed and in control at every step.
+
+This document covers the complete end-to-end pipeline, the rationale for every architectural decision, the Microsoft and Azure tooling wired in at each stage, the eight signature 'Cape' features that differentiate the product, and the cross-cutting concerns of security, cost, scalability, crash recovery, rollback, supply chain trust, and multi-user collaboration.
+
+Hackathon Track	The Next Billion Builders — Give everyone a cape. Help beginners to seasoned devs turn ideas into production-ready multi-agent apps using Azure AI Foundry, GitHub Copilot, MCP servers, and reusable Foundry Agents.
+
+2. Vision & Problem Statement
+2.1  The Friction That Kills Ideas
+Today, turning an idea into a production multi-agent application requires expertise across at least five disciplines: prompt engineering, backend development, cloud infrastructure, CI/CD pipelines, and observability. For the majority of potential builders — students, domain experts, entrepreneurs — this complexity acts as a hard gate that prevents them from ever shipping.
+
+Agentic Nexus removes every one of these gates. The user provides intent in natural language. The platform handles everything else: planning, agent provisioning, parallel code generation, inter-agent coordination, QA, containerization, and cloud deployment.
+
+2.2  Design Principles
+    • Intent-first: The system works from user goals, not technical specifications.
+    • Human-in-the-loop by default: Every major decision can be reviewed and approved by the user before execution.
+    • Graph-native orchestration: Agents are modelled as nodes with explicit dependency edges, enabling correct parallel execution.
+    • Observable by design: Every agent action, token consumed, and inter-agent message is captured in a traceable log.
+    • Cost-conscious: Model routing automatically selects the cheapest model capable of completing each sub-task.
+    • Production-ready output: Every build produces a Dockerfile, ARM/Bicep templates, and passing test suites — not just scripts.
+
+3. High-Level Architecture
+3.1  The Agent Graph
+The entire system is modeled as a directed acyclic graph (DAG). Each node is an agent. Directed edges encode data dependencies, meaning a downstream agent cannot begin until its upstream dependencies have delivered their outputs. This model enables maximum safe parallelism while preventing race conditions.
+
+The graph has three tiers:
+
+Tier	Description
+Tier 0 — Director AI	The root node. Owns the master plan, the Task Ledger, and all user communication. Never writes code directly. Orchestrates all lower-tier agents.
+Tier 1 — Module Agents	Specialized agents each responsible for exactly one module (e.g., Backend Engineer, Frontend Engineer, Database Architect). Run in parallel where dependencies allow.
+Tier 2 — Support Agents	Cross-cutting agents invoked by the Director or Module Agents as needed: Validator, QA Engineer, Healer, Deployment, Documentation Writer, and Cost Optimizer.
+
+3.2  Control Flow Overview
+The high-level control flow follows seven sequential stages, each described in full in Section 4. At a glance:
+
+    1. Requirement Clarification — Director converses with the user to build a Task Ledger.
+    2. Graph-Based Planning — Director generates and the user approves an Agent Execution Graph.
+    3. Agent Provisioning — Director selects or creates agents from the Azure AI Foundry Catalog.
+    4. Parallel Execution & A2A Communication — Module Agents work concurrently, exchanging context over A2A channels.
+    5. Monitoring, Persistence & Rating — Director tracks progress; state is checkpointed to Azure Cosmos DB.
+    6. Local Preview & Iterative Feedback — User interacts with the running app locally and requests changes before deployment.
+    7. Final Synthesis & One-Click Deploy — QA Agent validates; Deployment Agent ships a production bundle to Azure.
+
+3.3  Technology Stack Summary
+
+Layer	Technology	Purpose
+Director Brain	Azure OpenAI GPT-4o (o1-preview)	High-reasoning outer-loop planning and user dialogue
+Agent Runtime	Azure Container Apps (ACA)	Isolated, scalable, serverless containers per agent
+Orchestration	Microsoft Agent Framework (MAF) / Magentic-One	Manager-Worker pattern, plan execution, A2A protocol
+Agent Catalog	Azure AI Foundry Agent Service	Pre-built and custom agent templates with system prompts
+Persistent Memory	Azure Cosmos DB (NoSQL + DiskANN)	Long-term agentic memory, agent ratings, task history
+Tool Connectivity	Model Context Protocol (MCP)	Standardized agent-to-tool connections (GitHub, DBs, APIs)
+Observability	Azure AI Foundry Observability / App Insights	Token tracking, trace view, latency, cost dashboard
+CI/CD & Ship	GitHub Actions / Azure Pipelines	Automated container build and deployment to user repo
+Container Registry	Azure Container Registry (ACR)	Versioned Docker images for every built application
+Content Safety	Azure AI Content Safety	Real-time prompt injection and policy enforcement
+Cost Routing	Azure AI Model Catalog (MaaS)	Dynamic routing: GPT-4o vs GPT-4o-mini vs Phi-4
+Command Center UI	Azure App Service + React	Web-based user interface for the Director interaction
+Blueprint Store	Azure AI Foundry Management / Shared Library	JSON blueprints and exported standalone Foundry agents for sharing and remixing
+Local Preview	Docker Compose + Azure Dev Tunnels	Runs the full generated app locally before cloud deployment
+Cloud Preview	Azure Container Apps Environment (Ephemeral, TTL-bound)	Runs the full preview stack in the cloud for low-resource users; no local Docker required
+Crash Recovery	Azure Event Grid + Azure SignalR Service	Container failure detection and Director session reconnection
+Learning Mode	Azure OpenAI GPT-4o (long context)	Conversational code tutor pre-loaded with full build context
+IDE Integration	GitHub Copilot Extensions API + VS Code Extension API	Exposes @nexus as a Copilot chat participant in VS Code and other IDEs
+Data Ingestion	Azure Document Intelligence + Azure Blob Storage + GPT-4o Vision	Processes uploaded CSV, PDF, JSON, images and wireframes as build inputs
+API Simulation	Azure API Center + MCP Servers (read-only mode)	Schema-validated mock generation for Digital Twin using real OpenAPI specs
+Agent Ecosystem	Azure AI Foundry Shared Library (DiskANN vector search)	Exports built agents as standalone Foundry agents; recruits community agents
+Multi-User Collaboration	Azure AD (Entra ID) + Azure SignalR Service	Session ownership model, role-based access, real-time presence, and concurrent edit conflict detection
+
+4. Pipeline — Detailed Stage Descriptions
+
+STAGE
+1	Requirement Clarification & Task Ledger
+Building a shared, machine-readable model of user intent
+
+4.1.1  Objective
+Before a single agent is provisioned, the Director must translate the user's informal idea into a precise, structured specification that can be validated, planned against, and handed off to downstream agents without ambiguity.
+4.1.2  Process Flow
+    8. User submits an initial idea to the Command Center UI (e.g., 'I want to build a SaaS CRM with AI-generated email drafts').
+    9. The Director (GPT-4o with o1-preview reasoning) conducts a multi-turn clarification dialogue. It identifies ambiguities across five axes: functional scope, technical constraints, target users, integration requirements, and quality/compliance criteria.
+    10. Each answered question updates the Task Ledger — a living JSON document that serves as the single source of truth for the entire project.
+    11. Once the Director determines the Task Ledger is sufficiently complete (via a self-evaluation prompt), it spawns a Validator Agent for a Feasibility Check.
+    12. The Validator Agent reviews the Task Ledger against a set of architectural anti-patterns (e.g., circular dependencies, undefined data contracts, missing auth strategy) and returns a structured report.
+    13. The Director presents the Feasibility Report to the user and resolves any flagged issues before proceeding to Stage 2.
+4.1.3  Director Guardrail Dialogue
+The Director is not a passive executor of user instructions. When a user requests a technical decision — a specific stack choice, an architectural pattern, a library, or an approach — that the Director's reasoning identifies as suboptimal, risky, or likely to cause problems later in the pipeline, it does not silently comply. It raises a Guardrail Dialogue.
+
+A Guardrail Dialogue is a structured, non-blocking challenge surfaced in the Command Center UI (and in the @nexus Copilot Extension chat panel). It presents the Director's assessment without being prescriptive — the user retains full authority to override. The format is consistent:
+
+Guardrail Dialogue Format	Director: I can do that. Before I proceed, I want to flag a potential issue with this choice. Here is what you asked for, why it might cause problems, an alternative I would recommend, and what happens if you proceed anyway. Are you sure you want to continue with your original choice?
+
+Guardrail Dialogues are triggered by a defined set of risk signals that the Director evaluates when processing any user instruction that touches the Task Ledger's tech_constraints field or when a user requests a design change during the feedback loop:
+
+Risk Signal	Example Trigger
+Architectural mismatch	User asks to use SQLite as the production database for a multi-tenant SaaS.
+Security risk	User asks to store API keys in environment variables committed to the repository.
+Cost explosion risk	User asks to run every agent on GPT-4o with o1-preview reasoning regardless of task complexity.
+Dependency conflict	User asks to add a library that conflicts with a package already chosen by the Backend Engineer.
+Platform mismatch	User asks to deploy to a runtime that does not support the generated app's architecture.
+
+If the user confirms they want to proceed with the original choice, the Director records the decision — including the guardrail it raised and the user's explicit override — in the Task Ledger's revision_history. This creates an auditable record of intentional technical decisions, which is particularly valuable if the concern materialises later and the Healer Agent needs to understand the context of the original choice.
+
+Guardrail Dialogues are also active during the Local and Cloud Preview feedback loop in Stage 6. If a user requests a Structural change that the Director assesses as likely to break existing passing tests, introduce a security gap, or significantly increase deployment cost, a Guardrail Dialogue is raised before the Delta AEG is created. The user's response determines whether to proceed with the change, adjust its scope, or abandon it.
+4.1.4  Task Ledger Schema
+The Task Ledger is a versioned JSON document stored in Azure Cosmos DB. Key fields include: project_id, owner_id (Azure AD identity of the session Owner), collaborators (list of Azure AD identities with their assigned roles), user_intent (plain text), functional_requirements (structured list), non_functional_requirements (performance, SLA, budget), tech_constraints (preferred stack, forbidden services), integration_targets (third-party APIs, databases), timeline_budget, guardrail_overrides (a log of every Guardrail Dialogue raised, the user who triggered it, and the decision made), operation_log (the sequential field-level edit history for conflict detection and version reconstruction), and revision_history.
+4.1.5  Azure Tooling
+
+Tool	Role in Stage 1
+Azure OpenAI (GPT-4o / o1-preview)	Powers the Director's multi-turn clarification reasoning, self-evaluation prompts, and Guardrail Dialogue risk assessment.
+Azure App Service	Hosts the React-based Command Center UI where the user interacts with the Director in real time.
+Azure AI Content Safety	Scans every user message for prompt injection, jailbreak attempts, and policy violations before they reach the model.
+Azure Cosmos DB	Persists the versioned Task Ledger and Feasibility Report so the Director can resume sessions after interruption.
+
+STAGE
+2	Graph-Based Planning & HITL Approval
+Generating the Agent Execution Graph and securing user sign-off
+
+4.2.1  Objective
+Translate the approved Task Ledger into a formal Agent Execution Graph (AEG) — a directed graph where each node is a planned agent and each edge represents a data dependency. Obtain explicit user approval before any cloud resources are provisioned.
+4.2.2  Process Flow
+    14. The Director decomposes the Task Ledger into modules (e.g., Auth Service, REST API, PostgreSQL Schema, React Frontend, Email AI Module, CI/CD Pipeline, QA Suite).
+    15. For each module, the Director specifies: agent role, input requirements (what it needs from upstream agents), output contracts (what it will deliver to downstream agents), estimated token budget, and model preference.
+    16. The Director assembles these into the Agent Execution Graph (AEG) and renders it as both a visual dependency diagram in the Command Center UI and a structured JSON artifact in Cosmos DB.
+    17. A HITL Checkpoint is triggered. The user reviews the AEG and either approves it, requests revisions (which loop back to planning), or adds additional requirements.
+    18. Once approved, the AEG is locked and versioned. No structural changes are permitted without re-approval; additive changes (the Director or an agent identifying a missing sub-task) trigger a lightweight Delta Approval flow.
+    19. Delta AEG conflict detection: If the user requests two successive Structural changes during the feedback loop that are mutually incompatible — for example, 'add GraphQL' followed by 'switch to gRPC' — the Director detects the conflict before creating the second Delta AEG. It surfaces the incompatibility explicitly, explaining what the first Delta AEG already committed and why the second request conflicts with it. The user is offered three paths: revert the first Delta AEG and apply the second, combine the intent into a single compatible Delta, or abandon the second request.
+4.2.3  Inter-Agent Dependency Rules
+    • An agent may only start execution once all agents it depends on have delivered their output contracts.
+    • Agents with no inter-dependencies may start in parallel immediately upon AEG approval.
+    • If an agent modifies its output contract mid-execution (e.g., adds a new API endpoint), it must notify all downstream agents via the A2A channel and flag the Director.
+    • The Director maintains a global AEG state machine: PENDING, RUNNING, BLOCKED, COMPLETED, FAILED, SLEEPING.
+4.2.4  Azure Tooling
+
+Tool	Role in Stage 2
+Microsoft Agent Framework (MAF) / Magentic-One	Provides the Manager-Worker pattern runtime that the AEG is executed within. The Director is the Manager; Module Agents are Workers.
+Azure AI Foundry Agent Service	Stores the agent template definitions (system prompts, model assignments, tool manifests) for every node in the AEG.
+Azure Cosmos DB	Persists the approved AEG JSON, its version history, and the real-time state machine status of every agent node.
+
+STAGE
+3	Agent Provisioning from the Foundry Catalog
+Selecting, customizing, and launching agents for each AEG node
+
+4.3.1  Objective
+Instantiate the agents defined in the AEG by selecting the best-matching template from the Azure AI Foundry Agent Catalog or, where no suitable template exists, constructing a new template with custom system prompts and tool manifests.
+4.3.2  The Agent Foundry Catalog
+The catalog contains a curated library of battle-tested agent templates, each assigned a reputation score derived from historical performance metrics (task success rate, average token efficiency, output quality scores, downstream agent satisfaction ratings). The Director selects agents by matching the module's role description against catalog entries using semantic search over the catalog's vector embeddings in Cosmos DB.
+
+Built-in catalog roles include:
+    • Backend Engineer — REST API, microservices, authentication flows.
+    • Frontend Engineer — React/Next.js components, accessibility compliance.
+    • Database Architect — schema design, indexing strategy, migration scripts.
+    • Security Reviewer — OWASP checks, secrets scanning, IAM policy generation.
+    • Documentation Writer — README, API reference, inline code comments.
+    • QA Engineer — unit test scaffolding, integration tests, coverage reports.
+    • DevOps Engineer — Dockerfile, Kubernetes manifests, Azure Bicep/ARM templates.
+    • Cost Optimizer — token-routing analysis, resource sizing recommendations.
+    • Healer Agent — error trace analysis, automated patch generation.
+4.3.3  Custom Agent Template Creation
+If no catalog entry achieves a sufficient semantic similarity score, the Director constructs a new template. This involves: (1) inferring a role description from the AEG node specification, (2) generating a system prompt using a meta-prompt, (3) selecting tools from the MCP tool manifest registry, and (4) assigning a model tier based on task complexity. The new template is saved to the catalog for future reuse, seeded with a neutral reputation score.
+4.3.4  Agent Resource Constraints & Scheduling Fairness
+The system enforces a configurable maximum concurrent agent count per project (default: 8). This is both a cost-control mechanism and a rate-limit safeguard for Azure OpenAI API quotas. When all slots are occupied, new agents remain in PENDING state and the Director queues them for activation as slots free up. The Director's scheduling algorithm prioritises agents on the critical path of the AEG, but with two additional constraints to prevent starvation and manage API rate limits:
+
+Starvation prevention: A non-critical-path agent that has been PENDING for longer than a configurable starvation timeout (default: 10 minutes) is automatically elevated in scheduling priority to prevent indefinite waiting. The Director logs the elevation and adjusts its AEG critical-path analysis to account for the newly promoted agent. This ensures every agent in the graph eventually executes, even in heavily contended builds.
+
+Azure OpenAI rate limit coordination: With 8 agents making concurrent model calls, Azure OpenAI's TPM (tokens per minute) and RPM (requests per minute) limits will be reached regularly. The Director maintains a shared token budget counter that all agents read before making a model call. If the current-minute token consumption is within 15% of the quota limit, the Director delays new model call dispatches using a token bucket algorithm until the next rate window opens. HTTP 429 responses from the API are handled differently from connection timeouts: the Retry-After header value is respected exactly, and the delay is propagated to the Agent's task state as RATE_LIMITED rather than FAILED, so it does not consume a Model Escalation Policy attempt.
+4.3.5  Azure Tooling
+
+Tool	Role in Stage 3
+Azure AI Foundry Agent Service	Hosts the Agent Catalog. Provides APIs for semantic search over templates, template instantiation, and system prompt injection.
+Azure Container Apps (ACA)	Each instantiated agent runs in its own isolated ACA container, providing secure sandboxing, auto-scaling, and serverless cost efficiency.
+Model Context Protocol (MCP)	Standardizes how each agent's container connects to external tools — GitHub repositories, Azure SQL / PostgreSQL, Azure DevOps, REST APIs, file systems.
+Azure AI Model Catalog (MaaS)	The Director assigns a model tier to each agent at provisioning time based on task complexity classification.
+Azure Cosmos DB (DiskANN)	Vector index used for semantic search over the Agent Catalog to find the best-matching template.
+
+STAGE
+4	Parallel Execution & Agent-to-Agent Communication
+Agents build concurrently; inter-agent channels keep context in sync
+
+4.4.1  Objective
+Execute all ready agents in parallel, maximising throughput while ensuring that agents whose work is tightly coupled share context in real time, avoiding duplicated effort and incompatible output contracts.
+4.4.2  Execution Model
+The AEG's dependency edges define the allowed execution order. Agents with no incoming edges begin immediately after provisioning. When an agent completes its output contract, it atomically updates the AEG state machine in Cosmos DB and publishes its outputs to the shared context store. Downstream agents poll the state machine or receive an event-driven trigger via Azure Event Grid and begin execution once all their dependencies are marked COMPLETED.
+4.4.3  Agent-to-Agent (A2A) Communication
+For agents whose modules have high output coupling — for example, the Backend Engineer (which defines REST endpoints) and the Frontend Engineer (which must consume those endpoints) — the system establishes a dedicated A2A communication channel. These channels are modelled as named queues backed by Azure Service Bus. Agents discover each other's published output ports dynamically within the Foundry runtime using a registry lookup.
+
+A2A messages carry structured payloads that conform to the output contract schema defined in the AEG. When an agent publishes an additive change (e.g., adds a new endpoint that was not in the original contract), it broadcasts a DELTA_UPDATE message to all subscribed downstream agents and flags the Director. The Director determines whether the delta requires a Delta Approval from the user.
+4.4.4  Dependency-Aware Scheduler & Ghost Handshakes
+A naive parallel executor would stall whenever a downstream agent is blocked waiting for an upstream output — the classic dependency deadlock. For example, the Frontend Engineer cannot build components without knowing the Backend's API shape, so it sits idle while the Backend Engineer works. Agentic Nexus eliminates this using Ghost Handshakes.
+
+A Ghost Handshake is a provisional, schema-conformant stub published by an upstream agent as soon as its AEG node becomes RUNNING — before its real output is ready. The stub is generated from the output contract definition in the AEG and contains realistic placeholder data and type signatures but no real business logic. Downstream agents receive this stub immediately and can begin their work against it in parallel. When the upstream agent's real output is eventually published, the downstream agents receive a GHOST_RESOLVED message over their A2A channel and seamlessly swap the stub for the real contract.
+
+The Dependency-Aware Scheduler within the Director manages this process:
+
+    20. At AEG approval time, the scheduler identifies all dependency edges and classifies them as Blocking (downstream cannot start without real output — e.g., database migrations before the API can run) or Ghost-eligible (downstream can start with a stub — e.g., frontend components can be built against an API shape before the API is implemented).
+    21. For Ghost-eligible edges, the upstream agent generates and publishes its Ghost stub immediately upon starting. The downstream agent is unblocked and begins work.
+    22. The scheduler tracks Ghost-resolution deadlines: if the upstream agent does not publish its real output within a configurable window, the Director flags the delay and optionally notifies the user.
+    23. When real output arrives, the downstream agent's ACA container receives the GHOST_RESOLVED event. It replays any decisions that depended on the stub against the real contract, producing a targeted diff rather than rebuilding from scratch.
+
+Ghost Handshakes mean that the maximum 8-agent concurrency limit is used productively throughout the build — no agent ever idles purely because an upstream agent has not finished yet.
+
+Large-divergence handling: If the upstream agent's real output diverges significantly from the Ghost stub — for example, the Backend Engineer restructures the entire API schema after the stub was already consumed — the Director classifies this as a Ghost Divergence event rather than a standard GHOST_RESOLVED message. In a Ghost Divergence, the downstream agent's completed work is not simply patched; instead, the Director evaluates the cost of a targeted rewrite versus starting the downstream module from scratch using the real output as its initial context. The less costly path is taken and surfaced to the user in the AEG live view with an explanation of why rework was triggered. Ghost Divergences are also logged as a quality signal against the upstream agent's output contract fidelity score in its reputation metrics.
+Each agent follows a structured inner loop: (1) Read current task from the Task Ledger. (2) Fetch relevant context from the shared Cosmos DB memory store and any upstream agent outputs. (3) Execute the task using its assigned model and MCP-connected tools. (4) Self-validate output against the defined output contract schema. (5) Write outputs to the shared context store. (6) Report status to the Director. (7) Await next task assignment or enter SLEEPING state.
+4.4.5  Permission Modes
+The user may configure one of three permission modes at project start, and can switch modes at any time:
+
+Permission Mode	Behaviour
+Manual	Every individual agent task requires prior user notification and explicit approval before execution. Maximum control; slower throughput.
+Semi-Automated	Module-level HITL checkpoints: the user approves each module's plan before agents begin, but individual tasks within a module execute automatically.
+Autopilot	Agents execute all tasks autonomously. The Director continues to post progress updates to the UI. User can interrupt at any time.
+
+In addition to mode switching, the Command Center UI exposes a global Emergency Pause button available in all permission modes. Pressing it issues an immediate SUSPEND signal to every agent container via Azure Service Bus. Agents complete their current atomic model call (to avoid producing a half-written file) and then hold at a defined suspension boundary before their next tool write. In-flight model calls that have not yet made any file writes are cancelled immediately. The build enters a SUSPENDED state; no code is written and no model calls are dispatched until the user presses Resume or selects a rollback point. This is distinct from mode switching, which only affects future tasks — the Emergency Pause stops in-flight work within seconds.
+4.4.6  Approval Fatigue Mitigation — Impact-Based Filtering & Batch Approvals
+In Manual or Semi-Automated mode with up to 8 parallel agents, a naive implementation would surface dozens of task notifications within minutes. This creates Approval Fatigue: users begin approving requests without reading them, defeating the purpose of the permission system entirely. Agentic Nexus addresses this with two complementary mechanisms.
+
+Impact-Based Filtering classifies every task notification by its blast radius before deciding whether to interrupt the user:
+
+Risk Class	Criteria
+Routine (Silent)	Task is self-contained, affects no shared contracts, and is reversible (e.g., writing a CSS file, generating a docstring, adding a unit test).
+Notable (Batched)	Task modifies a shared output contract or touches a file that other agents depend on, but the change is additive and non-breaking (e.g., adding a new optional API field).
+Critical (Immediate)	Task is Contract-Breaking (changes an existing interface that downstream agents have already consumed), Budget-Escalating (triggers a model escalation or pushes cumulative spend above a threshold), or Irreversible (writes to an external system, deletes data, provisions a cloud resource).
+
+Batch Approval reviews are presented as a consolidated diff panel in the Command Center UI, not a list of 'Approve / Reject' buttons. The user sees a unified summary of all batched changes with a single 'Approve All', 'Reject All', or per-item action. Items within a batch are explicitly marked as low-risk by the Director, with a one-line rationale. If the user disagrees with a classification (e.g., they want a CSS change to always be shown), they can promote any task class to a higher tier permanently for the remainder of the session.
+
+Tray overflow protection: To prevent the batch from growing so large that it becomes meaningless, the tray has a hard item cap (default: 10 items). If 10 Notable items accumulate before the 2-minute interval expires, the tray is immediately presented to the user — it does not wait. This prevents the situation where a fast-moving build fills the tray with 30–40 unreviewed items and the user faces an 'Approve All or abandon reviewing entirely' choice. Above the cap, the tray is presented more frequently than the time interval would dictate, keeping individual batch reviews to a manageable size.
+
+The Director also learns from user behaviour during the session. If the user consistently approves a specific task class without modification, the Director offers to downgrade that class to Silent for future tasks of the same type, and records the preference in the user's profile for future builds.
+
+4.4.7  Azure Tooling
+
+Tool	Role in Stage 4
+Azure Container Apps (ACA)	Provides isolated, auto-scaling runtime for each agent. Supports concurrent execution of multiple agent containers.
+Azure Service Bus	Message broker for A2A communication channels. Ensures reliable, ordered, durable message delivery between correlated agents.
+Azure Event Grid	Event-driven triggers that wake dependent agents the moment upstream agents mark their outputs as COMPLETED.
+Model Context Protocol (MCP)	Provides each agent's tools — code execution sandbox, GitHub file write, database schema push, API testing harness.
+Azure Cosmos DB	Shared context store that all agents read from and write to. Acts as the distributed working memory of the entire build.
+
+STAGE
+5	Monitoring, Persistence & Agent Rating
+Real-time visibility, durable state, and a reputation system
+
+4.5.1  Objective
+Give the user continuous visibility into the build's progress, ensure that all agent state is durably persisted so the build can survive interruptions, and collect structured performance data that improves agent selection over time.
+4.5.2  The Command Center Dashboard
+The Command Center UI renders a live view of the AEG, with each node colour-coded by state (PENDING, RUNNING, BLOCKED, COMPLETED, FAILED). A side panel shows the active agent's current task, the last 10 log lines, and its running token/cost counter. For frontend modules, the UI streams a live preview of the component being built, and the user can reject a task and provide feedback directly.
+4.5.3  Agent State Checkpointing
+Rather than dissolving agent threads upon task completion, the system performs a full state checkpoint to Cosmos DB. The checkpoint captures: the agent's conversation history, all local variables and code artefacts produced, tool call logs, current task pointer, and performance metrics. This enables Rehydration — if a bug is discovered after an agent has been dissolved, the Director can resurrect the agent with its full memory intact, apply the patch, and re-run downstream validation without replanning from scratch.
+4.5.4  Agent Lifecycle Decisions
+When an agent reports task completion, the Director evaluates two options: Dissolve (release the ACA slot to free capacity for a queued agent) or Sleep (keep the container warm in a low-cost idle state if the agent's expertise is likely to be needed again within the next phase). The Director makes this decision based on the AEG graph — if the agent has dormant dependencies further down the graph, it sleeps; otherwise it is dissolved and checkpointed.
+4.5.5  Reputation Scoring
+After each agent completes its engagement, the Director computes a multi-dimensional performance score and writes it to the agent's catalog entry in Cosmos DB:
+
+Metric	Description
+Task Success Rate	Percentage of tasks completed within one attempt, without requiring a Healer Agent intervention.
+Token Efficiency	Tokens consumed per unit of meaningful output (lines of code, test coverage percentage, documentation words).
+Contract Fidelity	How accurately the agent's outputs matched the output contract schema defined in the AEG.
+Downstream Satisfaction	Whether downstream agents that depended on this agent's outputs needed to request corrections via A2A.
+Time-to-Completion	Wall-clock time versus estimated time, adjusted for model and task complexity.
+
+4.5.6  User-Defined Tests
+Users may inject custom test specifications at any point during the build. These are stored in the Task Ledger and automatically assigned to the QA Agent, which incorporates them into its test suite generation alongside auto-generated tests. If a user-defined test fails, the Healer Agent is triggered automatically (in Semi-Automated and Autopilot modes) or the Director surfaces the failure to the user with a repair recommendation (in Manual mode).
+4.5.7  Azure Tooling
+
+Tool	Role in Stage 5
+Azure AI Foundry Observability	Captures full agent traces — model calls, tool calls, A2A messages, latency, token counts — and presents them in a Trace View.
+Azure Application Insights	Custom telemetry for Director health monitoring, AEG state machine transitions, and Command Center UI performance.
+Azure Cosmos DB (NoSQL + DiskANN)	Persists agent checkpoints, Task Ledger revisions, AEG state, and reputation scores with low-latency vector recall.
+Azure Monitor	Alerts and dashboards for quota consumption, cost burn rate, ACA container health, and Service Bus queue depth.
+
+STAGE
+6	Local Preview & Iterative Feedback Loop
+User sees and tests the app before deployment; requests changes that feed back into the pipeline
+
+4.6.1  Objective
+Before a single line of infrastructure is provisioned in the cloud, the user gets to interact with the application running locally in a sandboxed environment. This stage closes the most critical gap in AI-generated software: the distance between what the user asked for and what was actually built. Changes requested at this stage are far cheaper to address than changes raised after deployment.
+4.6.2  The Local Preview Environment
+Once the QA Agent reports a passing test suite, the Deployment Agent offers the user a preview of the running application before any cloud infrastructure is provisioned. By default this runs locally, but the system automatically detects the user's environment and offers the right option for their hardware.
+
+4.6.3  Local Preview (Standard Path)
+On capable hardware, the Deployment Agent spins up a Local Preview using Docker Compose. All services — API server, frontend, database, background workers — run in a single-machine Docker Compose stack. The user accesses it via a URL served by a temporary tunnel (using Azure Dev Tunnels) in the Command Center UI.
+
+The Local Preview is not a mock or a simulation — it is the actual generated application code running against a seeded local database. The user can create records, trigger workflows, test edge cases, and verify that the application behaves exactly as described in the Task Ledger. For multi-agent runtime applications, the Foundry agent definitions are also loaded locally so the user can test the coordination logic before it is deployed to Azure AI Foundry.
+
+4.6.4  Cloud Preview (Low-Resource Path)
+For the Next Billion Builders — students, first-time developers, and users on constrained hardware — running a full Docker Compose stack alongside 8 agent containers, an IDE, and a browser is not realistic. Simultaneously running 8+ containers plus a database server plus a web server can exhaust even a moderately specced laptop and produce a frustrating, unusable experience that actively contradicts the platform's accessibility goal.
+
+Agentic Nexus detects this situation and offers an alternative automatically. Resource detection occurs via the @nexus Copilot Extension (which can read system memory and CPU metrics from the IDE host) or, for web-only users, via a lightweight browser-based resource probe that runs on page load. If available RAM is below 8 GB or if the user is accessing via a mobile browser, the Command Center UI presents the Cloud Preview option as the recommended path.
+
+The Cloud Preview spins up the identical Docker Compose stack — the same generated code, the same seeded database, the same services — as an ephemeral Azure Container Apps Environment in the user's Azure subscription rather than on their local machine. The user receives a public preview URL, indistinguishable in behaviour from the Local Preview, served directly in their browser. No local Docker installation is required. No local ports are occupied.
+
+Key design decisions for the Cloud Preview:
+
+Design Decision	Rationale
+Ephemeral ACA Environment	Provisioned with a hard Time-To-Live of 4 hours (configurable). The user receives a warning notification at 30 minutes, 10 minutes, and 5 minutes before TTL expiry. At any warning, the user can extend the TTL by one additional hour (up to a maximum of 8 hours total) with one click. If the TTL expires without extension, any uncommitted feedback is automatically saved as a draft note in the Task Ledger before the environment is deprovisioned, so the user's observations are not lost.
+Seeded data only — no user data stored	The preview database is populated with synthetic data generated from the schema. No real user data is ever written to the Cloud Preview environment.
+Same feedback loop, same iteration capability	Cosmetic, Behavioural, and Structural changes work identically in Cloud Preview. When the user requests a change, the relevant agent is rehydrated, patches the code, and the ACA environment is updated via a rolling restart — no re-provisioning required.
+Explicit cost disclosure	Before provisioning, the Director displays the estimated cost of the Cloud Preview window (typically under $0.50 for a 4-hour session). The user must approve this before the environment is created.
+
+The choice between Local and Cloud Preview is presented clearly at the start of Stage 6, with the recommended option highlighted based on the detected environment. Users on capable hardware who prefer Cloud Preview for convenience can select it freely. The platform never forces a local installation on a user who cannot or does not want to run Docker locally.
+4.6.5  Collecting Feedback
+The Command Center UI surfaces a structured Feedback Panel alongside the preview (Local or Cloud). The user can raise feedback at three levels of granularity:
+
+Feedback Level	Description & Director Response
+Cosmetic (Low)	Visual or copy changes — colours, labels, text. The Frontend Engineer agent is rehydrated from its checkpoint, patches the specific component, and the preview hot-reloads. No replanning required.
+Behavioural (Medium)	Logic changes — different validation rules, additional fields, altered workflow steps. The Director identifies the minimal set of affected agents, rehydrates them from checkpoints, applies targeted changes, and re-runs QA for affected modules only.
+Structural (High)	New modules, architectural changes, new integrations. The Director creates a Delta AEG — an additive change to the original graph — and presents it to the user as a new HITL approval before executing. Full replanning is scoped to the delta only, not the entire build.
+
+4.6.6  Iteration Loop
+The feedback loop is designed to be fast and non-destructive. Because every agent's state is checkpointed in Cosmos DB, the Director never re-executes work that has not changed. A Cosmetic change rehydrates one agent and runs for seconds. A Structural change rehydrates a sub-graph and runs the delta through the full pipeline. The user can iterate as many times as they need before pressing Ship.
+
+Each iteration produces a new version entry in the Task Ledger, giving the user a complete audit trail of every change requested, every agent rehydrated, and every test result. The user can also roll back to any previous iteration by restoring the corresponding Cosmos DB checkpoint.
+4.6.7  Azure Tooling
+
+Tool	Role in Stage 6
+Docker Compose	Orchestrates the Local Preview stack for users on capable hardware. All app services run locally before any cloud resource is provisioned.
+Azure Dev Tunnels	Provides a secure public URL for the local Docker Compose stack so the user can access the preview from any browser.
+Azure Container Apps Environment (Ephemeral)	Hosts the Cloud Preview stack for low-resource users. Provisioned with a hard TTL; auto-deprovisioned after the preview session ends to prevent lingering costs.
+Azure Cosmos DB (Checkpoints)	Stores versioned agent state checkpoints that enable precise, minimal rehydration when feedback triggers a targeted rebuild.
+Azure AI Foundry (Local/Cloud Emulation)	Foundry SDK supports agent definition loading in both local and cloud preview modes, allowing multi-agent runtime apps to be tested before production deployment.
+
+STAGE
+7	Final Synthesis & One-Click Deploy
+QA validation, containerization, and production shipment
+
+4.7.1  Objective
+Synthesize all module outputs into a coherent, fully tested application, package it for production deployment, and ship it to the user's cloud environment with a single user approval.
+4.7.2  QA Agent Synthesis
+    24. The QA Agent aggregates all module outputs from the shared Cosmos DB context store.
+    25. It generates a comprehensive test suite: unit tests for every function with a complexity score above a threshold, integration tests for all A2A and third-party API boundaries, end-to-end scenario tests covering the primary user journeys identified in the Task Ledger, and all user-defined tests from Stage 5.
+    26. The QA Agent executes the test suite inside an isolated ACA Job container. Test results and coverage reports are written back to Cosmos DB.
+    27. If any tests fail, the Healer Agent is automatically dispatched (see Section 5.1 for Self-Healing detail). The QA Agent re-runs the affected tests after each patch until all pass or the Director escalates to the user.
+4.7.3  Deployment Agent — Production Bundle
+Once the QA Agent reports full test passage, the Deployment Agent assembles the Production-Ready Bundle:
+    • Dockerfile — multi-stage build optimized for the detected application type.
+    • Azure Bicep / ARM Templates — declarative infrastructure definition covering App Service / AKS, Cosmos DB, Key Vault, VNet, and all required IAM role assignments.
+    • GitHub Actions Workflow — CI/CD pipeline that builds, tests, and deploys on every push to main.
+    • Blueprint JSON — a portable schema of all agents, their prompts, and their connection topology for sharing or remixing (see Section 5.4).
+    • Comprehensive README — architecture overview, setup instructions, environment variable reference, and operations runbook.
+4.7.4  One-Click Ship
+The Director presents the Production-Ready Bundle to the user in the Command Center UI with a cost estimate for the first month of Azure hosting. A single 'Ship' button triggers the GitHub Actions workflow, which pushes the Docker image to Azure Container Registry and executes the Bicep deployment to the user's specified Azure subscription. The Director monitors the deployment pipeline and surfaces the live application URL once the health check passes.
+4.7.5  Azure Tooling
+
+Tool	Role in Stage 7
+Azure Container Registry (ACR)	Stores all versioned Docker images produced by the Deployment Agent.
+GitHub Actions / Azure Pipelines	Executes the automated build, test, and deploy pipeline.
+Azure Bicep / ARM	Infrastructure-as-code templates generated by the Deployment Agent for repeatable, auditable cloud provisioning.
+Azure Container Apps (ACA) / AKS	Target runtime for the deployed application, selected by the Deployment Agent based on scale requirements.
+Azure Key Vault	Generated templates wire all secrets (API keys, DB connection strings) through Key Vault — never hardcoded in the image.
+
+5. Cape Features — Differentiating Capabilities
+Beyond the core pipeline, Agentic Nexus ships eight signature 'Cape' features that transform it from a code generator into an intelligent, resilient, collaborative, and educational build platform.
+
+5.1  The Self-Healing Debugger (The Safety Cape)
+Problem	In multi-agent systems, one agent's mistake propagates through the dependency graph, breaking downstream modules in ways that are difficult to trace and expensive to fix manually.
+
+How It Works
+The QA Agent runs its test suite continuously — not just at the end of the build, but as a rolling process that validates each module's output contract the moment it is delivered. When a test fails, the QA Agent does not report an error and halt. Instead, it triggers an automated repair loop:
+
+    28. The QA Agent packages the failure context: the failing test, the stack trace, the agent's full execution trace (sourced from Azure AI Foundry Observability), and the relevant portion of the Task Ledger specification.
+    29. A Healer Agent is dispatched with this failure context. It uses a high-reasoning GPT-4o call to perform root cause analysis — identifying whether the fault is in the failing module itself, in an upstream agent's output, or in the output contract definition.
+    30. The Healer Agent generates a targeted patch (a minimal diff) and applies it to the relevant module.
+    31. The QA Agent re-runs the affected tests against the patched module.
+    32. If the patch succeeds, the Healer Agent's fix is committed and the build continues. If the patch fails after three attempts on the same test, the Director escalates to the user with a full diagnostic report.
+    33. Cascade protection: If a Healer patch fixes the failing test but causes a new test failure in a different module, this is classified as a Healer Cascade event rather than a fresh failure. The Director does not dispatch a new independent Healer Agent for the secondary failure, as this could create an unbounded chain of Healer activations. Instead, the Director takes ownership of the cascade: it analyses both the original fix and the new failure together, treats them as a single compound problem, and dispatches one Healer Agent with the full cascade context. If the compound repair fails after three attempts, the Director suspends the entire affected module sub-graph and escalates to the user with a visualisation of the cascade chain. The global Healer activation count for a build session is also capped (default: 20 total dispatches) to prevent runaway automated repair loops.
+
+Azure Tooling
+    • Azure AI Foundry Observability — Agent Traces feed the exact failure context into the Healer Agent's reasoning prompt.
+    • Azure Container Apps — The Healer Agent runs in an ephemeral ACA container and is dissolved immediately after patch application.
+    • Azure Cosmos DB — Patch history is persisted with the agent checkpoint for audit and rollback capability.
+
+5.2  Token-Thrifty Cost Optimizer (The Budget Cape)
+Problem	Fear of runaway Azure OpenAI costs is the single largest adoption barrier for citizen developers. A build that unexpectedly costs hundreds of dollars will destroy trust immediately.
+
+How It Works
+The Cost Optimizer is not a separate agent but a routing layer that wraps every model call in the system. Before any agent makes a model API call, the Cost Optimizer classifies the task and selects the cheapest model tier capable of completing it at the required quality level:
+
+Task Complexity Class	Model Assigned
+Simple (documentation, CSS, boilerplate)	Microsoft Phi-4 — smallest, fastest, cheapest
+Intermediate (CRUD logic, unit tests, config files)	GPT-4o-mini — balanced cost and capability
+Complex (auth architecture, data modelling, security review)	GPT-4o — full capability
+High-reasoning (planning, root cause analysis, feasibility)	GPT-4o with o1-preview reasoning steps
+
+Task complexity is classified by the Director using a lightweight scoring heuristic before the task is dispatched to the worker agent. The Director monitors cumulative token spend in real time and can trigger an automatic cost alert if the project is trending above the user's declared budget. In all permission modes, the user sees a live cost ticker in the Command Center UI.
+
+Model Escalation Policy
+A critical safeguard prevents cost optimisation from undermining quality: the Model Escalation Policy. If a task assigned to a Small Language Model (SLM — Phi-4 or GPT-4o-mini) fails its self-validation check or is rejected by the QA Agent, the following escalation ladder is enforced automatically:
+
+Attempt	Model Used
+1st attempt	Assigned SLM (e.g., Phi-4)
+2nd attempt	One tier up (e.g., GPT-4o-mini)
+3rd attempt	GPT-4o (full model)
+4th attempt	GPT-4o + o1-preview reasoning
+
+Critically, the Healer Agent that fixes failed tasks is always dispatched at GPT-4o or higher, regardless of what model originally produced the failing code. This prevents a hallucination loop where an SLM generates broken code and the same SLM attempts to fix it with equally unreliable reasoning. The Escalation Policy ensures the 'production-ready' promise is never subordinated to cost savings.
+The escalation history for every task is written to the observability trace. If a particular task class consistently triggers escalation (e.g., all OAuth implementation tasks escalate to GPT-4o), the Cost Optimizer updates its complexity heuristic for future builds, reducing wasted escalation cycles over time.
+Azure Tooling
+    • Azure AI Model Catalog (MaaS) — Enables on-demand routing between GPT-4o, GPT-4o-mini, and Phi-4 within a single inference endpoint.
+    • Azure AI Foundry Observability — Token consumption per agent and per model tier is streamed to the Command Center dashboard.
+    • Azure Monitor — Budget alerts notify the Director and user when spend crosses configurable thresholds.
+
+5.3  Digital Twin Simulation Mode (The Foresight Cape)
+Problem	Deploying a multi-agent application to production without validation can trigger irreversible side effects: charges to third-party APIs, database mutations, or external notifications sent prematurely.
+
+How It Works
+Before the One-Click Ship step, the user can optionally launch a Digital Twin Simulation. This spins up the entire application inside an isolated ACA Jobs environment where all external dependencies are replaced with deterministic mocks:
+
+    • Database calls are intercepted and served from an in-memory SQLite instance seeded with synthetic data generated from the schema.
+    • Third-party REST API calls are served by a local mock server that returns schema-conformant synthetic responses.
+    • Email/SMS/notification services are intercepted and logged to a simulation inbox rather than actually sent.
+    • Time-dependent logic is accelerated using a simulation clock.
+
+The simulation runs all QA test scenarios and also generates a User Flow Report that visually traces the primary user journeys through the application, showing the Director and the user exactly how the agents will interact and what outputs will be produced — all without spending any production API quota.
+
+High-Fidelity Mock Generation via Azure API Center
+Mocking external APIs is notoriously unreliable when done by AI inference alone — the model may hallucinate response schemas that diverge from the real service's actual behaviour. Agentic Nexus avoids this with a two-source mock generation strategy:
+
+    34. If the target API is registered in Azure API Center (which aggregates OpenAPI/Swagger specifications for thousands of enterprise and public APIs), the Deployment Agent fetches the real OpenAPI specification directly and generates mocks that are schema-validated against it. The mock server enforces the real request/response contracts — field names, types, required fields, error codes — without any AI inference.
+    35. If the API is not in Azure API Center but the user has uploaded a JSON/OpenAPI schema file (via the Data-to-App Pipeline, Section 5.7), that spec is used as the mock source.
+    36. Only if neither source is available does the system fall back to AI-inferred mocks — and in this case, it explicitly labels the mock as 'Low Fidelity' in the Simulation Report, flagging it for the user's attention before they rely on the simulation results.
+
+MCP Servers further enhance simulation fidelity. For APIs where an MCP Server exists (e.g., GitHub, Stripe, Azure DevOps), the Digital Twin routes calls through the MCP Server's read-only mode, which executes against the real API but blocks all write operations. This gives the user genuine response data from the actual service without any risk of side effects.
+Azure Tooling
+    • Azure Container Apps Jobs — Ephemeral simulation environment that is fully torn down after the run, leaving no permanent side effects or costs.
+    • Azure API Center — Provides real OpenAPI specifications for enterprise and public APIs, ensuring mock servers are schema-validated rather than AI-hallucinated.
+    • Model Context Protocol (MCP) Servers — Read-only mode enables real API responses for supported services (GitHub, Stripe, Azure DevOps) without triggering write-side effects.
+    • Azure AI Foundry — Simulation traces are captured and surfaced in the same Trace View as production agent traces.
+
+5.4  Collaborative Blueprint Sharing (The Team Cape)
+Problem	Every time a new user wants to build a similar application, the entire planning and agent provisioning process must restart from scratch. There is no mechanism to learn from previous successful builds.
+
+How It Works
+Once a build completes successfully, the Director automatically generates a Blueprint — a portable, self-contained JSON document that encodes the complete build recipe:
+
+    • The AEG structure (all agent nodes, their roles, and their dependency edges).
+    • The system prompt for each agent (either catalog reference or custom definition).
+    • The inter-agent A2A channel topology.
+    • The MCP tool manifest for each agent.
+    • The QA test scaffolding structure (without project-specific test data).
+    • The Deployment Agent's Bicep template structure.
+
+Blueprints are versioned and published to the Azure AI Foundry Shared Library. Other Agentic Nexus users can browse the library, import a Blueprint into their own project, and use it as a starting point — reducing a multi-hour planning stage to a 5-minute configuration of the Task Ledger's project-specific parameters.
+Users can also share Blueprints privately within an organization, enabling teams to standardize on approved architectural patterns and security configurations.
+Azure Tooling
+    • Azure AI Foundry Management / Shared Library — Blueprint storage, version control, semantic search, and access control.
+    • Azure Cosmos DB — Blueprint metadata and usage analytics (how many projects have used a given Blueprint, and their average quality scores) feed back into the library's ranking algorithm.
+
+5.5  Codebase Explainer & Learning Mode (The Knowledge Cape)
+Problem	The hackathon track explicitly calls for accelerating learning, not just shipping. A user who receives a generated codebase they do not understand has gained a product but lost an opportunity. Over-reliance on AI generation without comprehension creates technical debt and dependency.
+
+How It Works
+After the Local Preview is approved and before or after the One-Click Ship, the user can optionally activate Learning Mode. This is not a static README — it is an interactive, conversational code tutor powered by GPT-4o that has been pre-loaded with the complete context of the build: the Task Ledger, all generated source files, the AEG, the agent decision log, and the QA results.
+
+Learning Mode operates at three levels of depth, selectable by the user:
+
+Depth Level	What the User Gets
+Overview (Beginner)	A plain-English walkthrough of the application's architecture — what each module does, why it exists, and how the pieces connect. No code shown unless requested. Analogies and diagrams are used wherever possible.
+Module Deep Dive (Intermediate)	The user selects any module and the tutor walks through its code file by file, explaining every function, design pattern used, and why that approach was chosen over alternatives. The tutor can show before/after comparisons if the Healer Agent made patches during the build.
+Decision Archaeology (Advanced)	The user can ask why any specific architectural or implementation decision was made. The tutor traces back through the agent decision log and the Task Ledger to reconstruct the reasoning chain — for example, why the Backend Engineer chose a particular auth strategy, which clarification question drove that decision, and what the alternative approaches would have been.
+
+Interactive Q&A
+Beyond the structured walkthrough, the user can ask freeform questions at any point: 'What would happen if I added caching here?', 'How would I extend this to support multiple tenants?', 'What does this middleware do?'. The tutor answers with direct reference to the generated code, not generic documentation, because it holds the full build context in its system prompt.
+
+Learning Mode sessions are optionally saved as annotated code tours — structured walkthroughs attached to the project's Blueprint. These tours can be shared with teammates or published to the Blueprint Library, turning every successful build into a learning resource for the next builder.
+Azure Tooling
+    • Azure OpenAI (GPT-4o) — Powers the conversational tutor with the full build context injected as a structured system prompt. The model's long context window is essential for holding all source files simultaneously.
+    • Azure AI Foundry Observability — Agent decision logs and trace data are fed into the tutor's context so it can explain not just the output code but the reasoning that produced it.
+    • Azure Cosmos DB — Stores saved Learning Mode sessions and annotated code tours attached to each project's Blueprint entry in the Shared Library.
+
+5.6  GitHub Copilot Extension — @nexus in the IDE (The Workspace Cape)
+Problem	The problem statement explicitly calls for exploring GitHub Copilot Extensions. Requiring a developer to leave their IDE and open a separate Command Center web app to interact with Agentic Nexus introduces exactly the kind of friction the platform is designed to remove.
+
+How It Works
+Agentic Nexus is published as a GitHub Copilot Extension — an @nexus participant that developers can invoke directly from VS Code, Visual Studio, or any Copilot-enabled IDE without switching context. The extension connects to the Agentic Nexus backend over the Copilot Extensions API, giving the user full access to the Director from within their primary workspace.
+
+The extension supports three interaction modes:
+
+Interaction Mode	Example & Behaviour
+New Build	`@nexus build me a REST API for this React UI` — The Director reads the currently open files in the IDE as context (injected via the Copilot Extensions API), launches a clarification dialogue in the Copilot Chat panel, and begins the full pipeline. The user never opens a browser.
+Module Augmentation	`@nexus add Stripe payment support to this project` — The Director analyses the existing codebase visible in the IDE, identifies affected modules, creates a Delta AEG for only the new feature, and routes it through the relevant agents. Existing code is not touched unless required.
+Live Debugging	`@nexus this test is failing, fix it` — The user highlights failing code or pastes an error. The Director dispatches a Healer Agent with the selected code and error trace as context. The fix is proposed as a diff directly in the Copilot Chat panel, which the user can accept as a standard code suggestion.
+
+Build Progress in the IDE
+When a build is running, the @nexus extension streams live progress updates directly into the Copilot Chat panel. When a module is completed, the generated files are automatically opened as new editor tabs for immediate inspection. The user can request a Learning Mode explanation of any file without leaving the IDE: `@nexus explain this file`.
+
+For developers who prefer the full visual AEG graph view, the extension includes a companion VS Code Webview Panel that renders the same Command Center UI in a split pane. The extension and the web Command Center share the same session state via Cosmos DB, so switching between them mid-build is seamless.
+Integration Tooling
+    • GitHub Copilot Extensions API — Registers @nexus as a chat participant. Grants access to the user's active workspace files as contextual input to the Director.
+    • VS Code Extension API — Renders completed module files as new editor tabs and surfaces proposed patches as inline diff suggestions.
+    • Azure App Service (Director Backend) — The @nexus extension is a thin client; all orchestration logic remains server-side, keeping the extension lightweight and IDE-agnostic.
+    • Azure Cosmos DB — Session state shared between the Copilot Extension and the web Command Center, enabling seamless channel switching mid-build.
+
+5.7  Data-to-App Pipeline (The Data Cape)
+Problem	The problem statement highlights data-to-app pipelines as a key use case, yet most AI builders only accept text descriptions of intent. Users who have structured data — a CSV export, a database schema, a JSON API response, or a set of design mockups — should be able to use that data as a first-class input instead of describing it in words.
+
+How It Works — Structured Data Ingestion
+At the beginning of Stage 1, the Director offers an optional 'Start from Data' path alongside the standard text description path. The user can upload one or more files. The Director routes each file to a specialised Data Ingestion Agent based on its type before any clarification questions are asked:
+
+File Type	What the Data Ingestion Agent Does
+CSV / Excel (.csv, .xlsx)	Infers column names, data types, relationships between sheets, and likely domain (e.g., sales records, user data, inventory). Auto-proposes a normalised database schema and suggests CRUD endpoints and a dashboard layout as starting points for the Task Ledger.
+JSON / OpenAPI Schema (.json, .yaml)	Parses the schema to extract entity types, relationships, and API surface. If it is an OpenAPI file, the Director can scaffold a client app or an integration layer around the existing API without the user describing any of the endpoints manually.
+PDF / Document (.pdf, .docx, .txt)	Extracts text using Azure Document Intelligence (OCR-capable). The Director uses the extracted content to pre-fill the Task Ledger with product requirements, user stories, or technical constraints described in the document — turning a spec doc into a build prompt.
+Image / Screenshot (.png, .jpg)	Passed to GPT-4o's vision capability. If the image is a UI mockup or wireframe, the Director uses it to pre-generate the Frontend Agent's task list and component hierarchy. If it is an architecture diagram, it seeds the AEG structure directly.
+Multiple files (mixed)	The Director synthesises all uploaded files into a unified context before beginning clarification. A PDF spec + a CSV dataset + a UI screenshot together give the Director more grounding than most human-authored text descriptions.
+
+Auto-Generated App Patterns from Data
+When the input is structured data, the Director uses a set of opinionated app patterns to reduce the planning overhead:
+
+    • CSV/Excel with row data → CRUD app scaffold: database schema, REST API, paginated data table UI, and export functionality generated automatically with minimal clarification needed.
+    • CSV with time-series columns → Dashboard scaffold: auto-detected metrics, chart type recommendations (line, bar, scatter), and a React dashboard with Azure Static Web Apps deployment.
+    • OpenAPI schema → Integration app scaffold: typed API client generated from the spec, authentication flow wired to the spec's security schemes, and a thin UI layer for testing endpoints.
+    • PDF requirements doc → Task Ledger pre-fill: user stories extracted and ranked by priority, technical constraints captured, and a suggested AEG structure proposed for user approval.
+
+In all cases, the Director still runs its clarification loop — but it starts from a position of substantial pre-existing context, so the conversation is shorter and more precise. The user corrects or extends the Director's inferences rather than describing everything from scratch.
+Azure Tooling
+    • Azure Document Intelligence — OCR and structured extraction for PDFs, Word documents, and scanned images. Produces machine-readable output that the Director can reason over directly.
+    • Azure Blob Storage — Temporary, encrypted storage for uploaded files during the build session. Files are deleted after the Task Ledger is populated.
+    • GPT-4o Vision (Azure OpenAI) — Processes image uploads (mockups, wireframes, architecture diagrams) to extract structural intent.
+    • Azure AI Search — Used to index large uploaded documents and retrieve relevant sections during the Director's clarification loop without exceeding model context limits.
+
+5.8  Agent Export & The Reusable Building Block Ecosystem
+Problem	The problem statement calls for Foundry agents that become reusable building blocks. The current design treats agents as internal orchestration components. Their value should not end when the build does — specialist agents that have been refined through real builds should be exportable for others to use independently.
+
+Agent Export — Standalone Foundry Agents
+At the end of any successful build, the user can select any specialist agent from the build's AEG and export it as a standalone Azure AI Foundry Agent. The export packages:
+
+    • The agent's system prompt, refined through its actual build experience.
+    • Its MCP tool manifest — the exact set of tools it was connected to during the build.
+    • Its model assignment and any model-escalation policy thresholds it accumulated.
+    • Its reputation score and performance metrics, which serve as a quality signal for other developers evaluating the agent.
+    • A natural-language description of its capabilities and recommended use cases, auto-generated by the Director.
+
+This exported agent is a fully portable, independently deployable Azure AI Foundry Agent. Another developer can import it into their own Azure subscription and invoke it directly from their code — no knowledge of Agentic Nexus required. For example, a highly-rated 'PostgreSQL Schema Architect' agent built during a fintech project can be exported, published to the Foundry Shared Library, and used by a health-tech team building a different application from scratch.
+
+Agent Recruitment — Importing Pre-Built Agents
+The reverse flow is equally important. When the Director is provisioning agents for Stage 3, it does not have to create every agent from scratch or rely only on Nexus's built-in catalog. It can recruit pre-existing agents published to the Azure AI Foundry Shared Library by any user or organisation.
+
+The Director's agent selection algorithm searches the Shared Library using semantic similarity against the module's role description. If a published community agent scores higher than the best in-house catalog template — factoring in its exported reputation score and the similarity of the past builds it was used in — the Director recommends it to the user and, upon approval, recruits it into the current build's AEG. The recruited agent runs exactly as it would in its original context, connecting to its pre-configured MCP tools.
+
+This creates a compounding network effect: every build improves the shared agent pool. Over time, the ecosystem moves from generic templates towards domain-hardened specialists — a fintech-optimised compliance reviewer, a HIPAA-aware data model architect, an e-commerce conversion-focused frontend engineer — all created organically by real builds and made available to the next builder.
+Azure Tooling
+    • Azure AI Foundry Agent Service — The target runtime for all exported standalone agents. Handles model execution, tool connections, and conversation threading independently of Nexus.
+    • Azure AI Foundry Shared Library — Public and private repositories for exported agents and Blueprints. Supports semantic search, versioning, and access control.
+    • Azure Cosmos DB (DiskANN vector index) — Powers the semantic similarity search used by the Director to compare module role descriptions against published agent capabilities.
+
+6. Cross-Cutting Concerns
+6.1  Security Architecture
+Security is enforced at three layers rather than being bolted on at the end:
+
+    • Input Layer: Azure AI Content Safety scans every user prompt, every agent-generated prompt, and every uploaded file before model execution. Injection patterns, policy violations, and sensitive data leakage are blocked in real time. Uploaded files are additionally processed with structural context separation to prevent prompt injection from file content (see Section 6.8.4).
+    • Execution Layer: Each agent container in Azure Container Apps runs with the principle of least privilege. MCP tool connections are scoped to the minimum permissions required for the agent's role. MCP manifests are validated against a permission scope policy before connections are granted — manifests requesting write access broader than the project repository are automatically rejected (see Section 6.8.1). The @nexus Copilot Extension reads workspace files as context, but applies a deny-list that explicitly excludes .env files, .pem/.key files, files matching common secrets naming patterns (e.g., *secret*, *credential*, *token*), and the .git directory. The user can extend the deny-list in their IDE settings.
+    • Output Layer: The Security Reviewer agent performs an automated OWASP-aligned code review on all generated code, including Healer Agent patches (which receive a differential security review comparing the patch to the original failing code), before any code is committed to the project repository. Secrets are never hardcoded; the Deployment Agent routes all secrets through Azure Key Vault.
+
+Multi-tenancy isolation: All build session resources are namespaced by project_id and owner_id. Cosmos DB is partitioned by project_id with row-level access policies enforced via Azure AD identity. Azure Service Bus topics are named with the pattern project_{id}.* and access policies permit only the Director and agents belonging to that project_id to publish or subscribe. ACA containers are deployed into project-specific resource groups with network isolation. Azure AI Search indexes (used by Learning Mode for large codebases) are tenant-isolated with per-project access keys. A build session from one user cannot read, write to, or receive messages from any resource belonging to another user's session.
+
+All inter-agent communication over Azure Service Bus is encrypted in transit with TLS 1.3. Cosmos DB data is encrypted at rest with Microsoft-managed keys by default, with customer-managed key (CMK) support available for enterprise projects.
+6.2  Scalability
+The serverless architecture of Azure Container Apps means agent containers scale to zero when idle and scale out to handle multiple concurrent user projects without capacity planning. The Director's outer loop runs on Azure App Service with auto-scaling rules tied to the active project count. Azure Cosmos DB's native horizontal partitioning (partitioned by project_id) ensures that the persistence layer scales linearly with the number of concurrent builds.
+
+The maximum concurrent agent count per project is configurable and enforced by the Director's scheduler. Enterprise tier users may request higher limits through Azure AI Foundry quota management.
+6.3  Cost Management
+Three mechanisms keep costs predictable:
+
+    37. The Token-Thrifty Cost Optimizer (Section 5.2) minimizes per-task model costs through intelligent model routing.
+    38. ACA containers scale to zero immediately after an agent enters SLEEPING or is dissolved, eliminating idle compute costs.
+    39. The user sets a budget cap in the Task Ledger. The Director tracks cumulative spend in real time and will halt non-critical tasks if the project is approaching the cap, presenting the user with a prioritized list of what to cut or a revised cost estimate to continue.
+6.4  Observability & Debugging
+Every model call, tool call, A2A message, and state transition is captured as a structured trace event in Azure AI Foundry Observability. The Command Center UI exposes:
+    • Trace View — a chronological, filterable log of all events across all agents for a given build.
+    • Cost Breakdown — token spend disaggregated by agent, model tier, and task.
+    • AEG Live View — real-time graph visualisation with node state colouring.
+    • Agent Reputation Panel — live reputation scores and comparative metrics across catalog agents.
+    • Simulation Report — output of the Digital Twin simulation (when run).
+
+All trace data is also exported to Azure Application Insights for long-term retention, anomaly detection, and custom alerting.
+6.5  Data Privacy
+User project data (Task Ledger, code artefacts, agent conversations) is stored in the user's own Azure subscription in a Cosmos DB account provisioned by the Bicep deployment template. Agentic Nexus operates as a tenant orchestrator with no persistent access to user data after the build session ends. Optional zero-data-retention (ZDR) mode routes all model calls through the Azure OpenAI ZDR endpoint, ensuring no prompt or completion data is logged by Microsoft.
+
+6.6  Checkpointing & Crash Recovery
+A multi-agent build session can span hours. Network interruptions, Azure service incidents, model API timeouts, and ACA container evictions are all realistic failure modes. The system must be able to recover from any of these without losing work or requiring the user to restart from scratch.
+
+6.6.1  What Gets Checkpointed
+Checkpointing operates at three granularities:
+
+Granularity	What Is Saved & When
+Task-level (finest)	After every individual task completion within an agent, the agent writes its current state — conversation history, all produced artefacts, tool call results, and the pointer to the next task — to its Cosmos DB checkpoint document. This is the primary recovery unit.
+Agent-level (medium)	When an agent finishes its module or enters SLEEPING state, a full agent checkpoint is written. This is a superset of the task-level checkpoint and includes the agent's complete memory and all inter-agent messages received.
+Session-level (coarsest)	The Director continuously writes the AEG state machine — the current status of every node — to a session document in Cosmos DB. This is written on every state transition (e.g., PENDING → RUNNING, RUNNING → COMPLETED).
+
+6.6.2  Agent Crash Recovery
+If an ACA container crashes mid-task (detected via the Azure Container Apps health probe), Azure Event Grid emits a container failure event. The Director's event handler receives this within seconds and takes the following steps:
+
+    40. Read the most recent task-level checkpoint for the crashed agent from Cosmos DB.
+    41. Determine whether the last task was completed (checkpoint written) or was in-flight (no checkpoint for that task). If the task was in-flight, it is marked for retry; if completed, execution resumes from the next task.
+    42. Rehydrate the agent — spin up a fresh ACA container, inject the checkpoint as the initial conversation state, and resume execution. From the agent's perspective, the crash did not happen.
+    43. Notify the user in the Command Center UI: 'Agent [name] recovered from container failure. Resuming from task [N].' In Manual permission mode, the user is asked to confirm before resuming.
+
+All agent task implementations are designed to be idempotent — running the same task twice with the same inputs produces the same output without side effects. This ensures that in-flight tasks can be safely retried after recovery.
+6.6.3  Cosmos DB Failure & Mitigation
+Azure Cosmos DB carries a 99.999% monthly uptime SLA (five nines) with automatic multi-region failover when configured with multiple write regions. However, the system does not assume that Cosmos is always available. A write-through local cache (backed by the ACA container's ephemeral volume) holds the last N checkpoints in memory. If a Cosmos DB write fails, the checkpoint is queued locally and retried with exponential backoff. The Director monitors checkpoint queue depth; if the queue exceeds a configurable threshold, the Director pauses new task dispatches until the backlog clears.
+6.6.4  Director Crash Recovery
+The Director itself — the Azure App Service instance managing the session — is the most critical component to protect. Its recovery is handled differently from agent recovery because it holds no in-memory state that is not already persisted: the AEG state machine, the Task Ledger, all agent checkpoints, and the full session audit log are all in Cosmos DB. If the Director process restarts, it rehydrates its full session context from Cosmos DB on startup and resumes as if no interruption occurred. The Command Center UI reconnects automatically via Azure SignalR Service, which buffers messages during the brief reconnection window.
+6.6.5  User-Visible Recovery Guarantees
+The system's recovery promise to the user is: you will never lose more than one task's worth of work (the in-flight task at the moment of failure). Every completed task is permanently persisted. The user's session can be closed and reopened from any device, and the build will resume exactly where it left off, with full history intact.
+
+Failure Scenario	Recovery Mechanism & User Impact
+ACA agent container crash	Event Grid detection → Director rehydrates agent from task checkpoint within ~30s. User sees notification; build resumes automatically in Semi-Auto and Autopilot modes.
+Azure OpenAI API timeout	Agent's MCP tool wrapper retries with exponential backoff (3 attempts). If all fail, Director flags task as BLOCKED and notifies user with option to retry or substitute model tier.
+Cosmos DB transient failure	Local checkpoint cache absorbs writes; retry queue clears automatically when DB recovers. No user-visible impact for outages under ~2 minutes.
+Director (App Service) restart	Session fully rehydrated from Cosmos DB on startup. UI reconnects via SignalR. User sees a brief 'Reconnecting...' indicator; no data loss.
+User browser closes mid-build	Build continues uninterrupted on the server. User reopens Command Center UI and resumes from current AEG state.
+
+6.7  Code Artefact Rollback
+Section 6.6 covers agent memory rollback — restoring a crashed agent's conversation state, task pointer, and variables from a Cosmos DB checkpoint. This is necessary but not sufficient. Agent memory and generated source code are two distinct layers, and a complete rollback requires both to be restored to a consistent state together.
+
+6.7.1  The Two-Layer Rollback Model
+Every completed agent task produces two independent, synchronised persistence writes:
+
+Layer	What Is Persisted
+Agent Memory Layer	Conversation history, tool call results, task pointer, local variables, performance metrics for this task.
+Code Artefact Layer	All source files written or modified by this task, committed as a Git commit to the project repository. Commit message follows the structured format: [agent_role][task_id] description.
+
+The Cosmos DB checkpoint document stores the Git commit SHA of the corresponding code commit. The Git commit message stores the Cosmos DB checkpoint ID. This bidirectional link means the two layers are always navigable together — given either, you can find the other.
+
+6.7.2  What 'Rollback' Means
+Because each task completion triggers both a Cosmos DB checkpoint write and a git commit, the project's code history is independently auditable and restorable at any granularity. A rollback is defined as the atomic restoration of both layers to a consistent prior state:
+
+    44. The user selects a target rollback point from the Build Timeline panel in the Command Center UI. The timeline displays all task completions as labelled markers, each showing the agent that completed it, the task description, and a thumbnail of the diff it introduced.
+    45. The Director identifies the Cosmos DB checkpoint ID and the corresponding Git commit SHA for the selected rollback point.
+    46. The Director instructs affected agents to restore their memory from the Cosmos DB checkpoint (agent rehydration, as per Section 6.6.2).
+    47. The Director's deployment tool issues a git revert to the corresponding commit on the project branch, restoring all source files to the state they were in at that point. The revert is itself a new commit — history is never rewritten, ensuring a complete audit trail.
+    48. The AEG state machine is updated to mark all tasks completed after the rollback point as PENDING again. The build resumes forward from the rollback point.
+
+Rollback scope is configurable. The user can roll back a single module (reverting only the commits from that module's agent while preserving all others), a time range (all commits within a window), or the entire build to a specific point. The Director validates that a partial rollback does not create a dependency inconsistency in the AEG before executing it.
+
+6.7.3  Rollback vs. Rehydration
+It is important to distinguish between two different recovery operations the document describes: Rehydration (Section 6.6.2) is automatic crash recovery — it restores an agent to resume from where it was before a failure, without undoing any completed work. Rollback is intentional, user-initiated reversion — it explicitly undoes completed work to return to a prior known-good state. Rehydration does not touch the Git repository. Rollback touches both layers atomically.
+
+6.7.4  Partial Build Consistency on Budget Exhaustion
+Section 6.3 described halting non-critical tasks when the budget cap is approached, without addressing the state of the codebase this leaves. With the two-layer rollback model, budget exhaustion is handled more gracefully: when the Director determines the budget cap is imminent, it first allows all in-flight tasks to complete their current atomic unit of work and commit, then halts new task dispatches. The resulting codebase is in a consistent state at module boundaries. Incomplete modules are explicitly flagged in the AEG as INCOMPLETE, and the Production Bundle is withheld until the user either extends the budget or manually marks the incomplete modules as acceptable. The user is never able to deploy a partially assembled application without being explicitly informed of what is missing.
+
+Tool	Role in Section 6.7
+GitHub / Azure Repos (via MCP)	Receives one git commit per completed agent task. Stores the full code version history independently of agent memory.
+Azure Cosmos DB	Stores Cosmos checkpoint-to-Git-SHA links enabling bidirectional navigation between memory state and code state.
+Command Center UI — Build Timeline	Visualises all task completions as rollback-selectable markers with diffs, enabling user-initiated rollback to any prior state.
+
+6.8  Shared Library Trust & Supply Chain Security
+The Agent Recruitment and Blueprint Sharing features (Sections 5.4 and 5.8) create a community-driven ecosystem that is a significant strength of Agentic Nexus. They also introduce a supply chain attack surface that must be explicitly defended. An unvetted community ecosystem where any user can publish agents or Blueprints that others automatically recruit is a serious security liability.
+
+6.8.1  Malicious Agent Vetting Pipeline
+Every agent published to the Azure AI Foundry Shared Library undergoes a multi-stage vetting pipeline before it becomes recruitable by other users:
+
+    49. Static prompt analysis: The agent's system prompt is scanned by Azure AI Content Safety for policy violations, jailbreak patterns, prompt injection instructions, and attempts to override safety constraints. Agents that fail this scan are rejected immediately and the publisher is flagged.
+    50. Sandboxed execution review: Before public listing, the agent is run in an isolated ACA sandbox against a set of standardised test builds that exercise its stated capabilities. The sandbox has no network access, no real MCP tool connections, and no access to any user data. The agent's outputs are reviewed by an automated Audit Agent for signs of malicious behaviour — unexpected file writes, attempts to access out-of-scope paths, anomalous API calls.
+    51. MCP manifest scope validation: The agent's declared MCP tool manifest is validated against a permission scope policy. Manifests requesting write access to resources broader than the project repository, or requesting access to credential stores, are automatically rejected. Overly broad read permissions trigger a human review queue.
+    52. Human review queue: Agents requesting elevated permissions or those that passed automated checks but triggered a secondary risk signal are placed in a human review queue before public listing. This mirrors the App Store review model for high-trust publishing.
+    53. Post-listing monitoring: Recruited community agents are executed in the same isolated ACA container environment as all other agents, with the same principle-of-least-privilege MCP scoping. Anomalous behaviour — unexpected tool calls, attempts to access out-of-scope Cosmos DB documents, unusual network requests — triggers an automatic suspension and audit of the agent's Shared Library listing.
+
+6.8.2  Reputation Score Anti-Gaming
+The reputation score system described in Section 4.5.5 is vulnerable to artificial inflation: an attacker creates many small builds using their own agent on trivial tasks, accumulating a high score before deploying the agent for harmful purposes. The following mechanisms close this loophole:
+
+    • Score weighting by build complexity: Reputation points earned on high-complexity builds (measured by AEG size, token volume, and downstream agent satisfaction) carry significantly more weight than points earned on trivial builds. A Phi-4-tier documentation task contributes a fraction of the score weight of a GPT-4o-tier architecture task.
+    • Publisher identity verification: Agents can only be published to the Shared Library by verified Azure AD accounts. This creates an accountable identity trail even without preventing fake builds.
+    • Anomaly detection on score velocity: If an agent's reputation score increases unusually quickly — many builds in a short window, all from the same or similar accounts — the system flags the score as potentially gamed and displays a 'Score Under Review' badge on the Shared Library listing until a human audit clears it.
+    • Community reports: Users who recruit an agent and observe unexpected behaviour can file a report directly from the Command Center UI. Three independent reports within any 30-day window automatically suspends the listing pending review.
+
+6.8.3  Blueprint Sanitisation Before Publishing
+Blueprints (Section 5.4) encode agent system prompts that were shaped by the original build's context. Before a Blueprint is published to the Shared Library — publicly or to an organisation — an automated sanitisation pass is run:
+
+    • Named entity detection: Azure AI Language's Named Entity Recognition identifies company names, personal names, email addresses, phone numbers, and URLs embedded in system prompts. Any entity that did not originate from the agent's catalog template definition (i.e., was inserted during the specific build) is flagged for removal or redaction.
+    • Internal endpoint scrubbing: URLs and hostnames in system prompts that match the user's declared integration targets in the Task Ledger are automatically redacted before Blueprint export.
+    • User confirmation: The sanitisation report is shown to the user before publishing. Items marked for redaction are highlighted; the user can choose to keep any flagged item (taking explicit responsibility) or accept the redactions. Nothing is redacted without the user seeing what was removed.
+
+6.8.4  Prompt Injection via Uploaded Files
+The Data-to-App Pipeline (Section 5.7) passes uploaded documents through Azure Document Intelligence and into the Director's context. A malicious document could embed instruction text designed to hijack the build. Three defences are applied in sequence:
+
+    54. Pre-extraction content scan: Azure AI Content Safety scans the raw document before it is passed to Azure Document Intelligence, flagging documents that contain known prompt injection patterns in their text content.
+    55. Structural context separation: The Director receives uploaded file content in a structurally distinct section of its system prompt, explicitly labelled as 'Untrusted External Content.' The Director's prompt engineering explicitly instructs it to treat this section as data to be analysed, not instructions to be followed. This is a well-established prompt injection mitigation pattern.
+    56. Post-extraction diff review: The Task Ledger fields that were auto-populated from the uploaded file are shown to the user for review before the build proceeds. A user reviewing their own Task Ledger will typically notice if a field contains something anomalous that they did not intend.
+
+6.8.5  Healer Agent Patch Security
+Section 5.1 describes the Healer Agent generating and applying code patches. These patches are not currently described as going through the Security Reviewer pipeline. This is a gap: a poorly-reasoning model or a compromised Healer Agent could introduce a security vulnerability under the guise of a fix, bypassing the standard security review that applies to all other generated code.
+
+All Healer Agent patches are now explicitly required to pass through the Security Reviewer agent before being committed to the project repository. The Security Reviewer receives both the original failing code and the proposed patch, performing a differential security review — checking not just whether the patch is safe in isolation, but whether it introduces any new security properties relative to the original code. If the Security Reviewer rejects a patch, the Healer Agent is re-dispatched with the rejection reason included in its context, and the rejected patch is logged in the observability trace.
+
+Trust Mechanism	Threat Mitigated
+Static prompt analysis + sandboxed execution review	Malicious system prompts in community-published agents.
+MCP manifest scope validation	Overly broad tool permissions granted to community agents.
+Post-listing anomaly monitoring	Malicious behaviour that passed initial vetting but emerges during real builds.
+Reputation score anti-gaming (complexity weighting + velocity detection)	Artificial inflation of reputation scores via trivial builds.
+Blueprint sanitisation (NER + endpoint scrubbing)	PII, company data, and internal endpoints leaking into public Blueprints.
+Prompt injection defences (content scan + context separation + user review)	Malicious instructions embedded in uploaded files hijacking the build.
+Healer patch security review (differential Security Reviewer pass)	Security vulnerabilities introduced by automated code patches.
+
+6.9  Multi-User Collaboration
+The document has up to this point assumed a single user interacting with the Director. This assumption breaks down for enterprise and team scenarios, which are explicitly part of the platform's target audience. A product manager defining requirements, a technical lead approving the AEG, and developers monitoring parallel agent execution are three different people with three different concerns — and the system must support their concurrent involvement without introducing chaos into the build session.
+
+6.9.1  The Session Ownership Model
+Every build session has one Owner — the user who initiated it. Ownership is registered against an Azure AD identity and stored in the session document in Cosmos DB. The Owner is the only party who can take financially consequential actions: approving the AEG, pressing One-Click Ship, extending the Cloud Preview TTL, and increasing the budget cap. This is a deliberate constraint, not a limitation — in a team context, it is essential that financial and deployment decisions have a clear, accountable author.
+
+Beyond the Owner, the session supports two additional role types:
+
+Role	Capabilities
+Owner	Full access. Initiates the build, approves the AEG and all Delta AEGs, approves the Production Bundle, presses Ship, manages budget, invites collaborators, sets permission mode.
+Collaborator — Edit	Can contribute to the Task Ledger during Stage 1, raise and resolve Guardrail Dialogues, add user-defined tests, leave comments on AEG nodes, and participate in the Local/Cloud Preview feedback loop. Cannot approve the AEG, approve deployment, or change the budget cap.
+Collaborator — View	Read-only access to all session state: the live AEG, the Build Timeline, agent progress, the Observability trace, and the Local/Cloud Preview. Can leave comments but cannot modify any session data.
+
+Collaborators are invited by the Owner via an Azure AD group membership or direct email invitation. The invitation generates a scoped session access token valid for the duration of the build. Access is revoked automatically when the session completes or when the Owner removes the collaborator.
+
+6.9.2  Real-Time Presence & Concurrent Editing
+When multiple users are active in the same session simultaneously, the Command Center UI displays a live presence panel showing who is currently online, what they are viewing, and whether anyone is actively editing. Presence state is maintained via Azure SignalR Service, the same mechanism used for crash recovery reconnection.
+
+Concurrent editing of the Task Ledger is the area with the highest conflict potential. The system handles this with an Operational Transformation model rather than 'last write wins':
+
+    • Each Task Ledger field is treated as an independently lockable unit. When a user begins editing a specific field, a soft lock is applied to that field for that user's session. Other users see the field as 'Being edited by [name]' and are prevented from editing it simultaneously. The soft lock expires after 60 seconds of inactivity — if the editing user stops typing without saving, the lock releases automatically.
+    • Field-level changes are stored as a sequential operation log rather than replacing the full document. Each operation records: the field path, the change type (insert, delete, replace), the content, the author's Azure AD identity, and a timestamp. The Cosmos DB document is reconstructed by replaying the operation log, which means the full edit history is preserved and any version can be reconstructed.
+    • If two users submit conflicting changes to the same field within the same 2-second write window (e.g., both editing the project title), the system detects the conflict and presents a merge dialogue to both users showing the two versions side by side. Neither version is applied automatically. The Owner's version is offered as the default suggestion, but either user can accept either version or manually compose a merged result.
+
+6.9.3  Role-Separated AEG Approval
+The AEG approval flow (Stage 2) is the most consequential decision point in the pipeline — it determines what gets built and at what cost. For team builds, this decision is modelled as a two-phase approval:
+
+    57. Technical review: The Owner and all Edit Collaborators receive the AEG for review simultaneously. Each can annotate individual nodes with comments (e.g., 'Why is the auth module estimated at 40k tokens?' or 'We should add a caching layer here'). Comments are threaded and resolved in the UI. This phase has a configurable review window (default: no time limit for Manual mode; automatically skipped in Autopilot mode).
+    58. Final approval: Only the Owner can click 'Approve AEG' and provision agent resources. This cannot be delegated. If the Owner is unavailable, the session remains in AWAITING_APPROVAL state indefinitely — it does not time out and auto-approve. This is intentional: auto-approval of a resource-provisioning decision in the Owner's absence would be a serious UX and financial safety failure.
+
+The same two-phase model applies to Delta AEGs generated during the feedback loop, with one addition: when a Structural change is requested by an Edit Collaborator (not the Owner), the Director flags this explicitly in the Delta AEG review — 'Structural change proposed by [name]' — so the Owner is aware of the source of the request before approving.
+
+6.9.4  Conflict Resolution for the Build Timeline
+With multiple collaborators able to submit feedback during the Local/Cloud Preview stage, there is potential for conflicting feedback — one user requests a Cosmetic change to the primary button colour while another user simultaneously requests a Behavioural change to the button's click handler. The Director handles this with a straightforward serialisation policy:
+
+    • Cosmetic and Behavioural changes from different users are queued and processed sequentially in submission order. Each change is applied to the output of the previous one, not to the base state.
+    • If two feedback items conflict — one user deletes a module while another adds a dependency on it — the Director detects the conflict before executing either change, presents both items to the Owner in a conflict resolution dialogue, and waits for an explicit resolution decision.
+    • Structural changes (Delta AEG requests) always require Owner approval before execution, regardless of which collaborator submitted the request. A Structural change request from a collaborator does not execute immediately — it enters a PENDING_OWNER_APPROVAL queue.
+
+6.9.5  Audit Trail for Team Accountability
+In team scenarios, the Task Ledger's revision_history field records not just what changed but who changed it and what role they held at the time. Every AEG approval, every feedback submission, every Guardrail Dialogue override, and every rollback action is attributed to a specific Azure AD identity. This audit trail is:
+
+    • Immutable — entries cannot be edited or deleted, even by the Owner.
+    • Exportable — the full audit trail can be exported as a structured JSON report alongside the Production Bundle, supporting compliance and post-mortem review requirements.
+    • Surfaced in the Build Timeline — the Command Center UI labels each timeline marker with the identity of the user whose action produced it, making it immediately clear who drove each decision during the build.
+
+Tool	Role in Section 6.9
+Azure AD (Entra ID)	Identity provider for all session participants. Owner and collaborator roles are assigned as scoped session claims against Azure AD identities.
+Azure SignalR Service	Real-time presence state, concurrent edit notifications, and field-lock broadcasts to all active session participants.
+Azure Cosmos DB (operation log)	Field-level edit operation log for the Task Ledger, enabling conflict detection, version reconstruction, and the immutable audit trail.
+Azure Service Bus	Broadcasts SUSPEND signals and Delta AEG PENDING_OWNER_APPROVAL notifications to all session participants in real time.
+
+7. End-to-End Data Flow
+The following table traces a single data artefact — the API contract between a Backend Engineer agent and a Frontend Engineer agent — through the complete pipeline, illustrating how data is created, stored, communicated, and consumed at each stage.
+
+Stage	Artefact State	Storage / Transport
+1 — Requirement	User mentions 'frontend consumes backend API' in conversation	Task Ledger (Cosmos DB) — integration_targets field
+2 — Planning	AEG edge: Backend Engineer → Frontend Engineer; output contract defined as OpenAPI 3.0 schema stub	AEG JSON (Cosmos DB) — node output_contracts field
+3 — Provisioning	Backend Engineer agent template loaded; output_contract schema injected into system prompt	Azure AI Foundry Agent Service
+4 — Execution	Backend Engineer publishes completed OpenAPI 3.0 spec to A2A channel	Azure Service Bus — topic: project_{id}.backend.api_contract
+4 — Execution	Frontend Engineer receives OpenAPI spec via A2A channel; begins component generation	Azure Event Grid trigger → ACA container wakeup
+5 — Monitoring	Both agents' token consumption and API contract fidelity score recorded	Cosmos DB + Azure AI Foundry Observability trace
+6 — QA	QA Agent generates integration tests that validate frontend calls against backend OpenAPI spec	ACA Jobs container; test results → Cosmos DB
+6 — Deploy	OpenAPI spec included in Production Bundle as API reference documentation	Azure Container Registry image + GitHub Actions artifact
+
+8. Hackathon Implementation Roadmap
+Given hackathon time constraints, the following phased implementation plan prioritises the core demo loop while scaffolding the full architecture.
+
+Phase	Deliverable
+Phase 1 — Director + Task Ledger (Day 1 AM)	Command Center UI (React on Azure App Service). Director multi-turn clarification loop. Task Ledger schema and Cosmos DB storage. Session-level and agent-level checkpointing foundations. File upload endpoint with Data Ingestion Agent (CSV and JSON parsing).
+Phase 2 — AEG Planning + HITL + Ghost Handshakes (Day 1 PM)	AEG generation prompt and JSON schema. Visual graph render in the UI. User approval / revision loop. Dependency-Aware Scheduler with Ghost Handshake stub generation and GHOST_RESOLVED resolution flow.
+Phase 3 — Agent Provisioning + Parallel Exec + Recruitment (Day 2 AM)	Azure AI Foundry agent template library (5 core roles). ACA container launch for 2-3 concurrent agents. MCP connections for GitHub and file system. Agent Recruitment: semantic search over Shared Library. ACA crash detection and rehydration from checkpoint.
+Phase 4 — QA + Self-Healing + Local Preview + Model Escalation (Day 2 PM)	QA Agent with auto-generated tests. Healer Agent with Model Escalation Policy (4-tier ladder). Docker Compose Local Preview stack. Azure Dev Tunnels integration. Feedback Panel with Cosmetic, Behavioural, and Structural change handling.
+Phase 5 — Deploy + All Capes + @nexus Extension + Collaboration (Day 3)	Deployment Agent (Dockerfile + Bicep). One-Click Ship via GitHub Actions. Cost Optimizer routing + Escalation Policy logging. Digital Twin with Azure API Center mock validation. Blueprint generation. Agent Export to Foundry Shared Library. @nexus Copilot Extension basic integration (new build + file context). Learning Mode conversational tutor. Multi-user collaboration: Owner/Collaborator roles, Azure AD invite flow, real-time presence via SignalR, field-level soft locks, AEG comment threading. Demo scenario end-to-end rehearsal.
+
+9. Glossary
+Term	Definition
+AEG	Agent Execution Graph — the directed acyclic graph of agent nodes and dependency edges that defines the build plan.
+A2A	Agent-to-Agent — the communication protocol and channel infrastructure allowing correlated agents to share context without Director mediation.
+ACA	Azure Container Apps — serverless container runtime used to host every agent in the system.
+Blueprint	A portable JSON artefact encoding a complete AEG, agent prompts, A2A topology, and deployment template for sharing and remixing.
+Cape Feature	A differentiating product capability layered on top of the core pipeline: Self-Healing Debugger, Cost Optimizer, Digital Twin, Blueprint Sharing, Learning Mode, GitHub Copilot Extension, Data-to-App Pipeline, and Agent Export Ecosystem.
+Director	The Tier-0 root agent. Owns user dialogue, the Task Ledger, the AEG, and overall build supervision.
+Healer Agent	A Tier-2 support agent dispatched when a test failure is detected; performs automated root cause analysis and patch generation.
+HITL	Human-in-the-Loop — an explicit checkpoint where the user must approve a plan or output before execution continues.
+MAF	Microsoft Agent Framework — the orchestration runtime providing the Manager-Worker pattern.
+MCP	Model Context Protocol — a standardised specification for connecting AI agents to external tools and data sources.
+Rehydration	The process of restoring a previously dissolved agent from its Cosmos DB checkpoint, including its full conversation and tool call history.
+Reputation Score	A multi-dimensional performance metric computed by the Director after each agent engagement and stored in the Agent Catalog.
+Checkpointing	The act of writing an agent's full state (conversation, artefacts, task pointer) to Cosmos DB after each task completion, enabling crash recovery without data loss.
+Idempotency	The property of an agent task whereby running the same task twice with the same inputs produces the same output without side effects. Required to make crash recovery safe.
+Learning Mode	An optional post-build mode in which a GPT-4o tutor pre-loaded with full build context answers questions about the generated codebase, architecture, and design decisions.
+Local Preview	A Docker Compose environment spun up after QA passes, allowing the user to interact with the fully generated application before any cloud infrastructure is provisioned.
+Delta AEG	An additive change to the original Agent Execution Graph, triggered by structural user feedback during Local Preview. Requires a lightweight HITL re-approval before execution.
+Ghost Divergence	A Ghost Handshake event where the upstream agent's real output differs substantially from the stub it published, requiring the Director to evaluate rewrite vs. patch cost for the downstream agent's existing work.
+Healer Cascade	The scenario where a Healer Agent patch fixes one test but causes a new failure in a different module. Treated as a single compound problem rather than two independent Healer dispatches to prevent unbounded activation chains.
+Two-Layer Rollback	The atomic restoration of both an agent's Cosmos DB memory checkpoint and the corresponding Git commit in the project repository, returning both layers to a consistent prior state simultaneously.
+Session Owner	The Azure AD identity that initiated a build session and holds exclusive authority over financially consequential actions: AEG approval, deployment, budget changes, and collaborator management.
+Collaborator — Edit	A session participant who can contribute to the Task Ledger, raise feedback, and annotate the AEG but cannot approve deployment or modify the budget.
+Collaborator — View	A read-only session participant who can observe all session state and leave comments but cannot modify any session data.
+Soft Lock	A temporary field-level edit lock applied when a user begins editing a specific Task Ledger field, preventing simultaneous conflicting edits. Expires after 60 seconds of inactivity.
+Operation Log	The sequential field-level edit history stored in Cosmos DB, used for conflict detection, version reconstruction, and the immutable audit trail.
+Build Timeline	The Command Center UI panel showing all task completions as labelled, selectable rollback markers with diff thumbnails.
+Supply Chain Attack	A threat where a malicious actor publishes a compromised agent or Blueprint to the Shared Library, exploiting the trust that other users place in community-contributed content.
+Ghost Handshake	A provisional, schema-conformant stub published by an upstream agent immediately upon starting, allowing downstream agents to begin work in parallel before the real output contract is ready.
+Model Escalation Policy	The automatic process of promoting a failed task to a more capable model tier (SLM → GPT-4o-mini → GPT-4o → GPT-4o+o1) after each consecutive failure, ensuring quality is never sacrificed for cost.
+Agent Export	The packaging of a built specialist agent as a standalone, independently deployable Azure AI Foundry Agent that other developers can use outside of Agentic Nexus.
+Agent Recruitment	The process by which the Director searches the Azure AI Foundry Shared Library for community-built agents whose capabilities match a module's role, and invites them into the current build's AEG.
+Data Ingestion Agent	A specialised Tier-2 agent that processes uploaded files (CSV, JSON, PDF, images) to pre-populate the Task Ledger with structured intent before the clarification dialogue begins.
+Guardrail Dialogue	A structured, non-blocking challenge raised by the Director when a user's requested design decision is assessed as suboptimal or risky. Presents pros, cons, and an alternative before asking for user confirmation. Override decisions are logged in the Task Ledger.
+Approval Fatigue	The failure mode where a user in Manual mode receives so many task approval requests that they begin approving without reading, defeating the purpose of the oversight system. Mitigated by Impact-Based Filtering and Batch Approvals.
+Impact-Based Filtering	The Director's mechanism for classifying every task notification as Routine (silent), Notable (batched), or Critical (immediate interrupt) based on its blast radius and reversibility.
+Batch Approval	A consolidated diff panel that groups multiple low-risk Notable task notifications into a single user review, presented at a configurable time or item-count interval.
+Cloud Preview	An ephemeral Azure Container Apps Environment that runs the generated application in the cloud rather than locally, enabling preview for users on low-resource hardware with no local Docker installation required.
+Task Ledger	A versioned JSON document that is the single source of truth for project requirements, constraints, decisions, and guardrail override history.
+
+10. References
+    • Microsoft Agent Framework (MAF) and Magentic-One pattern — Azure AI Foundry documentation.
+    • Azure AI Foundry Agent Service — agent template management and catalog APIs.
+    • Azure Container Apps — serverless container platform for agent isolation and scaling.
+    • Model Context Protocol (MCP) — open specification for AI-tool connectivity.
+    • Azure Cosmos DB with DiskANN vector index — long-term agentic memory and semantic search.
+    • Azure AI Content Safety — real-time prompt filtering and policy enforcement.
+    • Azure AI Model Catalog (MaaS) — on-demand model routing across GPT-4o, GPT-4o-mini, and Phi-4.
+    • Azure Application Insights and Azure Monitor — telemetry, observability, and alerting.
+    • GitHub Actions — CI/CD automation for application deployment pipelines.
+    • Azure Key Vault — secrets management for generated application deployments.
+    • Azure Dev Tunnels — secure local-to-public tunnel for Local Preview environment access.
+    • Azure SignalR Service — real-time WebSocket message buffering for Command Center UI reconnection on Director restart.
+    • GitHub Copilot Extensions API — @nexus IDE chat participant registration and workspace file access.
+    • Azure Document Intelligence — OCR and structured extraction for uploaded PDF and document inputs.
+    • Azure API Center — real OpenAPI specification registry for schema-validated Digital Twin mock generation.
+    • Azure AD (Entra ID) — identity provider for session ownership, collaborator role assignment, and immutable audit trail attribution.
+
+Agentic Nexus  |  Microsoft Hackathon 2026  |  The Next Billion Builders
+Built with Azure AI Foundry  •  Microsoft Agent Framework  •  Azure Container Apps  •  Model Context Protocol
