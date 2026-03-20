@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { sendToClarify, getBuildContext, getAgentLogs, generateProjectId } from './directorClient';
+import { sendToClarify, getBuildContext, getAgentLogs, generateProjectId, getAEGStatus, getProjectStatus, stateEmoji } from './directorClient';
 import { gatherWorkspaceContext, formatContextForPrompt } from './contextProvider';
 
 const projectSessions = new Map<string, string>();
@@ -49,18 +49,66 @@ async function handleBuildMode(
   stream.progress('Sending to Director agent...');
   const reply = await sendToClarify(projectId, enrichedInput);
 
-  stream.markdown(`**🤖 Director:**\n\n${reply.director_reply}\n\n`);
+  // Get the real project ID from the backend response
+  const realProjectId = (reply as any).project_id || projectId;
+  projectSessions.set(sessionKey, realProjectId);
 
-  if (reply.state === 'BUILDING') {
-    stream.markdown(`---\n⚙️ *Build started! Open the Command Center to watch agents work.*\n`);
-    stream.button({
-      command: 'vscode.open',
-      arguments: [vscode.Uri.parse('http://localhost:3000')],
-      title: '$(globe) Open Command Center',
-    });
-  } else {
-    stream.markdown(`\n*Reply to continue, or use \`@nexus /build\` to start fresh.*\n`);
+  stream.markdown(`**🤖 Director:**\n\n${reply.director_reply}\n\n`);
+  stream.markdown(`---\n⚙️ *Agents are now building your project...*\n\n`);
+
+  // Poll for agent status 5 times with 4 second intervals
+  stream.progress('Waiting for agents to start...');
+  await new Promise(resolve => setTimeout(resolve, 3000));
+
+  let lastProgress = 0;
+  for (let i = 0; i < 5; i++) {
+    const aegData = await getAEGStatus(realProjectId);
+    const projectData = await getProjectStatus(realProjectId);
+
+    if (aegData.agents.length > 0) {
+      stream.markdown(`**⚙️ Agent Status Update ${i + 1}:**\n\n`);
+      
+      // Show each agent status
+      for (const agent of aegData.agents) {
+        stream.markdown(`${stateEmoji(agent.state)} \`${agent.agent_type}\` — ${agent.state}\n\n`);
+      }
+
+      // Show progress bar
+      const progress = projectData.progress || aegData.progress || 0;
+      const filled = Math.floor(progress / 10);
+      const empty = 10 - filled;
+      const progressBar = '█'.repeat(filled) + '░'.repeat(empty);
+      stream.markdown(`**Progress:** \`${progressBar}\` ${progress}%\n\n`);
+
+      lastProgress = progress;
+
+      // If completed or failed, stop polling
+      if (projectData.status === 'completed' || projectData.status === 'failed') {
+        if (projectData.status === 'completed') {
+          stream.markdown(`✅ **Build completed!**\n\n`);
+        } else {
+          stream.markdown(`❌ **Build failed:** ${projectData.error || 'Unknown error'}\n\n`);
+        }
+        break;
+      }
+
+      stream.markdown(`---\n`);
+    }
+
+    // Wait 4 seconds before next poll
+    if (i < 4) {
+      stream.progress(`Checking agent status... (${i + 2}/5)`);
+      await new Promise(resolve => setTimeout(resolve, 4000));
+    }
   }
+
+  // Show button to open Command Center
+  stream.markdown(`\n*Open the Command Center to see full details:*\n`);
+  stream.button({
+    command: 'vscode.open',
+    arguments: [vscode.Uri.parse('http://localhost:5173')],
+    title: '$(globe) Open Command Center',
+  });
 }
 
 async function handleDebugMode(
@@ -128,9 +176,6 @@ function extractAgentName(prompt: string): string | null {
     .find(a => prompt.toLowerCase().includes(a)) ?? null;
 }
 
-function stateEmoji(state: string): string {
-  return ({ PENDING: '⏳', RUNNING: '🔄', COMPLETED: '✅', FAILED: '❌', DONE: '✅' } as Record<string, string>)[state] ?? '❓';
-}
 
 function generateDebugSuggestions(error: string): string {
   if (error.toLowerCase().includes('timeout')) {

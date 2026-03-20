@@ -13,34 +13,34 @@
   "main": "./dist/extension.js",
   "contributes": {
     "chatParticipants": [
-    {
-      "id": "nexus.agent",
-      "fullName": "Nexus Agent Builder",
-      "name": "nexus",
-      "description": "Build and debug AI-generated apps with @nexus",
-      "isSticky": true,
-      "commands": [
-        {
-          "name": "build",
-          "description": "Start a new app build"
-        },
-        {
-          "name": "debug",
-          "description": "Debug why an agent failed"
-        },
-        {
-          "name": "explain",
-          "description": "Explain the current build architecture"
-        }
-      ]
-    }
-  ]
+      {
+        "id": "nexus.agent",
+        "fullName": "Nexus Agent Builder",
+        "name": "nexus",
+        "description": "Build and debug AI-generated apps with @nexus",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "build",
+            "description": "Start a new app build"
+          },
+          {
+            "name": "debug",
+            "description": "Debug why an agent failed"
+          },
+          {
+            "name": "explain",
+            "description": "Explain the current build architecture"
+          }
+        ]
+      }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
-    "compile": "webpack",
-    "watch": "webpack --watch",
-    "package": "webpack --mode production --devtool hidden-source-map",
+    "compile": "npx webpack",
+    "watch": "npx webpack --watch",
+    "package": "npx webpack --mode production --devtool hidden-source-map",
     "compile-tests": "tsc -p . --outDir out",
     "watch-tests": "tsc -p . -w --outDir out",
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
@@ -57,7 +57,7 @@
     "ts-loader": "^9.5.4",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.56.1",
-    "webpack": "^5.105.3",
+    "webpack": "^5.105.4",
     "webpack-cli": "^6.0.1"
   },
   "dependencies": {

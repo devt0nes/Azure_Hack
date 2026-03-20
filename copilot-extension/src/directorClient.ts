@@ -20,6 +20,46 @@ export async function sendToClarify(projectId: string, userInput: string): Promi
   }
 }
 
+export async function getProjectStatus(projectId: string): Promise<{
+  status: string;
+  progress: number;
+  error: string | null;
+}> {
+  try {
+    const res = await axios.get(`${DIRECTOR_BASE_URL}/api/projects/${projectId}`);
+    return {
+      status: res.data.status,
+      progress: res.data.progress,
+      error: res.data.error,
+    };
+  } catch {
+    return { status: 'unknown', progress: 0, error: null };
+  }
+}
+
+export async function getAEGStatus(projectId: string): Promise<{
+  agents: Array<{ id: string; agent_type: string; state: string }>;
+  progress: number;
+  status: string;
+}> {
+  try {
+    const res = await axios.get(`${DIRECTOR_BASE_URL}/aeg?project_id=${projectId}`);
+    const data = res.data;
+    const agents = (data.task_ledger || []).map((task: any) => ({
+      id: task.agent,
+      agent_type: task.agent.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+      state: task.status === 'IN_PROGRESS' ? 'RUNNING' : task.status === 'COMPLETED' ? 'COMPLETED' : 'PENDING',
+    }));
+    return {
+      agents,
+      progress: data.progress || 0,
+      status: data.status || 'UNKNOWN',
+    };
+  } catch {
+    return { agents: [], progress: 0, status: 'UNKNOWN' };
+  }
+}
+
 export async function getBuildContext(projectId: string): Promise<BuildContext> {
   try {
     const res = await axios.get<BuildContext>(`${DIRECTOR_BASE_URL}/context/${projectId}`);
@@ -43,7 +83,9 @@ export async function getBuildContext(projectId: string): Promise<BuildContext> 
 
 export async function getAgentLogs(agentId: string, projectId: string): Promise<AgentStatus> {
   try {
-    const res = await axios.get<AgentStatus>(`${DIRECTOR_BASE_URL}/agents/${agentId}/logs?project_id=${projectId}`);
+    const res = await axios.get<AgentStatus>(
+      `${DIRECTOR_BASE_URL}/agents/${agentId}/logs?project_id=${projectId}`
+    );
     return res.data;
   } catch {
     return {
@@ -64,4 +106,17 @@ export async function getAgentLogs(agentId: string, projectId: string): Promise<
 
 export function generateProjectId(): string {
   return `proj_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+export function stateEmoji(state: string): string {
+  const map: Record<string, string> = {
+    PENDING: '⏳',
+    RUNNING: '🔄',
+    COMPLETED: '✅',
+    FAILED: '❌',
+    IN_PROGRESS: '🔄',
+    DRAFT: '📝',
+    DONE: '✅',
+  };
+  return map[state] ?? '❓';
 }
