@@ -1,0 +1,121 @@
+name: Build and Deploy to Azure Container Apps
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: nexusacrteam.azurecr.io
+  IMAGE_NAME: agentic-nexus
+  RESOURCE_GROUP: agentic-nexus-rg
+  CONTAINER_APP_NAME: agentic-nexus-api
+  CONTAINER_APP_ENVIRONMENT: agentic-nexus-env
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get Container App Image
+        id: image
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Deploy to Azure Container Apps
+        run: |
+          az containerapp update \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ steps.image.outputs.image }} \
+            --set-env-vars \
+            ENVIRONMENT=production \
+            LOG_LEVEL=INFO
+
+      - name: Health Check
+        run: |
+          CONTAINER_APP_URL=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)
+          
+          echo "Waiting for deployment..."
+          sleep 10
+          
+          for i in {1..10}; do
+            if curl -f "https://${CONTAINER_APP_URL}/api/health"; then
+              echo "✅ Health check passed"
+              exit 0
+            fi
+            echo "Attempt $i/10 - waiting..."
+            sleep 5
+          done
+          
+          echo "❌ Health check failed"
+          exit 1
+
+      - name: Create Deployment Annotation
+        run: |
+          az deployment group create \
+            --name "deployment-$(date +%s)" \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --template-file infrastructure.bicep \
+            --parameters imageName=${{ steps.image.outputs.image }}

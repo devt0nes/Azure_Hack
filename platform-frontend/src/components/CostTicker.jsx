@@ -29,17 +29,17 @@ export default function CostTicker({ tokens, cost }) {
   }, [cost, tokens])
 
   return (
-    <div className="relative rounded-full border border-ember/30 bg-gradient-to-r from-ember/5 via-amber-500/5 to-orange-500/5 px-6 py-3 text-sm backdrop-blur-xs shadow-glow-sm">
-      <div className="absolute inset-0 rounded-full bg-gradient-to-r from-transparent via-white/10 to-transparent" />
+    <div className="relative rounded-xl border border-primary/30 bg-card px-6 py-3 text-sm shadow-glow-sm">
+      <div className="absolute inset-0 rounded-xl bg-gradient-to-r from-transparent via-primary/10 to-transparent" />
       <div className="relative">
-        <div className="mono text-[9px] uppercase tracking-[0.3em] text-ink/60">
+        <div className="mono text-[9px] uppercase tracking-[0.3em] text-foreground/50">
           Live Cost
         </div>
         <div className="mt-2 flex items-baseline gap-3">
-          <span className="bg-gradient-to-r from-ember via-orange-400 to-amber-400 bg-clip-text text-2xl font-bold text-transparent">
+          <span className="text-gradient-ember text-2xl font-bold">
             ${displayCost.toFixed(3)}
           </span>
-          <span className="mono text-xs text-ink/50">{Math.round(displayTokens)} tokens</span>
+          <span className="mono text-xs text-foreground/50">{Math.round(displayTokens)} tokens</span>
         </div>
       </div>
     </div>

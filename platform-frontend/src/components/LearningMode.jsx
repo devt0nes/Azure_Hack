@@ -82,15 +82,15 @@ export default function LearningMode({ projectId }) {
   }
 
   return (
-    <div className="flex h-full min-h-[500px] flex-col bg-sand/10">
-      <div className="flex items-center justify-between border-b border-ink/10 pb-3">
+    <div className="flex h-full min-h-[500px] flex-col bg-transparent">
+      <div className="flex items-center justify-between border-b border-border pb-3">
         <div>
-          <h2 className="text-xl font-semibold text-midnight">Learning Mode</h2>
-          <p className="mono text-xs uppercase tracking-[0.2em] text-ink/50">
+          <h2 className="text-xl font-semibold text-foreground">Learning Mode</h2>
+          <p className="mono text-xs uppercase tracking-[0.2em] text-foreground/50">
             Overview Level
           </p>
         </div>
-        <div className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-semibold text-emerald-700">
+        <div className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-xs font-semibold text-emerald-400">
           GPT-4o
         </div>
       </div>
@@ -106,12 +106,12 @@ export default function LearningMode({ projectId }) {
             <div
               className={`max-w-[90%] rounded-2xl px-4 py-3 text-sm leading-relaxed shadow-sm ${
                 message.role === 'user'
-                  ? 'bg-ember text-white'
-                  : 'border border-ink/10 bg-white text-ink'
+                  ? 'bg-primary text-primary-foreground'
+                  : 'border border-border bg-card text-foreground'
               }`}
             >
               {message.role === 'tutor' ? (
-                <div className="prose prose-sm max-w-none prose-headings:font-semibold prose-h1:text-base prose-h2:text-sm prose-h3:text-xs prose-p:my-2 prose-strong:text-ember prose-code:rounded prose-code:bg-haze prose-code:px-1 prose-code:py-0.5 prose-code:text-xs">
+                <div className="prose prose-sm max-w-none prose-headings:font-semibold prose-h1:text-base prose-h2:text-sm prose-h3:text-xs prose-p:my-2 prose-strong:text-primary prose-code:rounded prose-code:bg-secondary prose-code:px-1 prose-code:py-0.5 prose-code:text-xs prose-invert">
                   <ReactMarkdown
                     components={{
                       h1: ({ children }) => (
@@ -148,13 +148,13 @@ export default function LearningMode({ projectId }) {
         ))}
       </div>
 
-      <div className="mt-4 space-y-3 border-t border-ink/10 pt-4">
+      <div className="mt-4 space-y-3 border-t border-border pt-4">
         <div className="flex flex-wrap gap-2">
           {QUICK_QUESTIONS.map((q) => (
             <button
               key={q}
               onClick={() => handleQuickQuestion(q)}
-              className="rounded-full border border-ink/20 bg-white px-3 py-1 text-xs hover:border-ember hover:bg-ember/5"
+              className="rounded-full border border-border bg-secondary px-3 py-1 text-xs text-foreground/80 hover:border-primary/50 hover:bg-primary/10"
             >
               {q}
             </button>
@@ -167,12 +167,12 @@ export default function LearningMode({ projectId }) {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               placeholder="Ask about the architecture..."
-              className="flex-1 rounded-full border border-ink/15 bg-white/80 px-4 py-3 text-sm outline-none focus:border-ember"
+              className="flex-1 rounded-full border border-border bg-secondary/60 px-4 py-3 text-sm text-foreground outline-none focus:border-primary"
             />
             <button
               type="submit"
               disabled={isAsking}
-              className="rounded-full bg-midnight px-5 py-3 text-sm font-semibold text-white transition hover:bg-midnight/90 disabled:cursor-not-allowed disabled:opacity-70"
+              className="rounded-full border border-border bg-card px-5 py-3 text-sm font-semibold text-foreground transition hover:border-foreground/30 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-70"
             >
               {isAsking ? 'Asking...' : 'Ask'}
             </button>

@@ -12,6 +12,8 @@ from typing import Dict, Optional
 from pathlib import Path
 from datetime import datetime
 
+from deployment_provider import get_deployment_provider
+
 logger = logging.getLogger(__name__)
 
 
@@ -235,6 +237,40 @@ class DeploymentIntegration:
         elif "python" in text_lower:
             return "python"
         return "python"  # Default
+    
+    async def deploy_to_cloud(self) -> Dict:
+        """
+        Actually deploy the generated app to the configured cloud provider.
+        """
+        try:
+            provider = get_deployment_provider()
+            generated_code_path = Path("./generated_code")
+
+            if not generated_code_path.exists():
+                raise FileNotFoundError("No generated code found — run code generation first")
+
+            dockerfile_path = generated_code_path / "deployment" / "Dockerfile"
+            if not dockerfile_path.exists():
+                # Try root of generated_code
+                dockerfile_path = generated_code_path / "Dockerfile"
+            if not dockerfile_path.exists():
+                raise FileNotFoundError("Dockerfile not found in generated output")
+
+            self.logger.info(f"🚀 Deploying to cloud via {provider.__class__.__name__}...")
+            result = await provider.deploy(self.project_id, self.app_name, generated_code_path)
+
+            # Save deployment result
+            result_file = Path("./generated_code/deployment_result.json")
+            import json
+            with open(result_file, 'w') as f:
+                json.dump(result, f, indent=2)
+
+            self.logger.info(f"✅ Deployed! URL: {result.get('deploy_url', 'pending')}")
+            return result
+
+        except Exception as e:
+            self.logger.error(f"❌ Cloud deployment failed: {str(e)}")
+            raise
 
 
 async def run_post_generation_deployment(
@@ -243,7 +279,8 @@ async def run_post_generation_deployment(
     ledger_data: Dict,
     enable_blueprint: bool = True,
     enable_cost_estimate: bool = True,
-    enable_bundle: bool = True
+    enable_bundle: bool = True,
+    enable_cloud_deploy: bool = False  # ← off by default, turn on when ready
 ) -> Dict:
     """
     Execute deployment tasks after code generation is complete.
@@ -255,6 +292,7 @@ async def run_post_generation_deployment(
         enable_blueprint: Whether to generate blueprint
         enable_cost_estimate: Whether to estimate costs
         enable_bundle: Whether to generate deployment bundle
+        enable_cloud_deploy: Whether to deploy to cloud provider (Railway/ACA)
         
     Returns:
         Dictionary with all deployment results
@@ -275,6 +313,9 @@ async def run_post_generation_deployment(
         
         if enable_cost_estimate:
             results["deployment_tasks"]["cost_estimate"] = await integration.estimate_cost()
+
+        if enable_cloud_deploy:
+            results["deployment_tasks"]["cloud_deploy"] = await integration.deploy_to_cloud()  # ← new
         
         results["status"] = "success"
         logger.info("\n" + "="*70)

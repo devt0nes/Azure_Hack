@@ -1,106 +1,47 @@
+import { getToken } from '../firebaseConfig'
+
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || ''
 
 function requireApiBaseUrl() {
-  if (!API_BASE_URL) {
-    throw new Error('VITE_API_BASE_URL is not configured')
-  }
+  if (!API_BASE_URL) throw new Error('VITE_API_BASE_URL is not configured')
 }
 
-export async function clarify({ projectId, userInput }) {
+async function apiFetch(path, options = {}) {
   requireApiBaseUrl()
-  const response = await fetch(`${API_BASE_URL}/clarify`, {
+  const token = await getToken()  // always fresh, Firebase handles refresh
+
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
+      ...options.headers,
+    },
+  })
+
+  if (response.status === 401) {
+    window.location.href = '/'
+  }
+  if (!response.ok) throw new Error(`Request failed: ${path}`)
+  return response.json()
+}
+
+export const clarify = ({ projectId, userInput }) =>
+  apiFetch('/clarify', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      project_id: projectId,
-      user_input: userInput,
-    }),
+    body: JSON.stringify({ project_id: projectId, user_input: userInput }),
   })
 
-  if (!response.ok) {
-    throw new Error('Director request failed')
-  }
+export const getAEG = ({ projectId }) =>
+  apiFetch(`/aeg?project_id=${projectId}`)
 
-  return response.json()
-}
-
-export async function getAEG({ projectId }) {
-  requireApiBaseUrl()
-  const response = await fetch(`${API_BASE_URL}/aeg?project_id=${projectId}`, {
-    method: 'GET',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-  })
-
-  if (!response.ok) {
-    throw new Error('Failed to fetch AEG')
-  }
-
-  return response.json()
-}
-
-export async function executeProject({ projectId }) {
-  requireApiBaseUrl()
-  const response = await fetch(`${API_BASE_URL}/execute`, {
+export const executeProject = ({ projectId }) =>
+  apiFetch('/execute', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      project_id: projectId,
-    }),
+    body: JSON.stringify({ project_id: projectId }),
   })
 
-  if (!response.ok) {
-    throw new Error('Failed to start execution')
-  }
-
-  return response.json()
-}
-
-export async function getHealth() {
-  requireApiBaseUrl()
-  const response = await fetch(`${API_BASE_URL}/api/health`)
-
-  if (!response.ok) {
-    throw new Error('Health check failed')
-  }
-
-  return response.json()
-}
-
-export async function listProjects() {
-  requireApiBaseUrl()
-  const response = await fetch(`${API_BASE_URL}/api/projects`)
-
-  if (!response.ok) {
-    throw new Error('Failed to list projects')
-  }
-
-  return response.json()
-}
-
-export async function getProject({ projectId }) {
-  requireApiBaseUrl()
-  const response = await fetch(`${API_BASE_URL}/api/projects/${projectId}`)
-
-  if (!response.ok) {
-    throw new Error('Failed to fetch project')
-  }
-
-  return response.json()
-}
-
-export async function getProjectLogs({ projectId }) {
-  requireApiBaseUrl()
-  const response = await fetch(`${API_BASE_URL}/api/projects/${projectId}/logs`)
-
-  if (!response.ok) {
-    throw new Error('Failed to fetch project logs')
-  }
-
-  return response.json()
-}
+export const getHealth = () => apiFetch('/api/health')
+export const listProjects = () => apiFetch('/api/projects')
+export const getProject = ({ projectId }) => apiFetch(`/api/projects/${projectId}`)
+export const getProjectLogs = ({ projectId }) => apiFetch(`/api/projects/${projectId}/logs`)

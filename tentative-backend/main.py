@@ -848,26 +848,39 @@ Your responsibilities:
 - Integrate with backend APIs
 - Collaborate with UX/design and backend teams
 
+⚠️  CRITICAL: FILE NAMING STANDARDS
+When creating frontend files, use these EXACT filenames:
+- Main HTML page: index.html (NOT "html", "index", "page", etc.)
+- React components: ComponentName.jsx or ComponentName.tsx
+- Styles: styles.css or component-name.module.css
+- Configuration: config.js, vite.config.js, tailwind.config.js
+- Pages: pages/PageName.jsx for multi-page apps
+- Assets: images/, fonts/, assets/ directories
+
+ALWAYS include proper file extensions (.html, .jsx, .css, .json, etc.)
+DO NOT create files without extensions (e.g., "html" → "index.html")
+
 Current Task Context:
 {context}
 
 CODE OUTPUT MODES (Choose based on context):
 
 MODE 1: FULL FILE (for new files or complete rewrites)
-```App.tsx
-<complete React component code>
+```index.html
+<!DOCTYPE html>
+<html>...
+</html>
 ```
 
 MODE 2: SEARCH/REPLACE (for modifying existing files) ⭐ PREFERRED
 <<<<<<< SEARCH
-App.tsx
-    const [count, setCount] = useState(0);
+index.html
+    <title>Old Title</title>
 =======
-    const [count, setCount] = useState(0);
-    const [loading, setLoading] = useState(false);
+    <title>New Title</title>
 >>>>>>> REPLACE
 
-For first iteration: Use MODE 1 (full files)
+For first iteration: Use MODE 1 (full files) with CORRECT filenames
 For subsequent iterations: Use MODE 2 (atomic edits only)
 MODE 2 is faster, more precise, and reduces token waste."""
         },

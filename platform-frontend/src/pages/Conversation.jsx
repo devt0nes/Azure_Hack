@@ -61,8 +61,8 @@ export default function Conversation({ projectId, onProjectChange }) {
   return (
     <div>
       <div className="flex items-center justify-between">
-        <h2 className="text-xl font-semibold">Conversation</h2>
-        <span className="mono text-xs uppercase tracking-[0.2em] text-ink/50">
+        <h2 className="text-xl font-semibold text-foreground">Conversation</h2>
+        <span className="mono text-xs uppercase tracking-[0.2em] text-foreground/50">
           /clarify
         </span>
       </div>
@@ -76,10 +76,10 @@ export default function Conversation({ projectId, onProjectChange }) {
             }`}
           >
             <div
-              className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed shadow-sm ${
+              className={`max-w-[80%] rounded-xl px-4 py-3 text-sm leading-relaxed ${
                 message.role === 'user'
-                  ? 'bg-ember text-white'
-                  : 'bg-white text-ink border border-ink/10'
+                  ? 'bg-primary text-primary-foreground'
+                  : 'border border-border bg-card text-foreground'
               }`}
             >
               <p className="whitespace-pre-wrap">{message.content}</p>
@@ -89,11 +89,11 @@ export default function Conversation({ projectId, onProjectChange }) {
       </div>
 
       {error ? (
-        <p className="mt-3 text-sm text-red-600">{error}</p>
+        <p className="mt-3 text-sm text-destructive">{error}</p>
       ) : null}
 
       <form onSubmit={handleSubmit} className="mt-5">
-        <label className="text-xs uppercase tracking-[0.25em] text-ink/50">
+        <label className="mono text-xs uppercase tracking-[0.25em] text-foreground/50">
           Your message
         </label>
         <div className="mt-2 flex items-center gap-3">
@@ -101,12 +101,12 @@ export default function Conversation({ projectId, onProjectChange }) {
             value={input}
             onChange={(event) => setInput(event.target.value)}
             placeholder="Ask the Director to clarify the build..."
-            className="flex-1 rounded-full border border-ink/15 bg-white/80 px-4 py-3 text-sm outline-none focus:border-ember"
+            className="flex-1 rounded-full border border-border bg-secondary/60 px-4 py-3 text-sm text-foreground outline-none focus:border-primary"
           />
           <button
             type="submit"
             disabled={isSending}
-            className="rounded-full bg-midnight px-5 py-3 text-sm font-semibold text-white transition hover:bg-midnight/90 disabled:cursor-not-allowed disabled:opacity-70"
+            className="rounded-full border border-border bg-card px-5 py-3 text-sm font-semibold text-foreground transition hover:border-foreground/30 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-70"
           >
             {isSending ? 'Sending...' : 'Send'}
           </button>
