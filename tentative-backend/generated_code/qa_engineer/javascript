@@ -1,0 +1,50 @@
+// File: tests/api_products.test.js
+/**
+ * Purpose: Integration tests for the `/api/products` endpoint.
+ * Dependencies: Jest for testing, Supertest for HTTP assertions.
+ */
+
+const request = require("supertest"); // For making HTTP requests to the tested server
+const app = require("../app"); // Import the Express app
+
+/**
+ * Test suite for `/api/products` endpoint.
+ */
+describe("GET /api/products", () => {
+  /**
+   * Test case: Retrieve all products without any filters
+   */
+  it("should return all products when no filter is applied", async () => {
+    const response = await request(app).get("/api/products");
+    expect(response.status).toBe(200);
+    expect(response.body).toHaveProperty("products");
+    expect(Array.isArray(response.body.products)).toBe(true);
+    expect(response.body.products.length).toBeGreaterThan(0);
+  });
+
+  /**
+   * Test case: Retrieve products filtered by category
+   */
+  it("should return products filtered by category", async () => {
+    const category = "Pastry";
+    const response = await request(app).get(`/api/products`).query({ category });
+    expect(response.status).toBe(200);
+    expect(response.body).toHaveProperty("products");
+    expect(Array.isArray(response.body.products)).toBe(true);
+    response.body.products.forEach((product) => {
+      expect(product.category).toBe(category);
+    });
+  });
+
+  /**
+   * Test case: Handle invalid category filter
+   */
+  it("should return an empty array when no products match the category filter", async () => {
+    const category = "NonExistentCategory";
+    const response = await request(app).get(`/api/products`).query({ category });
+    expect(response.status).toBe(200);
+    expect(response.body).toHaveProperty("products");
+    expect(Array.isArray(response.body.products)).toBe(true);
+    expect(response.body.products.length).toBe(0);
+  });
+});

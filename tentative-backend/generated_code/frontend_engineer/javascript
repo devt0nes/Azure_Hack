@@ -1,0 +1,11 @@
+// Purpose: Entry point for the React application.
+// Dependencies: React, ReactDOM
+// Author: Agentic Nexus Frontend Engineer
+
+import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./App";
+
+// Mount the React application to the root element in the HTML.
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);

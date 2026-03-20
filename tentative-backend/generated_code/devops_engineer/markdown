@@ -1,0 +1,42 @@
+# Infrastructure for Cookie Website
+
+This Terraform configuration provisions the infrastructure for the Cookie Website project.
+
+## Features
+
+- **S3 Bucket**: Static file hosting for the frontend.
+- **EC2 Instance**: Backend server hosting with Node.js.
+- **RDS PostgreSQL Database**: Stores application data.
+
+## Prerequisites
+
+- Terraform installed locally
+- An AWS account
+- An existing EC2 key pair
+
+## Variables
+
+- `ec2_key_pair_name`: EC2 key pair name for SSH access.
+- `backend_repo_url`: Git repository URL for the backend code.
+- `db_name`: Name of the PostgreSQL database.
+- `db_username`: Username for the database.
+- `db_password`: Password for the database.
+
+## Usage
+
+1. Clone this repository.
+2. Initialize Terraform:
+   ```bash
+   terraform init
+   ```
+3. Apply the configuration:
+   ```bash
+   terraform apply
+   ```
+4. Provide the required variables when prompted.
+
+## Outputs
+
+- S3 bucket name
+- EC2 public IP address
+- RDS endpoint

@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from content_safety import check_input, check_output
 
 # Import main orchestration
 import main as orchestrator_module
@@ -615,6 +616,15 @@ async def clarify_intent(request: ClarifyRequest, background_tasks: BackgroundTa
     Always creates a NEW project for each clarification request and triggers code generation
     """
     try:
+        # Check input safety
+        safety_result = check_input(request.user_input)
+        if not safety_result["is_safe"]:
+            return {
+                "director_reply": f"⚠️ Your request was blocked by content safety: {safety_result['blocked_reason']}. Please rephrase your request.",
+                "project_id": request.project_id,
+                "status": "blocked"
+            }
+        
         # Always create a new project for new clarification requests
         # This ensures each request gets fresh generation, not reuse of completed projects
         project_id = project_manager.create_project(
@@ -957,6 +967,26 @@ async def tunnel_status():
         "tunnel_url": "http://localhost:5173",
         "port": 5173,
         "message": "Running on localhost (no tunnel configured)"
+    }
+
+# ==========================================
+# CONTENT SAFETY ENDPOINT
+# ==========================================
+
+class ContentSafetyRequest(BaseModel):
+    """Request to check content safety"""
+    text: str
+
+
+@app.post("/api/content-safety/check", tags=["Safety"])
+async def check_content_safety(request: ContentSafetyRequest):
+    """Check if text is safe before processing"""
+    result = check_input(request.text)
+    return {
+        "is_safe": result["is_safe"],
+        "blocked_reason": result["blocked_reason"],
+        "scores": result["scores"],
+        "timestamp": datetime.utcnow().isoformat()
     }
 
 

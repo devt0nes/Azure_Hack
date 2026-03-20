@@ -1,0 +1,32 @@
+/**
+ * Purpose: Establish and manage the connection to the PostgreSQL database.
+ * Dependencies: pg (node-postgres)
+ * Author: Backend Engineer
+ */
+
+const { Pool } = require('pg'); // PostgreSQL client library
+const dotenv = require('dotenv'); // For loading environment variables
+
+dotenv.config(); // Load environment variables from .env file
+
+// Create a new PostgreSQL connection pool
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL, // PostgreSQL connection string
+  ssl: {
+    rejectUnauthorized: false, // Allow SSL connection for production environments
+  },
+});
+
+/**
+ * Execute a database query.
+ * @param {string} text - SQL query string
+ * @param {Array} params - Query parameters
+ * @returns {Promise} - Query result
+ */
+const query = (text, params) => {
+  return pool.query(text, params);
+};
+
+module.exports = {
+  query,
+};

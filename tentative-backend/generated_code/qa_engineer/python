@@ -1,0 +1,70 @@
+# File: test_recipes_api.py
+"""
+Purpose: Unit tests for the Recipe API endpoints.
+Dependencies: pytest, requests
+Author: QA Engineer
+"""
+
+import pytest
+import requests
+
+# Base URL for the API
+BASE_URL = "http://localhost:3000/api/recipes"
+
+
+@pytest.fixture
+def sample_recipe():
+    """
+    Fixture to provide a sample recipe for testing the POST endpoint.
+    Returns:
+        dict: Sample recipe data.
+    """
+    return {
+        "name": "Chocolate Chip Cookies",
+        "ingredients": "Flour, Sugar, Butter, Chocolate Chips",
+        "instructions": "Mix ingredients, bake at 350F for 10 mins.",
+        "category": "Dessert",
+        "image_url": "http://example.com/image.jpg"
+    }
+
+
+def test_get_recipes():
+    """
+    Test the GET /api/recipes endpoint for fetching a list of recipes.
+    """
+    response = requests.get(BASE_URL)
+    assert response.status_code == 200, "GET /api/recipes failed"
+    data = response.json()
+    assert isinstance(data, dict), "Response is not a dictionary"
+    assert "recipes" in data, "Missing 'recipes' key in response"
+    assert isinstance(data["recipes"], list), "Recipes should be a list"
+
+
+def test_post_recipes(sample_recipe):
+    """
+    Test the POST /api/recipes endpoint for adding a new recipe.
+    Args:
+        sample_recipe (dict): Sample recipe data.
+    """
+    response = requests.post(BASE_URL, json=sample_recipe)
+    assert response.status_code == 201, "POST /api/recipes failed"
+    data = response.json()
+    assert "message" in data, "Missing 'message' key in response"
+    assert data["message"] == "Recipe added successfully.", "Unexpected success message"
+
+
+def test_post_recipes_invalid_data():
+    """
+    Test the POST /api/recipes endpoint with invalid data to ensure validation.
+    """
+    invalid_recipe = {
+        "name": "",  # Name is required
+        "ingredients": "Flour, Sugar",
+        "instructions": "Mix ingredients.",
+        "category": "Dessert"
+    }
+    response = requests.post(BASE_URL, json=invalid_recipe)
+    assert response.status_code == 400, "Invalid POST data did not return 400"
+    data = response.json()
+    assert "error" in data, "Missing 'error' key in response"
+    assert "name" in data["error"], "Missing 'name' validation error"

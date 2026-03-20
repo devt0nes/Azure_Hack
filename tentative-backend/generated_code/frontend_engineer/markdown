@@ -1,0 +1,44 @@
+# Cookie Lovers Hub
+
+## Description
+Cookie Lovers Hub is a user-friendly website dedicated to everything about cookies, including recipes, history, trivia, and a community forum for cookie enthusiasts.
+
+## Features
+- Homepage with an introduction and featured content
+- Recipe section with categorized cookie recipes
+- Blog section featuring cookie trivia and baking tips
+- Contact page for inquiries or feedback
+- Responsive design for usability across devices
+
+## Prerequisites
+- Node.js (v16 or higher)
+- npm (v7 or higher)
+
+## Installation
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/your-repo/cookie-lovers-hub.git
+   ```
+2. Navigate to the project folder:
+   ```bash
+   cd cookie-lovers-hub
+   ```
+3. Install dependencies:
+   ```bash
+   npm install
+   ```
+
+## Running the Application
+1. Start the development server:
+   ```bash
+   npm start
+   ```
+2. Open your browser and navigate to `http://localhost:3000`.
+
+## Configuration
+No additional configuration is required for the frontend.
+
+## Dependencies
+- React: For building the user interface.
+- React DOM: For rendering React components to the DOM.
+- React Router DOM: For client-side routing.
