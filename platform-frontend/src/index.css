@@ -31,6 +31,7 @@
     --terminal: 142 55% 28%;
     --surface: 40 12% 91%;
     --surface-raised: 210 20% 84%;
+    --cyan: 187 72% 52%;
     --wire: 40 8% 72%;
   }
 
@@ -60,6 +61,7 @@
     --terminal: 142 70% 52%;
     --surface: 220 14% 12%;
     --surface-raised: 220 16% 18%;
+    --cyan: 187 80% 58%;
     --wire: 220 12% 28%;
   }
 
@@ -75,6 +77,10 @@
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+  }
+
+  html {
+    scroll-behavior: smooth;
   }
 
   .mono {
@@ -130,6 +136,67 @@
 
   .workshop-card.card-accent-blue:hover {
     @apply border-blue-500/50 bg-gradient-to-br from-blue-500/10 to-card;
+  }
+
+  .segment-card {
+    position: relative;
+    border: 1px solid hsl(var(--border));
+    border-left-width: 2px;
+    border-radius: 0.75rem;
+    background: linear-gradient(135deg, hsl(var(--card) / 0.95), hsl(var(--surface-raised) / 0.7));
+    box-shadow: 0 4px 20px hsl(var(--background) / 0.1);
+    transition: all 0.3s ease;
+  }
+
+  .segment-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 30px hsl(var(--background) / 0.15);
+  }
+
+  .segment-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 0.75rem;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    pointer-events: none;
+  }
+
+  .segment-card:hover::before {
+    opacity: 1;
+  }
+
+  .segment-card--primary {
+    border-left-color: hsl(var(--primary));
+  }
+
+  .segment-card--primary::before {
+    background: linear-gradient(135deg, hsl(var(--primary) / 0.08), transparent 60%);
+  }
+
+  .segment-card--emerald {
+    border-left-color: rgb(16 185 129);
+  }
+
+  .segment-card--emerald::before {
+    background: linear-gradient(135deg, rgb(16 185 129 / 0.08), transparent 60%);
+  }
+
+  .segment-card--blue {
+    border-left-color: rgb(59 130 246);
+  }
+
+  .segment-card--blue::before {
+    background: linear-gradient(135deg, rgb(59 130 246 / 0.08), transparent 60%);
+  }
+
+  .segment-card--cyan {
+    border-left-color: hsl(var(--cyan));
+  }
+
+  .segment-card--cyan::before {
+    background: linear-gradient(135deg, hsl(var(--cyan) / 0.08), transparent 60%);
   }
 
   .workshop-btn {

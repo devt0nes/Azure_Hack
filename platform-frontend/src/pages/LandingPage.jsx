@@ -46,24 +46,28 @@ const SIMPLE_WORKFLOW = [
     icon: '▪',
     title: 'Tell us your idea',
     text: 'Describe what you want to build in everyday language.',
+    accent: 'primary',
   },
   {
     step: '2',
     icon: '◆',
     title: 'Get a clear plan',
     text: 'The Director AI asks follow-up questions and creates a practical build plan.',
+    accent: 'emerald',
   },
   {
     step: '3',
     icon: '▸',
     title: 'Agents build together',
     text: 'Specialized agents work in parallel while you watch progress live.',
+    accent: 'blue',
   },
   {
     step: '4',
     icon: '✓',
     title: 'Preview and deploy',
     text: 'Review generated output, then deploy to Azure in guided steps.',
+    accent: 'cyan',
   },
 ]
 
@@ -106,11 +110,18 @@ const LIVE_METRICS = [
 
 export default function LandingPage({ onLogin, theme, onToggleTheme }) {
   const [expandedFAQ, setExpandedFAQ] = useState(null)
+  const [scrolled, setScrolled] = useState(false)
   const [workflowRef, workflowVisible] = useScrollAnimation()
   const [faqRef, faqVisible] = useScrollAnimation()
   const [metricsRef, metricsVisible] = useScrollAnimation()
   const [tickerRef, tickerVisible] = useScrollAnimation()
   const [pricingRef, pricingVisible] = useScrollAnimation()
+
+  useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 20)
+    window.addEventListener('scroll', onScroll)
+    return () => window.removeEventListener('scroll', onScroll)
+  }, [])
 
   const handleLogin = async () => {
     try {
@@ -139,23 +150,32 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
         }}
       />
 
-      <nav className="relative z-10 border-b border-border/40 px-6 py-5">
+      <nav className={`fixed top-0 left-0 right-0 z-50 transition-all duration-500 ${scrolled ? 'border-b border-border/50 bg-background/80 backdrop-blur-lg shadow-glass' : 'bg-transparent'} px-6 py-4`}>
         <div className="mx-auto flex max-w-7xl items-center justify-between">
-          <p className="mono text-sm uppercase tracking-[0.32em] text-foreground/80">Agentic_Nexus</p>
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-8">
+            <p className="mono text-sm font-medium uppercase tracking-[0.3em] text-foreground/90"><span className="text-gradient-ember font-bold">Agentic</span><span className="text-foreground/50 mx-1">_</span><span>Nexus</span></p>
+            <div className="hidden md:flex items-center gap-6">
+              <a href="#workflow" className="mono text-xs uppercase tracking-[0.15em] text-foreground/50 transition-colors duration-300 hover:text-foreground/90">Workflow</a>
+              <a href="#how-it-works" className="mono text-xs uppercase tracking-[0.15em] text-foreground/50 transition-colors duration-300 hover:text-foreground/90">How It Works</a>
+              <a href="#pricing" className="mono text-xs uppercase tracking-[0.15em] text-foreground/50 transition-colors duration-300 hover:text-foreground/90">Pricing</a>
+              <a href="#faq" className="mono text-xs uppercase tracking-[0.15em] text-foreground/50 transition-colors duration-300 hover:text-foreground/90">FAQ</a>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
             <button
               onClick={onToggleTheme}
-              className="workshop-btn px-3 py-2"
+              className="mono text-xs font-medium uppercase tracking-[0.15em] text-foreground/60 transition-colors hover:text-foreground px-3 py-2"
               aria-label="Toggle theme"
               title="Toggle theme"
             >
               <span className="text-sm">{theme === 'dark' ? '☀' : '☾'}</span>
             </button>
-            <button onClick={handleLogin} className="mono text-xs font-semibold uppercase tracking-[0.22em] text-foreground/75 transition-colors hover:text-foreground">Log In</button>
-            <button onClick={handleLogin} className="btn-ember mono rounded-sm px-6 py-2 text-xs tracking-wider">Get Started</button>
+            <button onClick={handleLogin} className="btn-ember mono rounded-md px-5 py-2 text-xs tracking-wider">Log In to Dashboard</button>
           </div>
         </div>
       </nav>
+
+      <div className="h-16"></div>
 
       <section className="relative z-10 px-6 pb-24 pt-20">
         <div className="mx-auto max-w-5xl text-center">
@@ -171,15 +191,16 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
           <button onClick={handleLogin} className="btn-ember mono rounded-sm px-10 py-3 text-sm tracking-wider">Start Free →</button>
 
           <div ref={metricsRef} className={`mx-auto mt-10 grid max-w-4xl gap-3 sm:grid-cols-2 lg:grid-cols-4 transition-all duration-700 ${metricsVisible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-8'}`}>
-            {LIVE_METRICS.map((metric) => (
-              <div
-                key={metric.label}
-                className="group rounded-xl border border-border bg-gradient-to-br from-card/95 via-card/85 to-surface-raised/70 p-4 text-left shadow-glass transition-all duration-300 hover:-translate-y-1 hover:border-primary/35"
-              >
-                <p className="mono text-[11px] uppercase tracking-[0.2em] text-foreground/55">{metric.label}</p>
-                <p className="mt-2 text-lg font-bold text-foreground group-hover:text-primary">{metric.value}</p>
-              </div>
-            ))}
+            {LIVE_METRICS.map((metric, idx) => {
+              const colors = ['primary', 'emerald', 'blue', 'cyan']
+              const cardClass = `segment-card segment-card--${colors[idx % colors.length]}`
+              return (
+                <div key={metric.label} className={cardClass}>
+                  <p className="mono text-[11px] uppercase tracking-[0.2em] text-foreground/40">{metric.label}</p>
+                  <p className="mt-2 text-lg font-bold text-foreground">{metric.value}</p>
+                </div>
+              )
+            })}
           </div>
         </div>
       </section>
@@ -210,7 +231,7 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
         </div>
       </section>
 
-      <section ref={workflowRef} className={`relative z-10 px-6 py-20 transition-all duration-700 ${workflowVisible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-8'}`}>
+      <section ref={workflowRef} id="workflow" className={`relative z-10 px-6 py-20 transition-all duration-700 ${workflowVisible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-8'}`}>
         <div className="mx-auto max-w-6xl">
           <div className="mb-12 text-center">
             <h2 className="text-4xl md:text-5xl font-bold text-foreground mb-3 tracking-tight">Workflow</h2>
@@ -219,11 +240,33 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
             </p>
           </div>
           <div className="mx-auto max-w-2xl space-y-4">
-            {SIMPLE_WORKFLOW.map((item, index) => (
+            {SIMPLE_WORKFLOW.map((item, index) => {
+              const accentStyles = {
+                primary: {
+                  card: 'segment-card segment-card--primary',
+                  icon: 'border-primary/30 bg-primary/10 text-primary',
+                },
+                emerald: {
+                  card: 'segment-card segment-card--emerald',
+                  icon: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+                },
+                blue: {
+                  card: 'segment-card segment-card--blue',
+                  icon: 'border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-400',
+                },
+                cyan: {
+                  card: 'segment-card segment-card--cyan',
+                  icon: 'border-cyan-500/30 bg-cyan-500/10 text-cyan-700 dark:text-cyan-400',
+                },
+              }
+
+              const currentStyle = accentStyles[item.accent] || accentStyles.primary
+
+              return (
               <div key={item.step} className="relative">
-                <div className="rounded-xl border border-border bg-gradient-to-br from-card/95 via-card/85 to-surface-raised/70 p-6 shadow-glass">
+                <div className={`${currentStyle.card} p-6`}>
                   <div className="flex items-start gap-4">
-                    <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-md border border-primary/30 bg-primary/10 mono text-lg font-bold text-primary">
+                    <div className={`flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-md border mono text-lg font-bold ${currentStyle.icon}`}>
                       {item.icon}
                     </div>
                     <div className="flex-1">
@@ -239,18 +282,18 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
                   </div>
                 )}
               </div>
-            ))}
+            )})}
           </div>
         </div>
       </section>
 
       <section className="relative z-10 px-6 py-16">
         <div className="mx-auto max-w-3xl">
-          <div className="workshop-panel p-0 text-left">
+          <div className="segment-card segment-card--primary p-0 text-left">
             <div className="flex items-center gap-2 border-b border-border/50 bg-gradient-to-r from-primary/15 to-transparent px-4 py-2.5">
-              <div className="h-2 w-2 rounded-full bg-destructive/50" />
+              <div className="h-2 w-2 rounded-full bg-red-500/80" />
               <div className="h-2 w-2 rounded-full bg-amber-500/50" />
-              <div className="h-2 w-2 rounded-full bg-terminal/50" />
+              <div className="h-2 w-2 rounded-full bg-emerald-500/60" />
               <span className="mono ml-auto text-[9px] text-muted-foreground/30">Agent Execution Terminal</span>
             </div>
             <div className="mono space-y-1.5 p-5 text-[11px]">
@@ -282,7 +325,7 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
         </div>
       </section>
 
-      <section className="relative z-10 px-6 py-20">
+      <section id="how-it-works" className="relative z-10 px-6 py-20">
         <div className="mx-auto max-w-6xl">
           <div className="mb-12 text-center">
             <h2 className="text-4xl md:text-5xl font-bold text-foreground mb-3 tracking-tight">How It Works</h2>
@@ -290,30 +333,27 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
               Three stages to build your application.
             </p>
           </div>
-          <div className="grid gap-px bg-border/50 md:grid-cols-3">
-            <div className="workshop-card group relative overflow-hidden">
-              <div className="absolute inset-0 -z-10 rounded opacity-0 transition-opacity group-hover:opacity-100 bg-gradient-to-br from-primary/15 to-transparent pointer-events-none" />
+          <div className="grid gap-6 md:grid-cols-3">
+            <div className="segment-card segment-card--primary p-6">
               <p className="mono text-xs font-semibold text-primary/70">01 / clarify</p>
               <h3 className="mono mt-3 text-base font-bold text-foreground">Direct & Clarify</h3>
-              <p className="mono mt-3 text-[13px] leading-relaxed text-foreground/75">Communicate with the Director Agent to define project requirements and resolve ambiguities interactively.</p>
+              <p className="mono mt-3 text-[13px] leading-relaxed text-foreground/60">Communicate with the Director Agent to define project requirements and resolve ambiguities interactively.</p>
             </div>
-            <div className="workshop-card group relative overflow-hidden">
-              <div className="absolute inset-0 -z-10 rounded opacity-0 transition-opacity group-hover:opacity-100 bg-gradient-to-br from-emerald-500/15 to-transparent pointer-events-none" />
+            <div className="segment-card segment-card--emerald p-6">
               <p className="mono text-xs font-semibold text-emerald-600 dark:text-emerald-400">02 / delegate</p>
               <h3 className="mono mt-3 text-base font-bold text-foreground">Orchestrate Agents</h3>
-              <p className="mono mt-3 text-[13px] leading-relaxed text-foreground/75">The system builds an Agent Execution Graph and delegates tasks to specialized agents working in parallel.</p>
+              <p className="mono mt-3 text-[13px] leading-relaxed text-foreground/60">The system builds an Agent Execution Graph and delegates tasks to specialized agents working in parallel.</p>
             </div>
-            <div className="workshop-card group relative overflow-hidden">
-              <div className="absolute inset-0 -z-10 rounded opacity-0 transition-opacity group-hover:opacity-100 bg-gradient-to-br from-blue-500/15 to-transparent pointer-events-none" />
+            <div className="segment-card segment-card--blue p-6">
               <p className="mono text-xs font-semibold text-blue-700 dark:text-blue-400">03 / monitor</p>
               <h3 className="mono mt-3 text-base font-bold text-foreground">Monitor & Execute</h3>
-              <p className="mono mt-3 text-[13px] leading-relaxed text-foreground/75">Track live logs, costs, and progress while generated output becomes available in real time.</p>
+              <p className="mono mt-3 text-[13px] leading-relaxed text-foreground/60">Track live logs, costs, and progress while generated output becomes available in real time.</p>
             </div>
           </div>
         </div>
       </section>
 
-      <section ref={pricingRef} className={`relative z-10 px-6 py-20 transition-all duration-700 ${pricingVisible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-8'}`}>
+      <section ref={pricingRef} id="pricing" className={`relative z-10 px-6 py-20 transition-all duration-700 ${pricingVisible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-8'}`}>
         <div className="mx-auto max-w-6xl">
           <div className="mb-12 text-center">
             <h2 className="text-4xl md:text-5xl font-bold text-foreground mb-3 tracking-tight">Pricing</h2>
@@ -321,9 +361,8 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
               Choose the plan that fits your building pace. You only pay for what you use.
             </p>
           </div>
-          <div className="grid gap-px bg-border/50 md:grid-cols-3">
-            <div className="workshop-card group relative">
-              <div className="absolute inset-0 -z-10 rounded opacity-0 transition-opacity group-hover:opacity-100 bg-gradient-to-br from-blue-500/10 to-transparent pointer-events-none" />
+          <div className="grid gap-6 md:grid-cols-3">
+            <div className="segment-card segment-card--blue p-6">
               <div className="flex items-center justify-between mb-4 pb-3 border-b border-border/30">
                 <h3 className="mono text-xs font-semibold text-foreground/70">STARTER</h3>
                 <span className="mono text-[9px] text-muted-foreground/40">free plan</span>
@@ -340,9 +379,7 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
               <button onClick={handleLogin} className="workshop-btn w-full">Get Started</button>
             </div>
 
-            <div className="workshop-card workshop-card--highlighted group relative border-primary/40">
-              <div className="absolute -top-px left-0 right-0 h-px bg-gradient-to-r from-transparent via-primary to-transparent" />
-              <div className="absolute inset-0 -z-10 rounded opacity-0 transition-opacity group-hover:opacity-100 bg-gradient-to-br from-primary/15 to-transparent pointer-events-none" />
+            <div className="segment-card segment-card--primary p-6">
               <div className="flex items-center justify-between mb-4 pb-3 border-b border-primary/20">
                 <h3 className="mono text-xs font-semibold text-primary/80">PROFESSIONAL</h3>
                 <span className="mono text-[9px] text-primary/50 bg-primary/10 px-2 py-0.5 rounded">recommended</span>
@@ -359,8 +396,7 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
               <button onClick={handleLogin} className="btn-ember w-full rounded-sm py-3 mono text-xs tracking-wider">Start Pro Trial</button>
             </div>
 
-            <div className="workshop-card group relative">
-              <div className="absolute inset-0 -z-10 rounded opacity-0 transition-opacity group-hover:opacity-100 bg-gradient-to-br from-emerald-500/10 to-transparent pointer-events-none" />
+            <div className="segment-card segment-card--emerald p-6">
               <div className="flex items-center justify-between mb-4 pb-3 border-b border-border/30">
                 <h3 className="mono text-xs font-semibold text-foreground/70">ENTERPRISE</h3>
                 <span className="mono text-[9px] text-muted-foreground/40">custom</span>
@@ -383,7 +419,7 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
         </div>
       </section>
 
-      <section ref={faqRef} className={`relative z-10 px-6 py-20 transition-all duration-700 ${faqVisible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-8'}`}>
+      <section ref={faqRef} id="faq" className={`relative z-10 px-6 py-20 transition-all duration-700 ${faqVisible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-8'}`}>
         <div className="mx-auto max-w-4xl">
           <div className="mb-12 text-center">
             <h2 className="text-4xl md:text-5xl font-bold text-foreground mb-3 tracking-tight">FAQ</h2>
@@ -426,7 +462,7 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
 
       <footer className="relative z-10 border-t border-border/40 px-6 py-12">
         <div className="mx-auto max-w-6xl text-center">
-          <p className="mono text-sm text-foreground/65">Platform A Command Center • March 2026</p>
+          <p className="mono text-sm text-foreground/65">Agentic Nexus • March 2026</p>
         </div>
       </footer>
     </div>

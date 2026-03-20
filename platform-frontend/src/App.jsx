@@ -370,7 +370,7 @@ export default function App() {
 
       <div className="relative z-10 overflow-hidden">
 
-        <aside className="fixed left-0 top-0 z-30 h-screen w-20 border-r border-border/60 bg-card/70 p-3 backdrop-blur-md">
+        <aside className="fixed left-0 top-0 z-[100] h-screen w-20 border-r border-border/60 bg-card/70 p-3 backdrop-blur-md">
           <div className="mt-6 flex h-full flex-col items-center gap-3">
             <button onClick={() => togglePopup('agents')} className={`${iconClass('agents')} group`} title="Agent Status" aria-label="Open agent status panel">
               {activePopup === 'agents' && <span className="absolute -left-2 h-6 w-1 rounded-full bg-primary" />}
@@ -379,28 +379,28 @@ export default function App() {
                 <circle cx="8.5" cy="7" r="3" />
                 <path d="M20 8v6" /><path d="M23 11h-6" />
               </svg>
-              <span className="pointer-events-none absolute left-full ml-3 whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium text-foreground opacity-0 transition-opacity group-hover:opacity-100">Agent Status</span>
+              <span className="pointer-events-none absolute left-full ml-3 z-50 whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium text-foreground opacity-0 transition-opacity group-hover:opacity-100">Agent Status</span>
             </button>
             <button onClick={() => togglePopup('learning')} className={`${iconClass('learning')} group`} title="Learning Agent" aria-label="Open learning assistant panel">
               {activePopup === 'learning' && <span className="absolute -left-2 h-6 w-1 rounded-full bg-primary" />}
               <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
                 <path d="M2 8l10-4 10 4-10 4-10-4z" /><path d="M6 10v4c0 2.2 2.7 4 6 4s6-1.8 6-4v-4" />
               </svg>
-              <span className="pointer-events-none absolute left-full ml-3 whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium text-foreground opacity-0 transition-opacity group-hover:opacity-100">Learning Assistant</span>
+              <span className="pointer-events-none absolute left-full ml-3 z-50 whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium text-foreground opacity-0 transition-opacity group-hover:opacity-100">Learning Assistant</span>
             </button>
             <button onClick={() => togglePopup('logs')} className={`${iconClass('logs')} group`} title="Live Logs" aria-label="Open live logs panel">
               {activePopup === 'logs' && <span className="absolute -left-2 h-6 w-1 rounded-full bg-primary" />}
               <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
                 <rect x="4" y="3" width="16" height="18" rx="2" /><path d="M8 7h8" /><path d="M8 12h8" /><path d="M8 17h5" />
               </svg>
-              <span className="pointer-events-none absolute left-full ml-3 whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium text-foreground opacity-0 transition-opacity group-hover:opacity-100">Live Logs</span>
+              <span className="pointer-events-none absolute left-full ml-3 z-50 whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium text-foreground opacity-0 transition-opacity group-hover:opacity-100">Live Logs</span>
             </button>
             <button onClick={() => togglePopup('feedback')} className={`${iconClass('feedback')} group`} title="Feedback" aria-label="Open feedback panel">
               {activePopup === 'feedback' && <span className="absolute -left-2 h-6 w-1 rounded-full bg-primary" />}
               <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
                 <path d="M4 21l4-1 10-10-3-3L5 17l-1 4z" /><path d="M14 7l3 3" />
               </svg>
-              <span className="pointer-events-none absolute left-full ml-3 whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium text-foreground opacity-0 transition-opacity group-hover:opacity-100">Feedback</span>
+              <span className="pointer-events-none absolute left-full ml-3 z-50 whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium text-foreground opacity-0 transition-opacity group-hover:opacity-100">Feedback</span>
             </button>
             <button onClick={() => togglePopup('aeg')} className={`${iconClass('aeg')} group`} title="AEG" aria-label="Open AEG panel">
               {activePopup === 'aeg' && <span className="absolute -left-2 h-6 w-1 rounded-full bg-primary" />}
@@ -408,7 +408,7 @@ export default function App() {
                 <circle cx="6" cy="6" r="2" /><circle cx="18" cy="6" r="2" /><circle cx="12" cy="18" r="2" />
                 <path d="M8 7l3 9" /><path d="M16 7l-3 9" /><path d="M8 6h8" />
               </svg>
-              <span className="pointer-events-none absolute left-full ml-3 whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium text-foreground opacity-0 transition-opacity group-hover:opacity-100">Agent Execution Graph</span>
+              <span className="pointer-events-none absolute left-full ml-3 z-50 whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium text-foreground opacity-0 transition-opacity group-hover:opacity-100">Agent Execution Graph</span>
             </button>
           </div>
         </aside>
