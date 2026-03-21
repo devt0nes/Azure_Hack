@@ -1,0 +1,50 @@
+# Day 4: Local preview with Docker Compose + hot-reload
+version: '3.9'
+
+services:
+  # Frontend: React + Vite Command Center
+  frontend:
+    image: node:20-alpine
+    container_name: platform-frontend
+    working_dir: /app
+    volumes:
+      - ../platform-frontend:/app
+      - /app/node_modules  # Prevent host node_modules from overwriting container
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_BASE_URL=http://backend:8000
+      - VITE_SIGNALR_URL=http://backend:8000/hub
+      - VITE_TUTOR_API_URL=http://backend:8000/tutor
+    networks:
+      - platform-network
+    restart: unless-stopped
+
+  # Backend: FastAPI with hot-reload
+  backend:
+    image: python:3.11-slim
+    container_name: platform-backend
+    working_dir: /app
+    volumes:
+      - ../platform-backend:/app
+      - backend-cache:/root/.cache  # Cache pip packages
+    command: sh -c "pip install --no-cache-dir fastapi uvicorn[standard] python-dotenv azure-cosmos azure-servicebus openai && uvicorn api:app --host 0.0.0.0 --port 8000 --reload"
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - COSMOS_ENDPOINT=${COSMOS_ENDPOINT:-}
+      - COSMOS_KEY=${COSMOS_KEY:-}
+      - SIGNALR_CONNECTION_STRING=${SIGNALR_CONNECTION_STRING:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    networks:
+      - platform-network
+    restart: unless-stopped
+
+networks:
+  platform-network:
+    driver: bridge
+
+volumes:
+  backend-cache:

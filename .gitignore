@@ -1,0 +1,43 @@
+# Generated files
+deployment_result.json
+azure_deployment_todo.json
+deployment_summary.json
+*.log
+/logs/
+/tmp/
+
+# Node modules
+node_modules/
+*.pem
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated project artifacts
+/projects/
+/generated/
+build/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+venv/
+env/
+
+# Testing
+coverage/
+.coverage

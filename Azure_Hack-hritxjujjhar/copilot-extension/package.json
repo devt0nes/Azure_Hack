@@ -1,0 +1,66 @@
+{
+  "name": "nexus-copilot-extension",
+  "displayName": "nexus-copilot-extension",
+  "description": "Nexus AI agent builder for VS Code",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.109.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "chatParticipants": [
+    {
+      "id": "nexus.agent",
+      "fullName": "Nexus Agent Builder",
+      "name": "nexus",
+      "description": "Build and debug AI-generated apps with @nexus",
+      "isSticky": true,
+      "commands": [
+        {
+          "name": "build",
+          "description": "Start a new app build"
+        },
+        {
+          "name": "debug",
+          "description": "Debug why an agent failed"
+        },
+        {
+          "name": "explain",
+          "description": "Explain the current build architecture"
+        }
+      ]
+    }
+  ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "webpack",
+    "watch": "webpack --watch",
+    "package": "webpack --mode production --devtool hidden-source-map",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "@types/vscode": "^1.109.0",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2",
+    "eslint": "^9.39.3",
+    "ts-loader": "^9.5.4",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.56.1",
+    "webpack": "^5.105.3",
+    "webpack-cli": "^6.0.1"
+  },
+  "dependencies": {
+    "axios": "^1.13.6"
+  }
+}
