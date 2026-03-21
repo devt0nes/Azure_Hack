@@ -238,9 +238,6 @@ class OrchestrationService:
                 # Update progress to 90% after orchestration completes
                 project_manager.update_project_status(project_id, ProjectStatus.GENERATING_CODE, progress=90)
                 
-                # Mark as completed
-                project_manager.update_project_status(project_id, ProjectStatus.COMPLETED, progress=100)
-                logger.info(f"Code generation completed for project {project_id}")
                 
                 return {
                     "status": "success",
