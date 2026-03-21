@@ -20,6 +20,9 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 import main as orchestrator_module
+from agents_router import router as agents_router, seed_agent_catalog
+from cost_router import router as cost_router
+from templates_router import router as templates_router, seed_template_catalog
 
 load_dotenv()
 
@@ -694,6 +697,15 @@ async def tunnel_status():  # intentionally public — just returns config info
 
 
 # ==========================================
+# ==========================================
+# INCLUDE ROUTERS
+# ==========================================
+
+app.include_router(agents_router, dependencies=[Depends(get_current_user)])
+app.include_router(cost_router, dependencies=[Depends(get_current_user)])
+app.include_router(templates_router, dependencies=[Depends(get_current_user)])
+
+
 # ERROR HANDLERS
 # ==========================================
 
@@ -715,6 +727,8 @@ async def general_exception_handler(request, exc):
 @app.on_event("startup")
 async def startup_event():
     logger.info("🚀 Agentic Nexus Backend API starting up")
+    seed_agent_catalog()
+    seed_template_catalog()
 
 @app.on_event("shutdown")
 async def shutdown_event():
