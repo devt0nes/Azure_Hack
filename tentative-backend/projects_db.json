@@ -107,5 +107,19 @@
     "error": null,
     "artifacts": [],
     "ledger_data": null
+  },
+  "344f0c72-a6b0-4edc-ab0a-4a069b1fdaeb": {
+    "project_id": "344f0c72-a6b0-4edc-ab0a-4a069b1fdaeb",
+    "project_name": "Project from clarification",
+    "user_intent": "build me a simple website for a bakery",
+    "description": null,
+    "owner_id": "dev-user-123",
+    "status": "failed",
+    "created_at": "2026-03-21T09:43:10.147321",
+    "updated_at": "2026-03-21T09:43:10.175064",
+    "progress": 10,
+    "error": "Missing credentials. Please pass one of `api_key`, `azure_ad_token`, `azure_ad_token_provider`, or the `AZURE_OPENAI_API_KEY` or `AZURE_OPENAI_AD_TOKEN` environment variables.",
+    "artifacts": [],
+    "ledger_data": null
   }
 }

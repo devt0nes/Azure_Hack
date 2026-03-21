@@ -5,11 +5,13 @@ import LandingPage from './pages/LandingPage.jsx'
 import Conversation from './pages/Conversation.jsx'
 import AEGView from './pages/AEGView.jsx'
 import Preview from './pages/Preview.jsx'
+import AgentMarketplace from './pages/AgentMarketplace.jsx'
 import AgentCard from './components/AgentCard.jsx'
 import CostTicker from './components/CostTicker.jsx'
 import LogStream from './components/LogStream.jsx'
 import FeedbackPanel from './components/FeedbackPanel.jsx'
 import LearningMode from './components/LearningMode.jsx'
+import CostOptimizerPanel from './components/CostOptimizerPanel.jsx'
 import AnimatedGridBackground from './components/AnimatedGridBackground.jsx'
 import { createSignalRConnection } from './services/signalr.js'
 import { getHealth, listProjects, getProjectLogs, getProject } from './services/api.js'
@@ -43,6 +45,8 @@ export default function App() {
   const [currentProjectName, setCurrentProjectName] = useState('No Project Selected')
   const [currentProjectData, setCurrentProjectData] = useState(null)
   const [theme, setTheme] = useState('light')
+  const [showMarketplace, setShowMarketplace] = useState(false)
+  const [selectedAegNodeId, setSelectedAegNodeId] = useState(null)
 
   useEffect(() => {
     const saved = typeof window !== 'undefined' ? window.localStorage.getItem(THEME_STORAGE_KEY) : null
@@ -59,13 +63,34 @@ export default function App() {
 
   const toggleTheme = () => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))
 
-  // ← Firebase session persistence — restores login on page refresh
+  // Start from the landing page on each fresh app load.
+  // This clears any previously persisted Firebase session so localhost
+  // doesn't jump straight into the command center.
   useEffect(() => {
-    const unsubscribe = auth.onAuthStateChanged((firebaseUser) => {
-      setUser(firebaseUser ?? null)
-      setAuthLoading(false)
-    })
-    return () => unsubscribe()
+    let unsubscribe = () => {}
+    let cancelled = false
+
+    const initAuth = async () => {
+      try {
+        await logout()
+      } catch {
+        // Ignore startup logout errors; we still want auth state to resolve.
+      }
+
+      if (cancelled) return
+
+      unsubscribe = auth.onAuthStateChanged((firebaseUser) => {
+        setUser(firebaseUser ?? null)
+        setAuthLoading(false)
+      })
+    }
+
+    initAuth()
+
+    return () => {
+      cancelled = true
+      unsubscribe()
+    }
   }, [])
 
   const handleLogin = (firebaseUser) => {
@@ -81,6 +106,8 @@ export default function App() {
     setCurrentProjectId('')
     setCurrentProjectName('No Project Selected')
     setCurrentProjectData(null)
+    setShowMarketplace(false)
+    setActivePopup(null)
   }
 
   const isLoggedIn = !!user  // ← rest of the component uses this unchanged
@@ -322,7 +349,15 @@ export default function App() {
   }
 
   const closePopup = () => setActivePopup(null)
-  const togglePopup = (key) => setActivePopup((prev) => (prev === key ? null : key))
+  const togglePopup = (key) => {
+    setShowMarketplace(false)
+    setActivePopup((prev) => (prev === key ? null : key))
+  }
+
+  const openMarketplace = () => {
+    setActivePopup(null)
+    setShowMarketplace(true)
+  }
 
   const renderPopupContent = () => {
     if (activePopup === 'agents') {
@@ -337,7 +372,8 @@ export default function App() {
     if (activePopup === 'learning') return <LearningMode projectId={currentProjectId} />
     if (activePopup === 'logs') return <LogStream logs={logs} />
     if (activePopup === 'feedback') return <FeedbackPanel />
-    if (activePopup === 'aeg') return <AEGView projectId={currentProjectId} />
+    if (activePopup === 'aeg') return <AEGView projectId={currentProjectId} onNodeSelect={setSelectedAegNodeId} />
+    if (activePopup === 'cost') return <CostOptimizerPanel projectId={currentProjectId} />
     return null
   }
 
@@ -346,7 +382,8 @@ export default function App() {
     activePopup === 'learning' ? 'Learning Assistant' :
     activePopup === 'logs' ? 'Live Logs' :
     activePopup === 'feedback' ? 'Feedback' :
-    activePopup === 'aeg' ? 'Agent Execution Graph' : ''
+    activePopup === 'aeg' ? 'Agent Execution Graph' :
+    activePopup === 'cost' ? 'Cost Optimizer' : ''
 
   return (
     <div className="relative h-screen overflow-hidden bg-gradient-to-br from-background via-card to-surface-raised text-foreground">
@@ -410,6 +447,25 @@ export default function App() {
               </svg>
               <span className="pointer-events-none absolute left-full ml-3 z-50 whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium text-foreground opacity-0 transition-opacity group-hover:opacity-100">Agent Execution Graph</span>
             </button>
+
+            <button onClick={openMarketplace} className={`relative flex h-12 w-12 items-center justify-center rounded-2xl border transition-all duration-300 border-border bg-background/70 text-foreground/60 hover:border-foreground/20 hover:text-foreground group`} title="Agent Marketplace" aria-label="Open agent marketplace">
+              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+                <rect x="3" y="3" width="7" height="7" rx="1"/>
+                <rect x="14" y="3" width="7" height="7" rx="1"/>
+                <rect x="3" y="14" width="7" height="7" rx="1"/>
+                <rect x="14" y="14" width="7" height="7" rx="1"/>
+              </svg>
+              <span className="pointer-events-none absolute left-full ml-3 z-50 whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium text-foreground opacity-0 transition-opacity group-hover:opacity-100">Agent Marketplace</span>
+            </button>
+
+            <button onClick={() => togglePopup('cost')} className={`${iconClass('cost')} group`} title="Cost Optimizer" aria-label="Open cost optimizer panel">
+              {activePopup === 'cost' && <span className="absolute -left-2 h-6 w-1 rounded-full bg-primary" />}
+              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+                <line x1="12" y1="1" x2="12" y2="23"/>
+                <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>
+              </svg>
+              <span className="pointer-events-none absolute left-full ml-3 z-50 whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium text-foreground opacity-0 transition-opacity group-hover:opacity-100">Cost Optimizer</span>
+            </button>
           </div>
         </aside>
 
@@ -431,6 +487,12 @@ export default function App() {
                     <span className="inline-flex items-center rounded-full border border-border bg-gradient-to-r from-secondary/80 to-card/60 px-2.5 py-1">
                       Layout: <span className="mono ml-1 font-semibold text-foreground">{hiddenPane === 'none' ? 'Split' : hiddenPane === 'director' ? 'Preview Only' : 'Director Only'}</span>
                     </span>
+                    {selectedAegNodeId && (
+                      <span className="inline-flex items-center gap-1.5 rounded-full border border-primary/25 bg-primary/8 px-2.5 py-1">
+                        <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
+                        <span className="mono font-semibold text-primary text-[11px]">Node: {selectedAegNodeId}</span>
+                      </span>
+                    )}
                   </div>
                 </div>
 
@@ -551,6 +613,18 @@ export default function App() {
           </main>
         </div>
       </div>
+
+      {/* ── Agent Marketplace full-page overlay ─────────────────────────── */}
+      {showMarketplace && (
+        <AgentMarketplace
+          onBack={() => setShowMarketplace(false)}
+          selectedAegNodeId={selectedAegNodeId}
+          currentProjectId={currentProjectId}
+          onAgentSelected={({ agentId, aegNodeId, projectId }) => {
+            console.log(`[Marketplace] ${agentId} → node ${aegNodeId} | project ${projectId}`)
+          }}
+        />
+      )}
     </div>
   )
 }
