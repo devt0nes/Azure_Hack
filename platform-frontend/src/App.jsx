@@ -8,7 +8,9 @@ import CostTicker from './components/CostTicker.jsx'
 import LogStream from './components/LogStream.jsx'
 import FeedbackPanel from './components/FeedbackPanel.jsx'
 import LearningMode from './components/LearningMode.jsx'
-import AgentLibraryPanel from './components/AgentLibraryPanel.jsx'   // ← NEW
+import AgentLibraryPanel from './components/AgentLibraryPanel.jsx'
+import AgentMarketplace from './pages/AgentMarketplace.jsx'
+import CostOptimizerPanel from './components/CostOptimizerPanel.jsx'
 import { createSignalRConnection } from './services/signalr.js'
 import { getHealth, listProjects, getProjectLogs, getProject } from './services/api.js'
 
@@ -38,7 +40,9 @@ export default function App() {
   const [currentProjectName, setCurrentProjectName] = useState('No Project Selected')
   const [currentProjectData, setCurrentProjectData] = useState(null)
   // ── Agent Library: track which AEG node the user last clicked ──────────
-  const [selectedAegNodeId, setSelectedAegNodeId] = useState(null)   // ← NEW
+  const [selectedAegNodeId,  setSelectedAegNodeId]  = useState(null)
+  // ── Marketplace full-page overlay ────────────────────────────────────────
+  const [showMarketplace,    setShowMarketplace]    = useState(false)
 
   const iconClass = (key) =>
     `relative flex h-12 w-12 items-center justify-center rounded-2xl border transition-all duration-300 ${
@@ -181,14 +185,9 @@ export default function App() {
     if (activePopup === 'logs')     return <LogStream logs={logs} />
     if (activePopup === 'feedback') return <FeedbackPanel />
     if (activePopup === 'aeg')      return <AEGView projectId={currentProjectId} onNodeSelect={setSelectedAegNodeId} />
-    // ── Agent Library panel ──────────────────────────────────────────────
-    if (activePopup === 'library')  return (
-      <AgentLibraryPanel
-        selectedAegNodeId={selectedAegNodeId}
-        onAgentSelected={({ agentId, aegNodeId }) => {
-          console.log(`[AgentLibrary] ${agentId} → node ${aegNodeId}`)
-        }}
-      />
+    // ── Agent Library is now a full-page marketplace (see AgentMarketplace overlay below)
+    if (activePopup === 'cost') return (
+      <CostOptimizerPanel projectId={currentProjectId} />
     )
     return null
   }
@@ -199,7 +198,7 @@ export default function App() {
     activePopup === 'logs'     ? 'Live Logs'              :
     activePopup === 'feedback' ? 'Feedback'               :
     activePopup === 'aeg'      ? 'Agent Execution Graph'  :
-    activePopup === 'library'  ? 'Agent Library'          :   // ← NEW
+    activePopup === 'cost'     ? 'Cost Optimizer'         :
     ''
 
   return (
@@ -251,16 +250,25 @@ export default function App() {
               <span className="pointer-events-none absolute left-full ml-3 whitespace-nowrap rounded-md bg-ink px-2 py-1 text-[11px] font-medium text-white opacity-0 shadow-lg transition-opacity group-hover:opacity-100">Agent Execution Graph</span>
             </button>
 
-            {/* ── Agent Library (NEW) ─────────────────────────────────────── */}
-            <button onClick={() => togglePopup('library')} className={`${iconClass('library')} group`} title="Agent Library" aria-label="Open agent library panel">
-              {activePopup === 'library' && <span className="absolute -left-2 h-6 w-1 rounded-full bg-ember" />}
+            {/* ── Agent Library (opens full-page marketplace) ─────────────── */}
+            <button onClick={() => setShowMarketplace(true)} className={`${iconClass('library')} group`} title="Agent Marketplace" aria-label="Open agent marketplace">
               <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
                 <rect x="3" y="3" width="7" height="7" rx="1"/>
                 <rect x="14" y="3" width="7" height="7" rx="1"/>
                 <rect x="3" y="14" width="7" height="7" rx="1"/>
                 <rect x="14" y="14" width="7" height="7" rx="1"/>
               </svg>
-              <span className="pointer-events-none absolute left-full ml-3 whitespace-nowrap rounded-md bg-ink px-2 py-1 text-[11px] font-medium text-white opacity-0 shadow-lg transition-opacity group-hover:opacity-100">Agent Library</span>
+              <span className="pointer-events-none absolute left-full ml-3 whitespace-nowrap rounded-md bg-ink px-2 py-1 text-[11px] font-medium text-white opacity-0 shadow-lg transition-opacity group-hover:opacity-100">Agent Marketplace</span>
+            </button>
+
+            {/* ── Cost Optimizer ───────────────────────────────────────────── */}
+            <button onClick={() => togglePopup('cost')} className={`${iconClass('cost')} group`} title="Cost Optimizer" aria-label="Open cost optimizer panel">
+              {activePopup === 'cost' && <span className="absolute -left-2 h-6 w-1 rounded-full bg-ember" />}
+              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+                <line x1="12" y1="1" x2="12" y2="23"/>
+                <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>
+              </svg>
+              <span className="pointer-events-none absolute left-full ml-3 whitespace-nowrap rounded-md bg-ink px-2 py-1 text-[11px] font-medium text-white opacity-0 shadow-lg transition-opacity group-hover:opacity-100">Cost Optimizer</span>
             </button>
 
           </div>
@@ -295,7 +303,7 @@ export default function App() {
                   </div>
                 </div>
                 <div className="animate-slide-in-right relative flex items-start gap-3">
-                  <CostTicker tokens={totalTokens} cost={totalCost} />
+                  <CostTicker tokens={totalTokens} cost={totalCost} projectId={currentProjectId} />
                   <button onClick={() => setIsProfileOpen((prev) => !prev)} className="flex h-12 w-12 items-center justify-center rounded-2xl border border-white/30 bg-white/70 text-ink/80 backdrop-blur-sm transition hover:bg-white/90" title="Account" aria-label="Open account menu">
                     <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="12" cy="8" r="4"/><path d="M4 20a8 8 0 0 1 16 0"/></svg>
                   </button>
@@ -379,6 +387,18 @@ export default function App() {
           </main>
         </div>
       </div>
+      {/* ── Agent Marketplace full-page overlay ─────────────────────────── */}
+      {showMarketplace && (
+        <AgentMarketplace
+          onBack={() => setShowMarketplace(false)}
+          selectedAegNodeId={selectedAegNodeId}
+          currentProjectId={currentProjectId}
+          onAgentSelected={({ agentId, aegNodeId, projectId }) => {
+            console.log(`[Marketplace] ${agentId} → node ${aegNodeId} | project ${projectId}`)
+          }}
+        />
+      )}
+
     </div>
   )
 }

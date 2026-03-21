@@ -1,0 +1,18 @@
+/**
+ * Purpose: Blog page component for coffee-related articles and reviews.
+ * Dependencies: React.
+ * Author: Frontend Engineer
+ */
+
+import React from 'react';
+
+function Blog() {
+  return (
+    <div style={{ padding: '20px' }}>
+      <h1>Coffee Blog</h1>
+      <p>Read articles and reviews about coffee.</p>
+    </div>
+  );
+}
+
+export default Blog;

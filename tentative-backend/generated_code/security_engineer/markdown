@@ -1,0 +1,47 @@
+# Bakery Website Security Configuration
+
+## Overview
+This module provides security features for the bakery website backend, including:
+- Encryption of sensitive data using Fernet.
+- Authentication using JSON Web Tokens (JWT).
+- Input sanitization to prevent XSS and SQL injection.
+- Rate limiting using Flask-Limiter.
+
+## Prerequisites
+- Python 3.8+
+- Required environment variables:
+  - `JWT_SECRET_KEY`: Secret key for JWT generation.
+  - `FERNET_KEY`: Secret key for encryption.
+
+## Installation
+1. Install Python dependencies:
+   ```bash
+   pip install cryptography PyJWT Flask Flask-Limiter Werkzeug
+   ```
+
+2. Set up environment variables:
+   ```bash
+   export JWT_SECRET_KEY="your-secret-key"
+   export FERNET_KEY="your-fernet-key"
+   ```
+
+## Usage
+1. Run the Flask application:
+   ```bash
+   python security_config.py
+   ```
+
+2. Access the API endpoints:
+   - `/api/menu` (GET): Fetch bakery menu items.
+   - `/api/order` (POST): Place an order.
+
+## Security Features
+- HTTPS enabled for secure communication.
+- Rate limiting to prevent abuse.
+- Input sanitization for user-provided data.
+
+## Compliance
+This project adheres to GDPR requirements through secure data encryption and protection mechanisms.
+
+## Examples
+### Encrypting Data

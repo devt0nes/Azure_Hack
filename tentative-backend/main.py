@@ -22,6 +22,15 @@ from openai import AzureOpenAI
 
 # --- Deployment Integration ---
 from deployment_integration import run_post_generation_deployment
+from cost_optimizer import get_optimizer, ModelTier, CostOptimizer
+
+# ── Template Library helpers (imported lazily to avoid circular imports) ──────
+def _get_template_helpers():
+    try:
+        from templates_router import get_templates_for_agent, get_template_code
+        return get_templates_for_agent, get_template_code
+    except ImportError:
+        return None, None
 
 # Load environment variables from .env file
 load_dotenv()
@@ -714,8 +723,8 @@ class TaskLedger:
     Comprehensive task ledger containing all project metadata,
     agent specifications, and execution graph.
     """
-    def __init__(self, user_intent: str, owner_id: str):
-        project_id = str(uuid.uuid4())[:8]
+    def __init__(self, user_intent: str, owner_id: str, project_id_override: str = None):
+        project_id = project_id_override if project_id_override else str(uuid.uuid4())
         self.data = {
             "id": project_id,
             "project_id": project_id,
@@ -1883,10 +1892,11 @@ class Agent:
     Supports pause/resume, handoffs, and dynamic collaboration via the swarm model.
     """
     
-    def __init__(self, agent_id: str, role: AgentRole, project_context: Dict, comm_hub: AgentCommunicationHub, 
-                 collaboration_bus: CollaborationBus, checkpoint_manager: CheckpointManager, 
+    def __init__(self, agent_id: str, role: AgentRole, project_context: Dict, comm_hub: AgentCommunicationHub,
+                 collaboration_bus: CollaborationBus, checkpoint_manager: CheckpointManager,
                  blackboard_manager: BlackboardManager, cosmos_manager=None, dependencies: List[str] = None,
-                 audit_logger: 'AuditLogger' = None, requirements_manager: 'RequirementsManager' = None):
+                 audit_logger: 'AuditLogger' = None, requirements_manager: 'RequirementsManager' = None,
+                 cost_optimizer: 'CostOptimizer' = None):
         self.agent_id = agent_id
         self.role = role
         self.project_context = project_context
@@ -1897,6 +1907,7 @@ class Agent:
         self.cosmos_manager = cosmos_manager
         self.audit_logger = audit_logger  # NEW: For comprehensive logging
         self.requirements_manager = requirements_manager  # NEW: For requirements tracking
+        self.cost_optimizer = cost_optimizer              # Cost routing layer
         self.dependencies = dependencies or []
         self.status = AgentStatus.CREATED
         self.created_at = datetime.now(timezone.utc).isoformat()
@@ -2273,7 +2284,34 @@ class Agent:
                         "content": error_msg
                     })
                     logger.warning(f"⚠️  {placeholder_msg} in {self.agent_id}")
-                    continue  # Skip to next iteration and ask for real code
+
+                    # 🔺 ESCALATION LOGIC
+                    if self.cost_optimizer:
+                        task_desc = task_context.get("user_intent", f"{self.role.value} task")
+                        current_tier = self.cost_optimizer.classify_task(task_desc, self.role.value)
+
+                        next_tier = self.cost_optimizer.get_escalation_tier(
+                            current_tier=current_tier,
+                            attempt_number=self.iteration_count,
+                            agent_role=self.role.value,
+                            task_description=task_desc,
+                        )
+
+                        if next_tier:
+                            self.cost_optimizer.record_escalation(
+                                agent_role=self.role.value,
+                                from_tier=current_tier,
+                                to_tier=next_tier,
+                                attempt=self.iteration_count
+                            )
+
+                            self.message_history.append({
+                                "role": "system",
+                                "content": f"Escalating model: {current_tier.value} → {next_tier.value} due to placeholder output"
+                            })
+                            logger.info(f"🔺 Escalating {self.agent_id} to {next_tier.value}")
+
+                    continue
                 
                 try:
                     parse_info = self._parse_and_save_code(response_text)
@@ -2356,24 +2394,52 @@ CORRECTIVE ACTION REQUIRED:
                     },
                 )
                 if not validation_result["success"]:
-                    # Provide validation feedback to agent
                     issues_text = "\n".join([
                         f"  - {issue['file']}: {issue['message']}"
                         for issue in validation_result.get('issues', [])
                     ])
                     validation_feedback = f"""VALIDATION ISSUES FOUND:
-{issues_text}
+                {issues_text}
 
-REQUIRED ACTIONS:
-1. Review each issue carefully
-2. Fix syntax errors and import problems
-3. Ensure all code follows Python best practices
-4. Regenerate the code in the next iteration"""
+                REQUIRED ACTIONS:
+                1. Review each issue carefully
+                2. Fix syntax errors and import problems
+                3. Ensure all code follows Python best practices
+                4. Regenerate the code in the next iteration"""
                     self.message_history.append({
                         "role": "system",
                         "content": validation_feedback
                     })
                     logger.info(f"ℹ️  Validation note: {validation_result.get('feedback', 'continue')}")
+
+                    # 🔺 ESCALATION LOGIC
+                    if self.cost_optimizer:
+                        task_desc = task_context.get("user_intent", f"{self.role.value} task")
+                        current_tier = self.cost_optimizer.classify_task(task_desc, self.role.value)
+
+                        next_tier = self.cost_optimizer.get_escalation_tier(
+                            current_tier=current_tier,
+                            attempt_number=self.iteration_count,
+                            agent_role=self.role.value,
+                            task_description=task_desc,
+                        )
+
+                        if next_tier:
+                            self.cost_optimizer.record_escalation(
+                                agent_role=self.role.value,
+                                from_tier=current_tier,
+                                to_tier=next_tier,
+                                attempt=self.iteration_count
+                            )
+                            
+                            next_model = self.cost_optimizer.get_model_for_tier(next_tier)
+
+                            self.message_history.append({
+                                "role": "system",
+                                "content": f"Escalating model: {current_tier.value} → {next_tier.value} ({next_model}) due to validation failure"
+                            })
+                            logger.info(f"🔺 Escalating {self.agent_id} to {next_tier.value} ({next_model})")
+
                 else:
                     logger.info(f"✓ Validation passed for {self.agent_id}")
 
@@ -2546,10 +2612,48 @@ YOU MUST DOCUMENT YOUR CODE AND GENERATE README:
 
 Missing documentation or README = REJECTION
 """
-        
+
+        # ── Template Library injection (frontend_engineer only) ───────────────
+        template_section = ""
+        if self.role == AgentRole.FRONTEND_ENGINEER:
+            try:
+                get_templates_for_agent, get_template_code = _get_template_helpers()
+                if get_templates_for_agent:
+                    # Pull tags from project context to find relevant templates
+                    project_tags = task_context.get("technology_stack", {}).get(
+                        "frontend_frameworks", []
+                    )
+                    available = get_templates_for_agent(self.role.value, project_tags)
+                    if available:
+                        template_lines = "\n".join(
+                            f"  - [{t['template_id']}] {t['name']} ({t['category']}): {t['description']}"
+                            for t in available
+                        )
+                        template_section = f"""
+🧩 TEMPLATE LIBRARY — REUSABLE COMPONENTS AVAILABLE 🧩
+You have access to pre-built, production-ready React components.
+ALWAYS check if a template covers your need before writing from scratch.
+
+Available templates:
+{template_lines}
+
+HOW TO USE A TEMPLATE:
+- Reference a template by its ID in your response: "Using template: [template_id]"
+- The system will inject the full code. Adapt it to the project's specific needs.
+- You can modify templates freely — they are starting points, not locked implementations.
+- Prefer templates over writing boilerplate from scratch (faster, fewer bugs).
+"""
+                        logger.info(
+                            f"📦 [{self.agent_id}] Injecting {len(available)} template(s) "
+                            f"into frontend agent context"
+                        )
+            except Exception as e:
+                logger.warning(f"⚠️  Could not load templates for {self.agent_id}: {e}")
+
         system_prompt = f"""You are a {role_display} in Agentic Nexus (Copilot Mode).
 
 {profile["system_prompt_template"].format(context=json.dumps(task_context, indent=2))}
+{template_section}
 
 🚨 CRITICAL - ITERATION {self.iteration_count} MODE: {mode_guidance}
 {collaboration_section}
@@ -2603,19 +2707,61 @@ You will not advance until code is complete, documented, AND all requirements ar
 
 {"⛔ CRITICAL: You MUST include code blocks (```filename```) in this iteration. Failing to do so will restart the entire iteration." if self.iteration_count <= 3 else ""}"""
         
+       # ── Cost Optimizer: classify task and select cheapest capable model ──
+        task_desc = task_context.get("user_intent", f"{self.role.value} task iter {self.iteration_count}")
+        is_critical = self.role.value in ("healer_agent", "solution_architect")
+
+        if self.cost_optimizer:
+            allowed, reason = self.cost_optimizer.should_allow_call(self.agent_id, is_critical)
+            if not allowed:
+                logger.warning(f"🚫 [{self.agent_id}] Model call blocked: {reason}")
+                return f"[BUDGET_CAP] {reason}"
+
+            # 🔺 CHECK IF THIS AGENT WAS ALREADY ESCALATED
+            escalation_records = self.cost_optimizer.escalation_records
+
+            agent_escalations = [
+                e for e in escalation_records if e.agent_role == self.role.value
+            ]
+
+            if agent_escalations:
+                # Use latest escalated tier
+                selected_tier = agent_escalations[-1].escalated_to
+                logger.info(f"🔺 [{self.agent_id}] Using escalated tier: {selected_tier.value}")
+            else:
+                # Default behavior
+                selected_tier = self.cost_optimizer.classify_task(task_desc, self.role.value)
+
+            selected_model = self.cost_optimizer.get_model_for_tier(selected_tier)
+
+        else:
+            selected_model = AZURE_OPENAI_DEPLOYMENT
+            selected_tier = ModelTier.COMPLEX
+
         response = self.client.chat.completions.create(
-            model=AZURE_OPENAI_DEPLOYMENT,
+            model=selected_model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(task_context, indent=2)}
             ] + self.message_history,
             temperature=0.7
         )
-        
+
         response_text = response.choices[0].message.content
-        
+
+        # ── Cost Optimizer: record actual token usage ────────────────────────
+        if self.cost_optimizer and hasattr(response, "usage") and response.usage:
+            self.cost_optimizer.record_usage(
+                agent_id=self.agent_id,
+                agent_role=self.role.value,
+                task_description=task_desc,
+                model_tier=selected_tier,
+                prompt_tokens=response.usage.prompt_tokens,
+                completion_tokens=response.usage.completion_tokens,
+            )
+
         # Log AI response for audit trail [NEW]
-        self._log_ai_response(response_text)
+        self._log_ai_response(response_text) 
         
         # Store in message history for next iteration
         self.message_history.append({
@@ -3154,6 +3300,34 @@ You will not advance until code is complete, documented, AND all requirements ar
             except json.JSONDecodeError:
                 logger.warning(f"Could not parse JSON metadata from {self.agent_id}")
 
+        # ── Template resolution: if agent referenced a template, inject its code ──
+        if self.role == AgentRole.FRONTEND_ENGINEER:
+            template_refs = re.findall(r'Using template:\s*\[([\w-]+)\]', response_text)
+            if template_refs:
+                try:
+                    _, get_template_code = _get_template_helpers()
+                    if get_template_code:
+                        resolved = []
+                        for tid in template_refs:
+                            code = get_template_code(tid)
+                            if code:
+                                resolved.append(
+                                    f"Template [{tid}] code injected:\n```jsx\n{code}\n```"
+                                )
+                                logger.info(
+                                    f"📦 [{self.agent_id}] Resolved template: {tid}"
+                                )
+                        if resolved:
+                            self.message_history.append({
+                                "role": "system",
+                                "content": (
+                                    "Template code injected — adapt and include in your output:\n\n"
+                                    + "\n\n".join(resolved)
+                                )
+                            })
+                except Exception as e:
+                    logger.warning(f"⚠️  Template resolution failed: {e}")
+
     def to_dict(self) -> Dict:
         """Convert agent to dictionary for serialization."""
         return {
@@ -3557,17 +3731,19 @@ class AgentSpawner:
     and managing their lifecycle in the system. Updated for swarm mode.
     """
     
-    def __init__(self, cosmos_manager, comm_hub: AgentCommunicationHub, 
+    def __init__(self, cosmos_manager, comm_hub: AgentCommunicationHub,
                  collaboration_bus: CollaborationBus, checkpoint_manager: CheckpointManager,
                  blackboard_manager: BlackboardManager, audit_logger: 'AuditLogger' = None,
-                 requirements_manager: 'RequirementsManager' = None):
+                 requirements_manager: 'RequirementsManager' = None,
+                 cost_optimizer: 'CostOptimizer' = None):
         self.cosmos_manager = cosmos_manager
         self.comm_hub = comm_hub
         self.collaboration_bus = collaboration_bus
         self.checkpoint_manager = checkpoint_manager
         self.blackboard_manager = blackboard_manager
-        self.audit_logger = audit_logger  # NEW
-        self.requirements_manager = requirements_manager  # NEW
+        self.audit_logger = audit_logger
+        self.requirements_manager = requirements_manager
+        self.cost_optimizer = cost_optimizer              # ← NEW
         self.agents: Dict[str, Agent] = {}
         self.agent_counter = {}
 
@@ -3608,8 +3784,9 @@ class AgentSpawner:
                         blackboard_manager=self.blackboard_manager,
                         cosmos_manager=self.cosmos_manager,
                         dependencies=agent_spec.get("dependencies", []),
-                        audit_logger=self.audit_logger,  # NEW
-                        requirements_manager=self.requirements_manager  # NEW
+                        audit_logger=self.audit_logger,
+                        requirements_manager=self.requirements_manager,
+                        cost_optimizer=self.cost_optimizer,  # ← NEW
                     )
                     self.agents[agent_id] = agent
                     
@@ -3969,14 +4146,19 @@ class Orchestrator:
 # ==========================================
 # 9. MAIN EXECUTION FLOW
 # ==========================================
-async def main(user_input: str = None, project_name: str = None, owner_id: str = "api_user"):
+async def main(user_input: str = None, project_name: str = None, owner_id: str = "api_user",
+               project_id_override: str = None, agent_overrides: list = None):
     """
     Main orchestration entry point
-    
+
     Args:
         user_input: User's project description/requirements
         project_name: Optional project name
         owner_id: User/owner identifier
+        project_id_override: Use this project ID instead of generating one
+        agent_overrides: List of role_key strings from the Agent Marketplace.
+                         If provided, these agents are used instead of Director AI choices.
+                         e.g. ['backend_engineer', 'frontend_engineer', 'qa_engineer']
     """
     logger.info("🚀 Initializing Agentic Nexus Platform...")
     
@@ -3985,7 +4167,7 @@ async def main(user_input: str = None, project_name: str = None, owner_id: str =
         user_input = """Build a collaborative platform where users can share, view, analyse and upload legal documents. Please choose and decide appropriate architecture and tech stack. There should be no ML or Devops."""
     
     # Initialize systems with NEW SWARM ARCHITECTURE
-    ledger = TaskLedger(user_input, owner_id)
+    ledger = TaskLedger(user_input, owner_id, project_id_override=project_id_override)
     director = DirectorAI()
     cosmos = CosmosManager()
     comm_hub = AgentCommunicationHub(cosmos)
@@ -4000,6 +4182,13 @@ async def main(user_input: str = None, project_name: str = None, owner_id: str =
     # Get project_id early (generated by ledger)
     ledger_data = await director.clarify_intent(ledger)
     project_id = ledger_data.get("project_id")
+
+    # ── Cost Optimizer (Budget Cape) ─────────────────────────────────────────
+    cost_optimizer = get_optimizer(
+        project_id=project_id or ledger.data.get("project_id") or "unknown",
+        budget_usd=float(os.getenv("PROJECT_BUDGET_USD", "5.0")),
+    )
+    logger.info(f"💰 Cost Optimizer initialised | project={cost_optimizer.project_id} | budget=${cost_optimizer.budget_usd:.2f}")
     
     # Override project name if provided
     if project_name:
@@ -4010,7 +4199,8 @@ async def main(user_input: str = None, project_name: str = None, owner_id: str =
     checkpoint_manager = CheckpointManager(cosmos)  # NEW: State persistence
     blackboard_manager = BlackboardManager(cosmos_manager=cosmos, project_id=project_id)  # NEW: Central + group messaging with persistence
     spawner = AgentSpawner(cosmos, comm_hub, collaboration_bus, checkpoint_manager, blackboard_manager,
-                          audit_logger=audit_logger, requirements_manager=requirements_manager)  # NEW: Pass managers
+                          audit_logger=audit_logger, requirements_manager=requirements_manager,
+                          cost_optimizer=cost_optimizer)
     swarm_orchestrator = SwarmOrchestrator(collaboration_bus, checkpoint_manager)  # NEW: Swarm orchestration
     
     try:
@@ -4018,6 +4208,29 @@ async def main(user_input: str = None, project_name: str = None, owner_id: str =
         logger.info("🧠 Director AI analyzing requirements...")
         ledger.data.update(ledger_data)
         ledger.add_revision("Initial intent decomposition and agent planning completed.")
+
+        # ── Agent Override: if user selected agents in the Marketplace, use those
+        #    instead of whatever the Director AI decided ──────────────────────────
+        if agent_overrides:
+            logger.info(f"🎯 Agent overrides received from Marketplace: {agent_overrides}")
+            # Build required_agents list in the format spawn_agents_from_ledger expects
+            override_specs = []
+            for role_key in agent_overrides:
+                override_specs.append({
+                    "role":         role_key,
+                    "specialty":    "azure_infrastructure",   # sensible default
+                    "count":        1,
+                    "dependencies": [],                        # Director AI will fill DAG next
+                })
+            ledger.data["agent_specifications"]["required_agents"] = override_specs
+            ledger.add_revision(
+                f"Agent list overridden by user marketplace selection: {agent_overrides}"
+            )
+            logger.info(
+                f"✅ Ledger overridden with {len(override_specs)} user-selected agents"
+            )
+        else:
+            logger.info("ℹ️  No agent overrides — using Director AI agent selection")
         
         logger.info(f"📋 Task Ledger populated with {len(ledger.data.get('agent_specifications', {}).get('required_agents', []))} agent specifications")
         

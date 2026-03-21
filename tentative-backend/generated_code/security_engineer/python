@@ -1,0 +1,1 @@
+token = generate_jwt({"user_id": "123"})

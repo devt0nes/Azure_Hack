@@ -1,0 +1,40 @@
+# Coffee Shop E-Commerce Website
+
+This is a simple e-commerce website for selling coffee products. Users can browse the product catalog, add items to a shopping cart, and proceed to a secure checkout.
+
+## Features
+- User authentication and account management
+- Product catalog with images, descriptions, and pricing
+- Shopping cart functionality
+- Secure checkout with payment gateway integration
+- Order management for users
+- Basic admin panel to manage products and orders
+
+## Tech Stack
+- Frontend: React, Bootstrap
+- Backend: Node.js, Express
+- Database: PostgreSQL
+- Cloud Services: AWS S3, AWS Lambda, AWS RDS
+
+## Prerequisites
+- Node.js (v14 or later)
+- npm (Node Package Manager)
+
+## Installation
+1. Clone the repository:
+   ```sh
+   git clone <repository_url>
+   cd <repository_directory>
+   ```
+
+2. Install dependencies:
+   ```sh
+   npm install
+   ```
+
+3. Run the development server:
+   ```sh
+   npm start
+   ```
+
+## Folder Structure

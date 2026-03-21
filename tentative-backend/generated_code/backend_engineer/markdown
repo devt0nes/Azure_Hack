@@ -1,0 +1,36 @@
+# Bakery Website Backend
+
+## Overview
+This project provides the backend services for a simple bakery website. It includes RESTful API endpoints for fetching menu items, submitting contact form inquiries, and retrieving gallery images.
+
+## Prerequisites
+- Node.js
+- SQLite database
+
+## Dependencies
+- express@^4.18.2
+- body-parser@^1.20.2
+- sqlite3@^5.1.6
+- cors@^2.8.5
+- dotenv@^16.0.3
+
+## Setup
+1. Clone the repository.
+2. Install dependencies: `npm install`.
+3. Set up the SQLite database with the provided schema.
+4. Create a `.env` file with the following content:
+   ```
+   PORT=3000
+   ```
+
+## Run the Server
+1. Start the server: `node server.js`.
+2. Access the API at `http://localhost:3000`.
+
+## Endpoints
+- `GET /menu`: Fetch the bakery menu.
+- `POST /contact`: Submit a contact form inquiry.
+- `GET /gallery`: Retrieve gallery items.
+
+## Testing
+Use tools like Postman to test the API endpoints.

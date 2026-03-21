@@ -1,0 +1,80 @@
+-- File: schema.sql
+-- Purpose: Define the database schema for a coffee enthusiasts website
+-- Dependencies: PostgreSQL
+-- Author: Database Architect
+
+-- Table: users
+-- Stores user information for authentication and community forum
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(50) NOT NULL UNIQUE,
+    email VARCHAR(255) NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Table: coffees
+-- Stores coffee type details and origins
+CREATE TABLE coffees (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    origin VARCHAR(255) NOT NULL,
+    description TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Table: articles
+-- Stores blog articles about coffee
+CREATE TABLE articles (
+    id SERIAL PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    content TEXT NOT NULL,
+    author VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Table: forum_posts
+-- Stores community forum posts
+CREATE TABLE forum_posts (
+    id SERIAL PRIMARY KEY,
+    user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    content TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Table: forum_comments
+-- Stores comments on forum posts
+CREATE TABLE forum_comments (
+    id SERIAL PRIMARY KEY,
+    post_id INT NOT NULL REFERENCES forum_posts(id) ON DELETE CASCADE,
+    user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Table: search_logs
+-- Logs user search queries for analytics
+CREATE TABLE search_logs (
+    id SERIAL PRIMARY KEY,
+    user_id INT REFERENCES users(id) ON DELETE SET NULL,
+    search_query TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Table: contact_form_submissions
+-- Stores user inquiries submitted via contact form
+CREATE TABLE contact_form_submissions (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    email VARCHAR(255) NOT NULL,
+    message TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Indexes for performance optimization
+CREATE INDEX idx_coffee_name ON coffees(name);
+CREATE INDEX idx_article_title ON articles(title);
+CREATE INDEX idx_forum_post_title ON forum_posts(title);
+CREATE INDEX idx_search_logs_query ON search_logs(search_query);
+CREATE INDEX idx_contact_email ON contact_form_submissions(email);

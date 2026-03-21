@@ -1,0 +1,34 @@
+# Bakery Website Backend API Tests
+
+## Purpose
+This repository contains unit tests for validating the backend API endpoints of the bakery website project. The tests ensure the correctness of the API functionality for handling bakery products, orders, and customer inquiries.
+
+## Prerequisites and Dependencies
+- Python 3.8+
+- Installed Python packages:
+  - `requests` (for HTTP requests)
+  - `unittest` (built-in module)
+
+## Installation
+1. Clone the repository:
+   ```
+   git clone <repository-url>
+   cd <repository-directory>
+   ```
+2. Install the required Python package:
+   ```
+   pip install requests
+   ```
+
+## Running the Tests
+1. Ensure the backend API server is running locally on `http://localhost:5000`.
+2. Run the tests using the following command:
+   ```
+   python test_backend_api.py
+   ```
+
+## Configuration
+- Update the `BASE_URL` variable in `test_backend_api.py` with the correct base URL of the backend API server.
+
+## Notes
+- The `/api/order` endpoint requires a valid JWT token passed in the `Authorization` header.

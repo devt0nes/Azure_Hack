@@ -1,0 +1,18 @@
+// routes/productRoutes.js
+// Purpose: Manages routes for product catalog operations.
+// Dependencies: express
+
+const express = require('express');
+const router = express.Router();
+
+const products = [
+  { id: 1, name: 'Espresso', description: 'Rich and dark espresso', price: 2.5, image_url: 'https://example.com/espresso.jpg' },
+  { id: 2, name: 'Cappuccino', description: 'Creamy cappuccino with frothy milk', price: 3.5, image_url: 'https://example.com/cappuccino.jpg' },
+];
+
+// Get All Products
+router.get('/', (req, res) => {
+  res.status(200).json(products);
+});
+
+module.exports = router;

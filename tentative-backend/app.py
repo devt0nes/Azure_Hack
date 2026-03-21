@@ -8,6 +8,7 @@ import asyncio
 import json
 import uuid
 import logging
+import os
 from datetime import datetime
 from typing import Optional, Dict, List, Any
 from pathlib import Path
@@ -19,6 +20,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from agents_router import router as agents_router
+from cost_router import router as cost_router
+from agents_router import router as agents_router, seed_agent_catalog, get_selected_agents
+from templates_router import router as templates_router, seed_template_catalog
 # Import main orchestration
 import main as orchestrator_module
 
@@ -30,6 +34,8 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+ORCHESTRATION_TIMEOUT_SECONDS = int(os.getenv("ORCHESTRATION_TIMEOUT_SECONDS", "600"))
 
 # ==========================================
 # FASTAPI APP INITIALIZATION
@@ -52,6 +58,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(agents_router)
+app.include_router(cost_router)
+app.include_router(templates_router)
 
 # ==========================================
 # DATA MODELS
@@ -223,15 +231,19 @@ class OrchestrationService:
             
             # Run the main orchestration with a timeout (300 seconds = 5 minutes max per request)
             try:
-                # Set timeout for orchestration
+                # Give the orchestrator enough time for multi-agent runs.
                 orchestration_task = orchestrator_module.main(
-                    user_input=user_input,
-                    project_name=project_name,
-                    owner_id=owner_id
+                user_input=user_input,
+                   project_name=project_name,
+                  owner_id=owner_id,
+                 project_id_override=project_id   # ← pass app.py's project ID
                 )
                 
                 # Execute with timeout
-                result = await asyncio.wait_for(orchestration_task, timeout=300.0)
+                result = await asyncio.wait_for(
+                    orchestration_task,
+                    timeout=float(ORCHESTRATION_TIMEOUT_SECONDS),
+                )
                 
                 logger.info(f"Orchestration completed. Result: {result}")
                 
@@ -248,7 +260,7 @@ class OrchestrationService:
                     "message": "Code generation completed"
                 }
             except asyncio.TimeoutError:
-                error_msg = "Code generation timed out after 5 minutes"
+                error_msg = f"Code generation timed out after {ORCHESTRATION_TIMEOUT_SECONDS} seconds"
                 logger.error(f"{error_msg} for project {project_id}")
                 project_manager.update_project_status(
                     project_id,
@@ -1001,6 +1013,8 @@ async def startup_event():
     logger.info("🚀 Agentic Nexus Backend API starting up")
     logger.info(f"API Documentation: /api/docs")
     logger.info(f"OpenAPI Schema: /api/openapi.json")
+    seed_agent_catalog() 
+    seed_template_catalog() 
 
 
 @app.on_event("shutdown")

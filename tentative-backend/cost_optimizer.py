@@ -20,12 +20,14 @@ Agent instances.
 
 import os
 import re
-import time
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+from azure.cosmos import CosmosClient
+from azure.cosmos import exceptions as CosmosExceptions
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,11 @@ ESCALATION_LADDER: List[ModelTier] = [
 
 # Healer Agent always dispatched at this tier minimum (Section 5.2)
 HEALER_MINIMUM_TIER = ModelTier.COMPLEX
+
+COSMOS_CONNECTION_STR = os.getenv("COSMOS_CONNECTION_STR")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "agentic-nexus-db")
+COST_STATE_CONTAINER = os.getenv("COST_STATE_CONTAINER", "CostOptimizerState")
+ENABLE_COST_STATE_PERSISTENCE = os.getenv("ENABLE_COST_STATE_PERSISTENCE", "false").strip().lower() == "true"
 
 
 # ─── Complexity keyword heuristic ───────────────────────────────────────────
@@ -165,6 +172,8 @@ class CostOptimizer:
         self.budget_usd          = budget_usd
         self.warning_threshold   = warning_threshold
         self.critical_threshold  = critical_threshold
+        self._state_enabled      = bool(COSMOS_CONNECTION_STR) and ENABLE_COST_STATE_PERSISTENCE
+        self.state_container     = self._init_state_container()
 
         # Token / cost tracking
         self.usage_records: List[TokenUsageRecord]   = []
@@ -186,6 +195,8 @@ class CostOptimizer:
         # Budget enforcement state
         self.cap_reached:    bool = False
         self.paused_agents:  List[str] = []
+
+        self._load_persisted_state()
 
         logger.info(
             f"💰 CostOptimizer initialised | project={project_id} | "
@@ -300,6 +311,7 @@ class CostOptimizer:
 
         # Check budget thresholds
         self._check_budget_thresholds()
+        self._persist_state()
 
         return record
 
@@ -328,7 +340,14 @@ class CostOptimizer:
                 )
                 return HEALER_MINIMUM_TIER
 
-        next_index = attempt_number  # attempt 1 failed → use index 1 (INTERMEDIATE)
+        # Guard: if current_tier isn't on the standard ladder (e.g. custom),
+        # find its position or default to index 0
+        try:
+            current_index = ESCALATION_LADDER.index(current_tier)
+        except ValueError:
+            current_index = 0
+
+        next_index = current_index + 1  # always move exactly one rung up
         if next_index >= len(ESCALATION_LADDER):
             logger.warning(
                 f"⚠️  [CostOptimizer] Max escalation reached for "
@@ -357,6 +376,7 @@ class CostOptimizer:
             f"{current_tier.value} → {next_tier.value} "
             f"(attempt {attempt_number + 1})"
         )
+        self._persist_state()
         return next_tier
 
     # ── 4. Budget enforcement ────────────────────────────────────────────────
@@ -365,6 +385,8 @@ class CostOptimizer:
         """Update the budget cap at runtime."""
         self.budget_usd = budget_usd
         self.cap_reached = False
+        self.paused_agents = []
+        self._persist_state()
         logger.info(f"💰 [CostOptimizer] Budget updated to ${budget_usd:.2f}")
 
     def should_allow_call(self, agent_id: str, is_critical: bool = False) -> Tuple[bool, str]:
@@ -382,6 +404,7 @@ class CostOptimizer:
             self.cap_reached = True
             if agent_id not in self.paused_agents:
                 self.paused_agents.append(agent_id)
+            self._persist_state()
             return False, f"Budget exhausted (${self.total_cost:.3f} / ${self.budget_usd:.2f})"
 
         return True, "ok"
@@ -427,8 +450,43 @@ class CostOptimizer:
         self.alerts.append(alert)
         icon = "🔴" if alert_type == "cap_reached" else "🟠" if alert_type == "critical" else "🟡"
         logger.warning(f"{icon} [CostOptimizer] ALERT [{alert_type.upper()}]: {message}")
+        self._persist_state()
 
     # ── 5. Heuristic learning ────────────────────────────────────────────────
+
+    def record_escalation(
+        self,
+        agent_role: str,
+        from_tier: ModelTier,
+        to_tier: ModelTier,
+        attempt: int,
+        task_description: str = "",
+        reason: Optional[str] = None,
+    ) -> EscalationRecord:
+        task_class = self._stem_task(task_description or f"{agent_role} attempt {attempt}")
+
+        for existing in reversed(self.escalation_records):
+            if (
+                existing.agent_role == agent_role
+                and existing.original_tier == from_tier
+                and existing.escalated_to == to_tier
+                and existing.task_class == task_class
+            ):
+                self._persist_state()
+                return existing
+
+        esc = EscalationRecord(
+            task_class=task_class,
+            original_tier=from_tier,
+            escalated_to=to_tier,
+            reason=reason or f"Escalated after failed attempt {attempt}",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            agent_role=agent_role,
+        )
+        self.escalation_records.append(esc)
+        self._update_escalation_heuristic(esc)
+        self._persist_state()
+        return esc
 
     def _stem_task(self, task_description: str) -> str:
         """Normalise a task description to a short stem for bucketing."""
@@ -546,6 +604,138 @@ class CostOptimizer:
 
 # ─── Module-level registry: one optimizer per project ───────────────────────
 # Keyed by project_id. app.py and main.py both import from here.
+
+    def _state_doc_id(self) -> str:
+        return f"cost_optimizer_state_{self.project_id}"
+
+    def _init_state_container(self):
+        if not self._state_enabled:
+            return None
+        try:
+            client = CosmosClient.from_connection_string(COSMOS_CONNECTION_STR)
+            db = client.get_database_client(DATABASE_NAME)
+            return db.get_container_client(COST_STATE_CONTAINER)
+        except Exception as e:
+            logger.warning(f"⚠️  [CostOptimizer] Cosmos state unavailable: {e}")
+            self._state_enabled = False
+            return None
+
+    def _persist_state(self):
+        if not self._state_enabled or self.state_container is None:
+            return
+        try:
+            self.state_container.upsert_item({
+                "id": self._state_doc_id(),
+                "project_id": self.project_id,
+                "type": "cost_optimizer_state",
+                "budget_usd": self.budget_usd,
+                "warning_threshold": self.warning_threshold,
+                "critical_threshold": self.critical_threshold,
+                "total_tokens": self.total_tokens,
+                "total_cost": self.total_cost,
+                "cap_reached": self.cap_reached,
+                "paused_agents": list(self.paused_agents),
+                "agent_spend": list(self.agent_spend.values()),
+                "usage_records": [self._record_to_dict(r) for r in self.usage_records],
+                "escalation_records": [self._esc_to_dict(e) for e in self.escalation_records],
+                "alerts": [self._alert_to_dict(a) for a in self.alerts],
+                "learned_overrides": {k: v.value for k, v in self._learned_tier_overrides.items()},
+                "escalation_counts": dict(self._escalation_counts),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as e:
+            logger.warning(f"⚠️  [CostOptimizer] Could not persist state: {e}")
+            self._state_enabled = False
+            self.state_container = None
+
+    def _load_persisted_state(self):
+        if not self._state_enabled or self.state_container is None:
+            return
+        try:
+            doc = self.state_container.read_item(item=self._state_doc_id(), partition_key=self.project_id)
+        except CosmosExceptions.CosmosResourceNotFoundError:
+            return
+        except Exception as e:
+            logger.warning(f"⚠️  [CostOptimizer] Could not load persisted state: {e}")
+            self._state_enabled = False
+            self.state_container = None
+            return
+
+        self.budget_usd = float(doc.get("budget_usd", self.budget_usd))
+        self.warning_threshold = float(doc.get("warning_threshold", self.warning_threshold))
+        self.critical_threshold = float(doc.get("critical_threshold", self.critical_threshold))
+        self.total_tokens = int(doc.get("total_tokens", 0))
+        self.total_cost = float(doc.get("total_cost", 0.0))
+        self.cap_reached = bool(doc.get("cap_reached", False))
+        self.paused_agents = list(doc.get("paused_agents", []))
+        self.agent_spend = {
+            item["agent_id"]: item
+            for item in doc.get("agent_spend", [])
+            if item.get("agent_id")
+        }
+        self.usage_records = [self._record_from_dict(item) for item in doc.get("usage_records", [])]
+        self.escalation_records = [self._esc_from_dict(item) for item in doc.get("escalation_records", [])]
+        self.alerts = [self._alert_from_dict(item) for item in doc.get("alerts", [])]
+        self._learned_tier_overrides = {
+            key: ModelTier(value)
+            for key, value in doc.get("learned_overrides", {}).items()
+        }
+        self._escalation_counts = {
+            key: int(value)
+            for key, value in doc.get("escalation_counts", {}).items()
+        }
+
+    def _record_from_dict(self, record: dict) -> TokenUsageRecord:
+        return TokenUsageRecord(
+            agent_id=record["agent_id"],
+            agent_role=record["agent_role"],
+            task_description=record["task_description"],
+            model_tier=ModelTier(record["model_tier"]),
+            model_deployment=record["model_deployment"],
+            prompt_tokens=int(record["prompt_tokens"]),
+            completion_tokens=int(record["completion_tokens"]),
+            total_tokens=int(record["total_tokens"]),
+            cost_usd=float(record["cost_usd"]),
+            timestamp=record["timestamp"],
+            attempt_number=int(record.get("attempt_number", 1)),
+            escalated_from=ModelTier(record["escalated_from"]) if record.get("escalated_from") else None,
+            project_id=self.project_id,
+        )
+
+    def _esc_from_dict(self, esc: dict) -> EscalationRecord:
+        return EscalationRecord(
+            task_class=esc["task_class"],
+            original_tier=ModelTier(esc["original_tier"]),
+            escalated_to=ModelTier(esc["escalated_to"]),
+            reason=esc["reason"],
+            timestamp=esc["timestamp"],
+            agent_role=esc["agent_role"],
+        )
+
+    def _alert_from_dict(self, alert: dict) -> CostAlert:
+        pct_used = float(alert.get("pct_used", 0.0))
+        return CostAlert(
+            alert_type=alert["alert_type"],
+            message=alert["message"],
+            spend_usd=float(alert["spend_usd"]),
+            budget_usd=float(alert["budget_usd"]),
+            pct_used=(pct_used / 100.0) if pct_used > 1 else pct_used,
+            timestamp=alert["timestamp"],
+            project_id=self.project_id,
+        )
+
+    def delete_persisted_state(self):
+        if not self._state_enabled or self.state_container is None:
+            return
+        try:
+            self.state_container.delete_item(item=self._state_doc_id(), partition_key=self.project_id)
+        except CosmosExceptions.CosmosResourceNotFoundError:
+            return
+        except Exception as e:
+            logger.warning(f"⚠️  [CostOptimizer] Could not delete persisted state: {e}")
+            self._state_enabled = False
+            self.state_container = None
+
 
 _optimizers: Dict[str, CostOptimizer] = {}
 
