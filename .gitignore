@@ -1,0 +1,63 @@
+# ----------------------
+# Python
+# ----------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Pytest
+.pytest_cache/
+
+# Logs
+*.log
+agent_logs/
+
+# ----------------------
+# Environment variables
+# ----------------------
+.env
+.env.*
+
+# ----------------------
+# Build / generated files
+# ----------------------
+generated_code/
+dist/
+build/
+
+# ----------------------
+# Node / React (JSX)
+# ----------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Next / React build
+.next/
+out/
+
+# ----------------------
+# OS files
+# ----------------------
+.DS_Store
+Thumbs.db
+
+# ----------------------
+# IDEs / Editors
+# ----------------------
+.vscode/
+.idea/
+
+# ----------------------
+# Misc
+# ----------------------
+*.sqlite3
+*.db

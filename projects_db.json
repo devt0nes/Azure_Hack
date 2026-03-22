@@ -1,0 +1,38 @@
+{
+  "dbb51147-b664-454a-bef9-3509d7481af7": {
+    "project_id": "dbb51147-b664-454a-bef9-3509d7481af7",
+    "project_name": "Test Project",
+    "user_intent": "Build a simple REST API",
+    "description": null,
+    "status": "completed",
+    "created_at": "2026-03-22T10:37:13.906314",
+    "updated_at": "2026-03-22T10:40:26.371095",
+    "progress": 100,
+    "error": null,
+    "artifacts": [],
+    "ledger_data": null,
+    "azure_resources": [
+      "cosmos_db",
+      "blob_storage",
+      "key_vault"
+    ]
+  },
+  "aa553eb0-76db-4098-93eb-ee08cc8b07b8": {
+    "project_id": "aa553eb0-76db-4098-93eb-ee08cc8b07b8",
+    "project_name": "Test Project",
+    "user_intent": "Build a simple REST API",
+    "description": null,
+    "status": "completed",
+    "created_at": "2026-03-22T10:38:15.799506",
+    "updated_at": "2026-03-22T10:40:27.701173",
+    "progress": 100,
+    "error": null,
+    "artifacts": [],
+    "ledger_data": null,
+    "azure_resources": [
+      "cosmos_db",
+      "blob_storage",
+      "key_vault"
+    ]
+  }
+}
