@@ -14,10 +14,11 @@ import contextlib
 from datetime import datetime
 from typing import Dict
 
-import agent_orchestrator_v3 as orchestrator_module
-import general_agent as general_agent_module
+
+from agents_combined import  agent_orchestrator_v3 as orchestrator_module
+from agents_combined import  general_agent as general_agent_module
 from blob_workspace import build_blob_workspace_from_env
-from agent_orchestrator_v3 import EnhancedAgentOrchestrator, WORKSPACE_DIR
+from agents_combined import  EnhancedAgentOrchestrator, WORKSPACE_DIR
 
 
 def latest_ledger_id() -> str:
