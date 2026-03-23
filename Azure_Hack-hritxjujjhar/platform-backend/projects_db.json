@@ -1,0 +1,22 @@
+{
+  "project-1774262596428": {
+    "project_id": "project-1774262596428",
+    "project_name": "Project project-",
+    "user_intent": "build me a website for laptops",
+    "description": null,
+    "status": "created",
+    "created_at": "2026-03-23T10:43:16.435729",
+    "updated_at": "2026-03-23T10:43:23.646460",
+    "progress": 0,
+    "error": null,
+    "artifacts": [],
+    "ledger_data": null,
+    "clarification_questions": [
+      "What specific features or functionalities should the laptop website include?",
+      "Do you have a preferred design style or color scheme for the website?",
+      "Will the website focus on selling laptops, providing reviews, or something else?"
+    ],
+    "clarification_answers": {},
+    "clarification_state": "awaiting_answers"
+  }
+}
