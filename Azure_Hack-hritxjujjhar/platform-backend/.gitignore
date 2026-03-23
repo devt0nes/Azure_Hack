@@ -1,63 +1,43 @@
-# Environment Variables
+# Generated files
+deployment_result.json
+azure_deployment_todo.json
+deployment_summary.json
+*.log
+/logs/
+/tmp/
+
+# Node modules
+node_modules/
+*.pem
+
+# Environment
 .env
 .env.local
 .env.*.local
 
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-ENV/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
 # IDE
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
-.DS_Store
-*.sublime-project
-*.sublime-workspace
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-
-# Logs
-*.log
-logs/
-
-# IDE specific
-*.iml
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Project specific
-*.bak
-*.tmp
-/data/
-/output/
+# Generated project artifacts
+/projects/
+/generated/
+build/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+venv/
+env/
+
+# Testing
+coverage/
+.coverage
