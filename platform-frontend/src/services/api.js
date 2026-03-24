@@ -38,6 +38,29 @@ export const clarifyWithAnswers = ({ projectId, userInput, answers }) =>
     body: JSON.stringify({ project_id: projectId, user_input: userInput, answers }),
   })
 
+export const askQuestion = ({ projectId, userMessage, conversationHistory = [], question_count = 0 }) =>
+  apiFetch('/question', {
+    method: 'POST',
+    body: JSON.stringify({
+      project_id: projectId,
+      user_message: userMessage,
+      conversation_history: conversationHistory,
+      question_count: question_count,
+    }),
+  })
+
+export const checkQuestionReadiness = ({ projectId }) =>
+  apiFetch('/question-readiness', {
+    method: 'POST',
+    body: JSON.stringify({ project_id: projectId }),
+  })
+
+export const executeFromSpecs = ({ projectId }) =>
+  apiFetch('/execute-from-specs', {
+    method: 'POST',
+    body: JSON.stringify({ project_id: projectId }),
+  })
+
 export const getAEG = ({ projectId }) =>
   apiFetch(`/aeg?project_id=${projectId}`)
 
@@ -96,3 +119,8 @@ export async function downloadProjectArtifact({ projectId, artifactName }) {
   const blob = await response.blob()
   return { blob, filename: artifactName }
 }
+
+// Workspace file management endpoints
+export const getWorkspaceFiles = () => apiFetch('/api/workspace/files')
+export const getProjectSpecs = ({ projectId }) => apiFetch(`/api/workspace/specs/${projectId}`)
+export const getProjectLedger = ({ projectId }) => apiFetch(`/api/workspace/ledger/${projectId}`)

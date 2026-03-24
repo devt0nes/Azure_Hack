@@ -159,6 +159,17 @@ class ClarifyAnswersRequest(BaseModel):
     answers: Dict[str, str]
 
 
+class QuestionRequest(BaseModel):
+    project_id: str
+    user_message: str
+    conversation_history: Optional[List[Dict[str, str]]] = None
+    question_count: Optional[int] = 0
+
+
+class QuestionReadinessRequest(BaseModel):
+    project_id: str
+
+
 # ------------------------------
 # Project storage
 # ------------------------------
@@ -206,6 +217,7 @@ class ProjectStore:
             "clarification_questions": [],
             "clarification_answers": {},
             "clarification_state": "none",
+            "question_count": 0,
         }
         self.projects[project_id] = payload
         self._save()
@@ -723,13 +735,21 @@ async def _invoke_real_orchestrator(project_id: str, project_data: Dict[str, Any
     )
 
     try:
+        # Step 0: Read project specifications file if it exists
+        project_specs = _read_project_specs_file(project_id)
+        if project_specs:
+            # Prepend specs to user input so director has full context
+            user_input = f"PROJECT SPECIFICATIONS:\n\n{project_specs}\n\nADDITIONAL CONTEXT:\n{user_input}"
+            logger.info("Director agent will use gathered specifications for project %s", project_id)
+            _append_project_log(project_id, "director_agent_using_specs", specs_length=len(project_specs))
+        
         # Step 1: Import director and orchestrator modules
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from director_agent import DirectorAI, TaskLedger, normalize_layers_common_sense, default_workspace_layout
         from agent_orchestrator_v3 import EnhancedAgentOrchestrator
         
         logger.info("Step 1: Director Agent - Generating task ledger for %s", project_id)
-        _append_project_log(project_id, "director_agent_start", user_intent=user_input)
+        _append_project_log(project_id, "director_agent_start", user_intent=user_input[:200])
         
         # Step 2: Create task ledger via Director Agent (iterative refinement)
         director = DirectorAI()
@@ -993,6 +1013,21 @@ async def _simulate_deployment(project_id: str, request: DeploymentRequest) -> N
         logger.exception("Deployment failed for %s", project_id)
         store.update(project_id, status=ProjectStatus.COMPLETED, error=str(exc))
         _append_project_log(project_id, "deployment_failed_exception", error=str(exc))
+
+
+def _read_project_specs_file(project_id: str) -> Optional[str]:
+    """Read the project specifications file if it exists."""
+    try:
+        workspace_dir = REPO_ROOT / "workspace"
+        spec_file = workspace_dir / f"project_specs_{project_id}.md"
+        if spec_file.exists() and spec_file.is_file():
+            content = spec_file.read_text(encoding="utf-8")
+            logger.info("Read project specifications from: %s", spec_file.resolve())
+            _append_project_log(project_id, "specs_file_read", spec_file=str(spec_file.resolve()))
+            return content
+    except Exception as exc:
+        logger.warning("Could not read project specs file for %s: %s", project_id, exc)
+    return None
 
 
 def _check_input_safety(text: str) -> Dict[str, Any]:
@@ -1597,6 +1632,271 @@ async def clarify_intent(request: ClarifyRequest, background_tasks: BackgroundTa
             "project_id": request.project_id,
             "status": "processing",
         }
+
+
+@app.post("/question", tags=["QuestioningAgent"])
+async def question_endpoint(request: QuestionRequest):
+    """Interactive questioning agent endpoint.
+    
+    Conducts natural conversation to gather project specifications.
+    Updates project specification file iteratively.
+    """
+    try:
+        from questioning_agent import QuestioningAgent
+        
+        project = store.get(request.project_id)
+        current_question_count = request.question_count or 0
+        
+        if not project:
+            created = store.create_with_id(
+                request.project_id, 
+                f"Project {request.project_id[:8]}", 
+                request.user_message, 
+                None
+            )
+            project = created
+        else:
+            current_question_count = project.get("question_count", 0)
+        
+        agent = QuestioningAgent()
+        conversation_history = request.conversation_history or []
+        
+        response = agent.get_response(
+            request.project_id,
+            request.user_message,
+            conversation_history,
+            question_count=current_question_count
+        )
+        
+        # Update project with new question count
+        if not response.get("must_execute"):
+            project["question_count"] = response["question_count"]
+            project["updated_at"] = datetime.utcnow().isoformat()
+            store._save()
+        
+        _append_project_log(
+            request.project_id,
+            "questioning_agent_response",
+            user_message=request.user_message[:100],
+            question_count=response["question_count"]
+        )
+        
+        return {
+            "response": response["response"],
+            "agent_thinking": response["agent_thinking"],
+            "next_topics": response["next_topics"],
+            "project_id": request.project_id,
+            "spec_updated": response["spec_updated"],
+            "spec_preview": response["spec_preview"],
+            "full_spec_path": response["full_spec_path"],
+            "question_count": response["question_count"],
+            "questions_remaining": response["questions_remaining"],
+            "must_execute": response["must_execute"]
+        }
+    except Exception as exc:
+        logger.error("Question endpoint error: %s", exc)
+        return {
+            "response": "I encountered an issue processing your input. Please try again.",
+            "project_id": request.project_id,
+            "error": str(exc)
+        }
+
+
+@app.post("/question-readiness", tags=["QuestioningAgent"])
+async def question_readiness_endpoint(request: QuestionReadinessRequest):
+    """Check if project specifications are complete and ready for execution."""
+    try:
+        from questioning_agent import QuestioningAgent
+        
+        project = store.get(request.project_id)
+        if not project:
+            return {
+                "is_ready": False,
+                "completeness": 0,
+                "message": "No project found. Start a conversation first.",
+                "missing_areas": ["Project specifications"],
+                "project_id": request.project_id
+            }
+        
+        agent = QuestioningAgent()
+        readiness = agent.suggest_execution(request.project_id, [])
+        
+        return {
+            "is_ready": readiness["is_ready"],
+            "completeness": readiness["completeness"],
+            "message": readiness["message"],
+            "missing_areas": readiness["missing_areas"],
+            "full_spec_path": readiness["full_spec_path"],
+            "project_id": request.project_id
+        }
+    except Exception as exc:
+        logger.error("Question readiness error: %s", exc)
+        return {
+            "is_ready": False,
+            "completeness": 0,
+            "message": "Error assessing specification readiness.",
+            "project_id": request.project_id,
+            "error": str(exc)
+        }
+
+
+@app.post("/execute-from-specs", tags=["QuestioningAgent"])
+async def execute_from_specs(request: ExecuteRequest, background_tasks: BackgroundTasks):
+    """Execute project generation using specifications gathered by questioning agent."""
+    try:
+        from questioning_agent import QuestioningAgent
+        
+        project = store.get(request.project_id)
+        active_project_id = request.project_id
+        
+        if not project:
+            return {
+                "message": "Project not found",
+                "project_id": request.project_id,
+                "status": "failed",
+                "error": "No project with this ID"
+            }
+        
+        # Load the specification file
+        agent = QuestioningAgent()
+        spec_path = agent._get_spec_file_path(request.project_id)
+        
+        if not os.path.exists(spec_path):
+            return {
+                "message": "No specifications found. Please complete the questioning process first.",
+                "project_id": request.project_id,
+                "status": "failed"
+            }
+        
+        with open(spec_path, 'r', encoding='utf-8') as f:
+            project_specs = f.read()
+        
+        # Update project with specifications as the intent
+        project["user_intent"] = f"Based on these specifications:\n\n{project_specs}"
+        project["updated_at"] = datetime.utcnow().isoformat()
+        store._save()
+        
+        # Start execution
+        store.update(active_project_id, status=ProjectStatus.QUEUED, progress=5)
+        background_tasks.add_task(_simulate_generation, active_project_id)
+        
+        _append_project_log(
+            active_project_id,
+            "execute_from_specs_started",
+            local_output_dir=str(_project_generated_dir(active_project_id).resolve()),
+            blob_enabled=bool(BLOB_WORKSPACE),
+            spec_file=spec_path
+        )
+        
+        return {
+            "message": "Execution started using gathered specifications",
+            "project_id": active_project_id,
+            "status": "running",
+            "spec_file": spec_path
+        }
+    except Exception as exc:
+        logger.error("Execute from specs error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to start execution from specifications")
+
+
+@app.get("/api/workspace/files", tags=["Workspace"])
+async def get_workspace_files():
+    """List all files in the workspace directory (specs, ledgers, etc.)."""
+    try:
+        workspace_dir = REPO_ROOT / "workspace"
+        if not workspace_dir.exists():
+            return {"files": [], "workspace_path": str(workspace_dir.resolve())}
+        
+        files = []
+        for file_path in sorted(workspace_dir.glob("*")):
+            if file_path.is_file():
+                files.append({
+                    "name": file_path.name,
+                    "type": "spec" if "project_specs" in file_path.name else "ledger" if "ledger" in file_path.name else "other",
+                    "size": file_path.stat().st_size,
+                    "modified_at": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat(),
+                    "path": str(file_path.relative_to(REPO_ROOT))
+                })
+        
+        return {
+            "workspace_path": str(workspace_dir.resolve()),
+            "file_count": len(files),
+            "files": files
+        }
+    except Exception as exc:
+        logger.error("Workspace files error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to list workspace files")
+
+
+@app.get("/api/workspace/specs/{project_id}", tags=["Workspace"])
+async def get_project_specs_file(project_id: str):
+    """Retrieve the project specifications markdown file content."""
+    try:
+        workspace_dir = REPO_ROOT / "workspace"
+        spec_file = workspace_dir / f"project_specs_{project_id}.md"
+        
+        if not spec_file.exists():
+            raise HTTPException(status_code=404, detail=f"Specifications file not found for project {project_id}")
+        
+        content = spec_file.read_text(encoding="utf-8")
+        return {
+            "project_id": project_id,
+            "file_path": str(spec_file.resolve()),
+            "file_size": spec_file.stat().st_size,
+            "modified_at": datetime.fromtimestamp(spec_file.stat().st_mtime).isoformat(),
+            "content": content
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Get specs file error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to retrieve specifications file")
+
+
+@app.get("/api/workspace/ledger/{project_id}", tags=["Workspace"])
+async def get_project_ledger(project_id: str):
+    """Retrieve the task ledger JSON file for a project."""
+    try:
+        workspace_dir = REPO_ROOT / "workspace"
+        ledger_file = workspace_dir / f"ledger_{project_id}.json"
+        
+        # Also get project status and logs
+        project = store.get(project_id)
+        project_status = "unknown"
+        project_progress = 0
+        if project:
+            project_status = project.get("status", "unknown")
+            project_progress = project.get("progress", 0)
+        
+        if not ledger_file.exists():
+            return {
+                "project_id": project_id,
+                "file_path": str(ledger_file.resolve()),
+                "exists": False,
+                "project_status": project_status,
+                "project_progress": project_progress,
+                "message": f"Ledger file not found. Project status: {project_status} (progress: {project_progress}%). The director agent may still be running. Check logs for details.",
+                "ledger_data": None
+            }
+        
+        content = ledger_file.read_text(encoding="utf-8")
+        ledger_data = json.loads(content)
+        
+        return {
+            "project_id": project_id,
+            "file_path": str(ledger_file.resolve()),
+            "exists": True,
+            "project_status": project_status,
+            "project_progress": project_progress,
+            "file_size": ledger_file.stat().st_size,
+            "modified_at": datetime.fromtimestamp(ledger_file.stat().st_mtime).isoformat(),
+            "ledger_data": ledger_data
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Get ledger error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to retrieve ledger file")
 
 
 @app.get("/aeg", tags=["Compatibility"])
