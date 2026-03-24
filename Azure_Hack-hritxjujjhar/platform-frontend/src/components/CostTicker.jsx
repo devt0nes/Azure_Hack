@@ -1,23 +1,50 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 
-export default function CostTicker({ tokens, cost }) {
+const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
+
+export default function CostTicker({ projectId }) {
   const [displayCost, setDisplayCost] = useState(0)
   const [displayTokens, setDisplayTokens] = useState(0)
+  const [targetCost, setTargetCost] = useState(0)
+  const [targetTokens, setTargetTokens] = useState(0)
+  const pollRef = useRef(null)
 
+  // Poll the live ticker endpoint every 3s
+  useEffect(() => {
+    if (!projectId) return
+
+    const fetchTicker = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/cost/ticker?project_id=${projectId}`)
+        if (!res.ok) return
+        const data = await res.json()
+        setTargetCost(data.total_cost_usd ?? 0)
+        setTargetTokens(data.total_tokens ?? 0)
+      } catch (e) {
+        // silently fail — ticker is non-critical
+      }
+    }
+
+    fetchTicker()
+    pollRef.current = setInterval(fetchTicker, 3000)
+    return () => clearInterval(pollRef.current)
+  }, [projectId])
+
+  // Smooth animation toward target values
   useEffect(() => {
     const costInterval = setInterval(() => {
-      setDisplayCost((prev) => {
-        const diff = cost - prev
-        if (Math.abs(diff) < 0.001) return cost
+      setDisplayCost(prev => {
+        const diff = targetCost - prev
+        if (Math.abs(diff) < 0.0001) return targetCost
         return prev + diff * 0.1
       })
     }, 100)
 
     const tokenInterval = setInterval(() => {
-      setDisplayTokens((prev) => {
-        if (prev === tokens) return tokens
-        const diff = tokens - prev
-        if (Math.abs(diff) < 1) return tokens
+      setDisplayTokens(prev => {
+        if (prev === targetTokens) return targetTokens
+        const diff = targetTokens - prev
+        if (Math.abs(diff) < 1) return targetTokens
         return prev + Math.sign(diff) * Math.ceil(Math.abs(diff) * 0.15)
       })
     }, 150)
@@ -26,7 +53,7 @@ export default function CostTicker({ tokens, cost }) {
       clearInterval(costInterval)
       clearInterval(tokenInterval)
     }
-  }, [cost, tokens])
+  }, [targetCost, targetTokens])
 
   return (
     <div className="relative rounded-xl border border-primary/30 bg-card px-6 py-3 text-sm shadow-glow-sm">
@@ -39,7 +66,9 @@ export default function CostTicker({ tokens, cost }) {
           <span className="text-gradient-ember text-2xl font-bold">
             ${displayCost.toFixed(3)}
           </span>
-          <span className="mono text-xs text-foreground/50">{Math.round(displayTokens)} tokens</span>
+          <span className="mono text-xs text-foreground/50">
+            {Math.round(displayTokens)} tokens
+          </span>
         </div>
       </div>
     </div>

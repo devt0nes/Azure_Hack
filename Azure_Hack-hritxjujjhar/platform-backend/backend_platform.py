@@ -27,6 +27,11 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from blob_workspace import build_blob_workspace_from_env
 
+try:
+    from azure.cosmos import CosmosClient
+except Exception:  # pragma: no cover - optional runtime dependency safeguard
+    CosmosClient = None
+
 
 load_dotenv()
 AZURE_MODEL_DEPLOYMENT = os.getenv("AZURE_MODEL_DEPLOYMENT") or os.getenv("AZURE_OPENAI_DEPLOYMENT") or "gpt-4o"
@@ -220,42 +225,251 @@ SELECTED_AGENTS_BY_PROJECT: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
 AGENT_CATALOG: List[Dict[str, Any]] = [
     {
-        "id": "backend_engineer",
-        "role": "backend_engineer",
-        "tier": 1,
+        "id": "solution-architect-v1",
+        "agent_id": "solution-architect-v1",
+        "role": "Solution Architect",
+        "display_name": "Solution Architect",
+        "role_key": "solution_architect",
+        "tier": 2,
         "model_label": "GPT-4o",
-        "description": "Builds backend APIs and orchestration logic.",
-        "reputation_score": 0.93,
-        "tags": ["backend", "api", "python"],
+        "model_tier": "complex",
+        "description": "Designs the overall system architecture, selects stack boundaries, and defines the execution plan other agents follow.",
+        "reputation_score": 0.94,
+        "tags": ["architecture", "planning", "system-design"],
+        "specialties": ["azure_infrastructure", "microservices"],
+        "dependencies": [],
+        "mcp_tools": ["file_write", "diagram_gen"],
+        "source": "builtin",
+        "status": "available",
+        "visibility": "workspace",
+        "creator": "Agentic Nexus",
     },
     {
-        "id": "frontend_engineer",
-        "role": "frontend_engineer",
+        "id": "api-designer-v1",
+        "agent_id": "api-designer-v1",
+        "role": "API Designer",
+        "display_name": "API Designer",
+        "role_key": "api_designer",
+        "tier": 2,
+        "model_label": "GPT-4o-mini",
+        "model_tier": "intermediate",
+        "description": "Produces OpenAPI and interface contracts, versioning strategy, and endpoint design before implementation starts.",
+        "reputation_score": 0.80,
+        "tags": ["api", "openapi", "swagger", "rest"],
+        "specialties": ["api_development"],
+        "dependencies": ["solution_architect"],
+        "mcp_tools": ["file_write", "code_exec"],
+        "source": "builtin",
+        "status": "available",
+        "visibility": "workspace",
+        "creator": "Agentic Nexus",
+    },
+    {
+        "id": "security-engineer-v1",
+        "agent_id": "security-engineer-v1",
+        "role": "Security Engineer",
+        "display_name": "Security Engineer",
+        "role_key": "security_engineer",
+        "tier": 2,
+        "model_label": "GPT-4o",
+        "model_tier": "complex",
+        "description": "Performs security review, threat modeling, auth design, and compliance checks across generated systems.",
+        "reputation_score": 0.95,
+        "tags": ["owasp", "security", "iam"],
+        "specialties": ["security_compliance", "azure_infrastructure"],
+        "dependencies": ["solution_architect"],
+        "mcp_tools": ["github-read", "code-sandbox"],
+        "source": "builtin",
+        "status": "available",
+        "visibility": "workspace",
+        "creator": "Agentic Nexus",
+    },
+    {
+        "id": "database-architect-v1",
+        "agent_id": "database-architect-v1",
+        "role": "Database Architect",
+        "display_name": "Database Architect",
+        "role_key": "database_architect",
         "tier": 1,
         "model_label": "GPT-4o",
-        "description": "Builds React UI and frontend integrations.",
+        "model_tier": "complex",
+        "description": "Designs schemas, indexing strategy, and migration scripts for relational and document databases.",
+        "reputation_score": 0.83,
+        "tags": ["schema", "migrations", "indexing"],
+        "specialties": ["database_design", "azure_infrastructure"],
+        "dependencies": ["solution_architect"],
+        "mcp_tools": ["azure-sql", "cosmos-db", "github-file-write"],
+        "source": "builtin",
+        "status": "available",
+        "visibility": "workspace",
+        "creator": "Agentic Nexus",
+    },
+    {
+        "id": "backend-engineer-v1",
+        "agent_id": "backend-engineer-v1",
+        "role": "Backend Engineer",
+        "display_name": "Backend Engineer",
+        "role_key": "backend_engineer",
+        "tier": 1,
+        "model_label": "GPT-4o-mini",
+        "model_tier": "intermediate",
+        "description": "Builds REST APIs, microservices, and authentication flows. Outputs OpenAPI contracts consumed by the frontend.",
+        "reputation_score": 0.87,
+        "tags": ["api", "auth", "microservices"],
+        "specialties": ["azure_infrastructure", "microservices", "api_development"],
+        "dependencies": ["database_architect", "api_designer", "security_engineer"],
+        "mcp_tools": ["github-file-write", "code-sandbox", "azure-sql"],
+        "source": "builtin",
+        "status": "available",
+        "visibility": "workspace",
+        "creator": "Agentic Nexus",
+    },
+    {
+        "id": "frontend-engineer-v1",
+        "agent_id": "frontend-engineer-v1",
+        "role": "Frontend Engineer",
+        "display_name": "Frontend Engineer",
+        "role_key": "frontend_engineer",
+        "tier": 1,
+        "model_label": "GPT-4o-mini",
+        "model_tier": "intermediate",
+        "description": "Builds React/Next.js components with accessibility compliance and integrates backend contracts into polished UI flows.",
         "reputation_score": 0.91,
-        "tags": ["frontend", "react", "ui"],
+        "tags": ["react", "ui", "nextjs"],
+        "specialties": ["react_frontend", "angular_frontend"],
+        "dependencies": ["backend_engineer", "api_designer"],
+        "mcp_tools": ["github-file-write", "code-sandbox"],
+        "source": "builtin",
+        "status": "available",
+        "visibility": "workspace",
+        "creator": "Agentic Nexus",
     },
     {
-        "id": "database_architect",
-        "role": "database_architect",
+        "id": "devops-engineer-v1",
+        "agent_id": "devops-engineer-v1",
+        "role": "DevOps Engineer",
+        "display_name": "DevOps Engineer",
+        "role_key": "devops_engineer",
         "tier": 2,
         "model_label": "GPT-4o-mini",
-        "description": "Designs schema and data layer conventions.",
-        "reputation_score": 0.88,
-        "tags": ["database", "sql", "schema"],
+        "model_tier": "intermediate",
+        "description": "Generates Dockerfiles, IaC, deployment pipelines, and operational workflows for Azure environments.",
+        "reputation_score": 0.86,
+        "tags": ["docker", "bicep", "ci-cd"],
+        "specialties": ["devops_ci_cd", "azure_infrastructure"],
+        "dependencies": ["backend_engineer", "database_architect", "security_engineer"],
+        "mcp_tools": ["github-file-write", "azure-devops", "acr"],
+        "source": "builtin",
+        "status": "available",
+        "visibility": "workspace",
+        "creator": "Agentic Nexus",
     },
     {
-        "id": "qa_engineer",
-        "role": "qa_engineer",
+        "id": "qa-engineer-v1",
+        "agent_id": "qa-engineer-v1",
+        "role": "QA Engineer",
+        "display_name": "QA Engineer",
+        "role_key": "qa_engineer",
         "tier": 2,
         "model_label": "GPT-4o-mini",
-        "description": "Creates tests and quality checks.",
+        "model_tier": "intermediate",
+        "description": "Generates unit, integration, and end-to-end tests and helps validate production readiness.",
         "reputation_score": 0.89,
-        "tags": ["qa", "testing"],
+        "tags": ["testing", "coverage", "e2e"],
+        "specialties": ["testing_automation"],
+        "dependencies": ["backend_engineer", "frontend_engineer"],
+        "mcp_tools": ["code-sandbox", "github-file-write"],
+        "source": "builtin",
+        "status": "available",
+        "visibility": "workspace",
+        "creator": "Agentic Nexus",
     },
 ]
+
+COSMOS_DATABASE_NAME = os.getenv("COSMOS_DATABASE") or os.getenv("DATABASE_NAME", "agentic-nexus-db")
+COSMOS_AGENT_CATALOG_CONTAINER = os.getenv("COSMOS_AGENT_CATALOG_CONTAINER", "AgentCatalog")
+
+_agent_catalog_container = None
+_agent_catalog_container_error: Optional[str] = None
+
+
+def _get_agent_catalog_container():
+    global _agent_catalog_container, _agent_catalog_container_error
+
+    if _agent_catalog_container is not None:
+        return _agent_catalog_container
+    if _agent_catalog_container_error is not None:
+        return None
+
+    if CosmosClient is None:
+        _agent_catalog_container_error = "azure-cosmos package is unavailable"
+        return None
+
+    connection_str = (os.getenv("COSMOS_CONNECTION_STR") or "").strip()
+    endpoint = (os.getenv("COSMOS_ENDPOINT") or "").strip()
+    key = (os.getenv("COSMOS_KEY") or "").strip()
+
+    if connection_str:
+        client = CosmosClient.from_connection_string(connection_str)
+    elif endpoint and key:
+        client = CosmosClient(endpoint, key)
+    else:
+        _agent_catalog_container_error = "Cosmos credentials are not configured"
+        return None
+
+    try:
+        database = client.get_database_client(COSMOS_DATABASE_NAME)
+        container = database.get_container_client(COSMOS_AGENT_CATALOG_CONTAINER)
+        # Probe once so we fail early and can safely fall back.
+        container.read()
+        _agent_catalog_container = container
+        return _agent_catalog_container
+    except Exception as exc:
+        _agent_catalog_container_error = str(exc)
+        logger.warning(
+            "Could not initialize Cosmos AgentCatalog container %s/%s: %s",
+            COSMOS_DATABASE_NAME,
+            COSMOS_AGENT_CATALOG_CONTAINER,
+            exc,
+        )
+        return None
+
+
+def _normalize_agent_catalog_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    agent = dict(item)
+    if "id" not in agent and agent.get("agent_id"):
+        agent["id"] = agent["agent_id"]
+    if "agent_id" not in agent and agent.get("id"):
+        agent["agent_id"] = agent["id"]
+    if "reputation_score" in agent:
+        try:
+            agent["reputation_score"] = float(agent.get("reputation_score") or 0.0)
+        except (TypeError, ValueError):
+            agent["reputation_score"] = 0.0
+    return agent
+
+
+def _load_agent_catalog() -> tuple[List[Dict[str, Any]], str]:
+    container = _get_agent_catalog_container()
+    if container is None:
+        return AGENT_CATALOG, "local-fallback"
+
+    try:
+        items = list(
+            container.query_items(
+                query="SELECT * FROM c",
+                enable_cross_partition_query=True,
+            )
+        )
+        agents = [
+            _normalize_agent_catalog_item(item)
+            for item in items
+            if item.get("id") or item.get("agent_id")
+        ]
+        return agents, "cosmos"
+    except Exception as exc:
+        logger.warning("Failed to read agent catalog from Cosmos DB: %s", exc)
+        return AGENT_CATALOG, "local-fallback"
 
 _ORCHESTRATOR_MODULE = None
 
@@ -1218,7 +1432,7 @@ async def get_context(project_id: str):
 
 @app.get("/api/agents", tags=["Compatibility"])
 async def get_agents(tier: Optional[int] = Query(default=None), role: Optional[str] = Query(default=None), tag: Optional[str] = Query(default=None)):
-    agents = AGENT_CATALOG
+    agents, source = _load_agent_catalog()
     if tier is not None:
         agents = [a for a in agents if int(a.get("tier", 0)) == int(tier)]
     if role:
@@ -1227,12 +1441,13 @@ async def get_agents(tier: Optional[int] = Query(default=None), role: Optional[s
     if tag:
         tag_l = tag.lower()
         agents = [a for a in agents if any(tag_l == str(t).lower() for t in a.get("tags", []))]
-    return {"agents": agents, "count": len(agents), "source": "local"}
+    return {"agents": agents, "count": len(agents), "source": source}
 
 
 @app.get("/api/agents/{agent_id}", tags=["Compatibility"])
 async def get_agent(agent_id: str):
-    for agent in AGENT_CATALOG:
+    agents, _ = _load_agent_catalog()
+    for agent in agents:
         if agent.get("id") == agent_id:
             return agent
     raise HTTPException(status_code=404, detail="Agent not found")
@@ -1242,7 +1457,8 @@ async def get_agent(agent_id: str):
 async def select_agent(payload: AgentSelectionRequest):
     project_id = payload.project_id or "default"
     project_map = SELECTED_AGENTS_BY_PROJECT.setdefault(project_id, {})
-    selected = next((a for a in AGENT_CATALOG if a["id"] == payload.agent_id), None)
+    agents, _ = _load_agent_catalog()
+    selected = next((a for a in agents if a.get("id") == payload.agent_id), None)
     if not selected:
         raise HTTPException(status_code=404, detail="Agent not found")
     project_map[payload.agent_id] = {

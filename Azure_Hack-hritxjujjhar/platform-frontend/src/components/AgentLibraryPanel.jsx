@@ -17,23 +17,27 @@
 import { useState, useEffect, useCallback } from 'react'
 import { getAgentCatalog, selectAgentForNode } from '../services/agents.js'
 
-// ─── Reputation bar ────────────────────────────────────────────────────────
-function ReputationBar({ score }) {
-  const pct   = Math.round(score * 100)
-  const color =
-    pct >= 90 ? 'from-emerald-400 to-emerald-500' :
-    pct >= 80 ? 'from-amber-400  to-amber-500'    :
-                'from-red-400    to-red-500'
+// ─── Reputation stars ──────────────────────────────────────────────────────
+function ReputationStars({ score }) {
+  const normalized = Math.max(0, Math.min(1, Number(score) || 0))
+  const starsFilled = Math.round(normalized * 5)
+  const scoreOutOfFive = (normalized * 5).toFixed(1)
 
   return (
-    <div className="flex items-center gap-2">
-      <div className="h-1.5 flex-1 rounded-full bg-ink/10 overflow-hidden">
-        <div
-          className={`h-full rounded-full bg-gradient-to-r ${color} transition-all duration-700`}
-          style={{ width: `${pct}%` }}
-        />
+    <div className="flex items-center justify-end gap-1.5">
+      <div className="flex items-center gap-0.5" aria-label={`Reputation ${scoreOutOfFive} out of 5`}>
+        {Array.from({ length: 5 }).map((_, i) => (
+          <svg
+            key={i}
+            className={`h-3.5 w-3.5 ${i < starsFilled ? 'text-amber-500' : 'text-ink/20'}`}
+            viewBox="0 0 24 24"
+            fill="currentColor"
+          >
+            <path d="M12 2.5l2.94 5.96 6.58.96-4.76 4.64 1.12 6.55L12 17.52 6.12 20.6l1.12-6.55L2.48 9.42l6.58-.96L12 2.5z" />
+          </svg>
+        ))}
       </div>
-      <span className="mono text-[11px] font-semibold text-ink/60">{pct}%</span>
+      <span className="mono text-[11px] font-semibold text-ink/60">{scoreOutOfFive}/5</span>
     </div>
   )
 }
@@ -136,7 +140,7 @@ function AgentCard({ agent, onSelect, selectedAegNodeId, isSelected }) {
           {/* Right: reputation + chevron */}
           <div className="flex flex-shrink-0 flex-col items-end gap-1.5 min-w-[80px]">
             <div className="w-20">
-              <ReputationBar score={agent.reputation_score} />
+              <ReputationStars score={agent.reputation_score} />
             </div>
             <svg
               className={`h-3.5 w-3.5 text-ink/30 transition-transform duration-200 ${expanded ? 'rotate-180' : ''}`}
