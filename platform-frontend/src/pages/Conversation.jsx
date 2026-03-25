@@ -4,6 +4,7 @@ import {
   checkQuestionReadiness,
   clarifyWithAnswers,
   executeFromSpecs,
+  ingestProjectContext,
   loadCanvas,
   uploadCanvasFile,
 } from '../services/api.js'
@@ -81,6 +82,7 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
   const [isCheckingReadiness, setIsCheckingReadiness] = useState(false)
   const [isExecuting, setIsExecuting] = useState(false)
   const [nextTopics, setNextTopics] = useState([])
+  const [ingestionHint, setIngestionHint] = useState('')
 
   const messagesContainerRef = useRef(null)
   const messagesEndRef = useRef(null)
@@ -135,26 +137,64 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
     setMessages((prev) => [...prev, userMessage])
     setInput('')
     setError('')
+    setIngestionHint('')
     setIsSending(true)
 
     try {
       const requestProjectId = activeProjectId || projectId || `project-${Date.now()}`
       let payloadInput = userMessage.content
+      let legacyCanvasContext = ''
+      let legacyFilesBlock = ''
+
+      const canIngest = Boolean(activeProjectId || projectId)
+      const shouldIngest = referenceFiles.length > 0 || includeCanvasContext
+
+      if (canIngest && shouldIngest) {
+        try {
+          const ingestion = await ingestProjectContext({
+            projectId: activeProjectId || projectId,
+            referenceFiles,
+            includeCanvas: includeCanvasContext,
+          })
+          const ingestionContext = String(ingestion?.questioning_context_markdown || '').trim()
+          if (ingestionContext) {
+            payloadInput = `${payloadInput}\n\n${ingestionContext}`
+            const fileCount = Array.isArray(ingestion?.file_results) ? ingestion.file_results.length : 0
+            const hasCanvas = Boolean(ingestion?.canvas_result)
+            const details = [
+              fileCount > 0 ? `${fileCount} file${fileCount === 1 ? '' : 's'}` : '',
+              hasCanvas ? 'canvas' : '',
+            ].filter(Boolean).join(' + ')
+            setIngestionHint(details ? `Ingestion context attached (${details})` : 'Ingestion context attached')
+          }
+        } catch {
+          // fallback path below keeps existing behavior if ingestion is unavailable
+        }
+      }
 
       if (includeCanvasContext && (activeProjectId || projectId)) {
         const canvasPayload = await loadCanvas({ projectId: activeProjectId || projectId })
         const canvasContext = exportCanvasAsContext(canvasPayload?.canvas_data)
         if (canvasContext) {
-          payloadInput = `${payloadInput}\n\n${canvasContext}`
+          legacyCanvasContext = canvasContext
         }
       }
 
       if (referenceFiles.length > 0) {
-        const filesBlock = [
+        legacyFilesBlock = [
           'Reference files:',
           ...referenceFiles.map((file) => `- ${file.filename}: ${file.url}`),
         ].join('\n')
-        payloadInput = `${payloadInput}\n\n${filesBlock}`
+      }
+
+      const hasIngestionContext = payloadInput.includes('INGESTION CONTEXT (AUTO-GENERATED):')
+      if (!hasIngestionContext) {
+        if (legacyCanvasContext) {
+          payloadInput = `${payloadInput}\n\n${legacyCanvasContext}`
+        }
+        if (legacyFilesBlock) {
+          payloadInput = `${payloadInput}\n\n${legacyFilesBlock}`
+        }
       }
 
       setLastUserIntent(payloadInput)
@@ -541,6 +581,10 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
                     </span>
                   ))}
                 </div>
+              ) : null}
+
+              {ingestionHint ? (
+                <p className="mt-2 text-[11px] text-primary/80">✓ {ingestionHint}</p>
               ) : null}
             </form>
 

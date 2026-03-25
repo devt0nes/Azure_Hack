@@ -3,13 +3,14 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import Depends, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 import backend_platform
+from ingestion_service import build_ingestion_context
 
 
 app = backend_platform.app
@@ -17,6 +18,16 @@ app = backend_platform.app
 
 class CanvasUpdateRequest(BaseModel):
 	canvas_data: Any
+
+
+class ReferenceFileItem(BaseModel):
+	filename: str
+	url: str
+
+
+class IngestionContextRequest(BaseModel):
+	reference_files: List[ReferenceFileItem] = []
+	include_canvas: bool = False
 
 
 def _decode_jwt_payload(token: str) -> Dict[str, Any]:
@@ -167,6 +178,36 @@ async def get_canvas_asset(project_id: str, filename: str):
 		raise HTTPException(status_code=404, detail="Canvas asset not found")
 
 	return FileResponse(candidate)
+
+
+@app.post("/api/projects/{project_id}/ingestion/context", tags=["Ingestion"])
+async def generate_project_ingestion_context(
+	project_id: str,
+	request: IngestionContextRequest,
+	current_user: Dict[str, Any] = Depends(get_current_user),
+):
+	project = assert_project_owner(project_id, current_user)
+
+	context = build_ingestion_context(
+		repo_root=backend_platform.REPO_ROOT,
+		project_id=project_id,
+		reference_files=[item.model_dump() for item in request.reference_files],
+		include_canvas=bool(request.include_canvas),
+		canvas_data=project.get("canvas_data") if request.include_canvas else None,
+	)
+
+	project["ingestion_context"] = {
+		"generated_at": context.get("generated_at"),
+		"combined_summary": context.get("combined_summary"),
+		"task_ledger_seeds": context.get("task_ledger_seeds") or [],
+		"file_count": len(context.get("file_results") or []),
+		"has_canvas": bool(context.get("canvas_result")),
+		"persisted_files": context.get("persisted_files") or {},
+	}
+	project["updated_at"] = datetime.utcnow().isoformat()
+	backend_platform.store._save()
+
+	return context
 
 
 __all__ = ["app", "get_current_user", "assert_project_owner"]

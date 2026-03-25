@@ -118,6 +118,22 @@ export const saveCanvas = ({ projectId, canvasData }) =>
 export const loadCanvas = ({ projectId }) =>
   apiFetch(`/api/projects/${projectId}/canvas`)
 
+export const ingestProjectContext = ({
+  projectId,
+  referenceFiles = [],
+  includeCanvas = false,
+}) =>
+  apiFetch(`/api/projects/${projectId}/ingestion/context`, {
+    method: 'POST',
+    body: JSON.stringify({
+      reference_files: referenceFiles.map((file) => ({
+        filename: file.filename,
+        url: file.url,
+      })),
+      include_canvas: includeCanvas,
+    }),
+  })
+
 export async function uploadCanvasFile({ projectId, file }) {
   requireApiBaseUrl()
   const token = await getToken()
