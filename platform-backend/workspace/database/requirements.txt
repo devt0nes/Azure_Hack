@@ -1,2 +1,0 @@
-# Requirements for migration/seed scripts and UUID support
-psycopg2-binary>=2.9.3

@@ -24,6 +24,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from tooly import ToolRegistry, has_command_failed, is_done
 from issues_tracker import get_issues_tracker
+from template_tools import attach_template_tools
 
 load_dotenv()
 
@@ -1530,7 +1531,10 @@ BUILD FAST. COORDINATE ON LAYER BLACKBOARD. END WITH [READY_FOR_VERIFICATION].""
         # Wrap in CWD-aware registry, pass workspace root
         workspace_root = os.path.dirname(allowed_root)
         self.tools_registry = CWDAwareToolRegistry(base_tool_registry, allowed_root, workspace_root)
-        
+
+        # Attach template library tools (search_template + use_template)
+        attach_template_tools(self.tools_registry)
+
         # Build system prompt using plain replacement (no .format), so brace escaping is unnecessary.
         self.system_prompt = self.GENERIC_SYSTEM_PROMPT.replace(
             "{role}", role
