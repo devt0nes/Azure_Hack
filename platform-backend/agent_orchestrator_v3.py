@@ -36,7 +36,46 @@ from urllib.parse import urlparse
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
-import fcntl
+import sys
+import platform
+
+# Cross-platform file locking
+try:
+    import fcntl
+    HAS_FCNTL = True
+except ImportError:
+    HAS_FCNTL = False
+    if platform.system() == "Windows":
+        import msvcrt
+
+def acquire_lock(lock_file):
+    """Cross-platform file lock acquisition"""
+    if HAS_FCNTL:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    elif platform.system() == "Windows":
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            time.sleep(0.1)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+
+def release_lock(lock_file):
+    """Cross-platform file lock release"""
+    if HAS_FCNTL:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    elif platform.system() == "Windows":
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+
+def acquire_shared_lock(lock_file):
+    """Cross-platform shared file lock acquisition"""
+    if HAS_FCNTL:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
+    elif platform.system() == "Windows":
+        # Windows doesn't have shared locks, use exclusive
+        acquire_lock(lock_file)
 
 from general_agent import GeneralAgent, BackendEngineerAgent, FrontendDeveloperAgent, set_blackboard
 from issues_tracker import get_issues_tracker, set_issues_tracker, IssuesTracker
@@ -180,11 +219,11 @@ class LayerBlackboard:
         with self._lock:
             lock_file = open(self.lock_path, "w")
             try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                acquire_lock(lock_file)
                 self.messages.append(entry)
                 self._write_file()
             finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                release_lock(lock_file)
                 lock_file.close()
     
     def read_all(self) -> str:
@@ -192,7 +231,7 @@ class LayerBlackboard:
         with self._lock:
             lock_file = open(self.lock_path, "w")
             try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
+                acquire_shared_lock(lock_file)
                 if not self.messages:
                     return f"Layer {self.layer_number} blackboard is empty."
                 result = f"Layer {self.layer_number} Coordination:\n"
@@ -200,7 +239,7 @@ class LayerBlackboard:
                     result += f"- [{msg['agent']}]: {msg['content']}\n"
                 return result
             finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                release_lock(lock_file)
                 lock_file.close()
 
     def message_count(self) -> int:
@@ -257,7 +296,7 @@ class StructuredBlackboard:
         lock_file = open(lock_path, 'w')
         
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            acquire_lock(lock_file)
             
             entry = {
                 "agent": agent_name,
@@ -270,7 +309,7 @@ class StructuredBlackboard:
             return True
         
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            release_lock(lock_file)
             lock_file.close()
     
     def read_section(self, section: str) -> str:
