@@ -350,6 +350,15 @@ class DatabaseArchitectAgent(GeneralAgent):
 DATABASE ARCHITECT WORKFLOW - GENERIC SCHEMA DESIGN
 ═══════════════════════════════════════════════════════════════════════════════
 
+⚠️  MANDATORY FILES - YOU MUST WRITE ALL OF THESE OR VERIFICATION WILL FAIL:
+  • migrations/schema.sql    ← write_file("migrations/schema.sql", content=<full DDL>)
+  • migrations/seed_data.sql ← write_file("migrations/seed_data.sql", content=<INSERT rows>)
+  • config/db_config.js
+  • config/db_setup.js
+  • README.md
+
+DO NOT emit [READY_FOR_VERIFICATION] until ALL five files above have been written via write_file().
+
 SYSTEM ARCHITECT COMPLIANCE (MANDATORY):
   ✅ Read contracts/backend_api_contract.json and contracts/directory_structure.json first
   ✅ Follow System Architect specifications exactly (no guessing, no drift)
@@ -1655,11 +1664,22 @@ Assigned issues JSON:
 
       return normalized
 
+    _SCAFFOLD_STUBS = {
+      ".sql":  "-- scaffold placeholder: replace with real SQL\n",
+      ".md":   "# Scaffold placeholder\n",
+      ".js":   "// scaffold placeholder\n",
+      ".ts":   "// scaffold placeholder\n",
+      ".py":   "# scaffold placeholder\n",
+      ".json": "{}\n",
+    }
+
     def _touch_file_if_missing(self, abs_path: str) -> None:
       os.makedirs(os.path.dirname(abs_path), exist_ok=True)
       if not os.path.exists(abs_path):
+        ext = os.path.splitext(abs_path)[1].lower()
+        stub = self._SCAFFOLD_STUBS.get(ext, "")
         with open(abs_path, "w", encoding="utf-8") as f:
-          f.write("")
+          f.write(stub)
 
     def _materialize_structure_node(self, base_abs: str, node) -> int:
       """Materialize a directory-structure node from System Architect contract."""
@@ -1798,6 +1818,24 @@ Assigned issues JSON:
       findings = []
       if missing_files:
         findings.append("missing directory-contract files: " + ", ".join(missing_files[:25]))
+
+      # Extra guard: required database migration files must have real content, not just scaffold stubs.
+      CONTENT_REQUIRED = {
+        "database/migrations/schema.sql",
+        "database/migrations/seed_data.sql",
+      }
+      for req_path in CONTENT_REQUIRED & declared:
+        abs_req = os.path.join(WORKSPACE_DIR, req_path)
+        if os.path.exists(abs_req):
+          try:
+            with open(abs_req, "r", encoding="utf-8", errors="ignore") as _f:
+              _content = _f.read().strip()
+            if not _content or _content.startswith("-- scaffold placeholder"):
+              findings.append(
+                f"file exists but contains only scaffold stub (database_architect must write real SQL): {req_path}"
+              )
+          except Exception:
+            pass
 
       return {"ok": len(findings) == 0, "missing": findings}
 
@@ -2046,13 +2084,32 @@ Assigned issues JSON:
       """Hard gate for contract-first orchestration and upstream dependencies."""
       role_norm = (role or "").strip().lower().replace(" ", "_")
       required = self._required_upstream_roles(role_norm)
+
+      # Only enforce prerequisites for roles that are actually in the plan.
+      # If backend_engineer was intentionally excluded (e.g. pure frontend project),
+      # it should not block frontend_engineer from starting.
+      planned_roles = set()
+      try:
+        spec = (self.ledger or {}).get("agent_specifications", {}) if isinstance(self.ledger, dict) else {}
+        raw_agents = spec.get("required_agents", []) or []
+        for a in raw_agents:
+          if isinstance(a, str):
+            planned_roles.add(a.strip().lower().replace(" ", "_"))
+          elif isinstance(a, dict):
+            r = a.get("role") or a.get("agent_name") or ""
+            planned_roles.add(r.strip().lower().replace(" ", "_"))
+      except Exception:
+        pass  # If we can't read the ledger, fall through to normal enforcement
+
       coexecuting_roles = {
         str(r or "").strip().lower().replace(" ", "_")
         for r in (current_layer_roles or [])
       }
       missing_upstream = [
         r for r in required
-        if r not in self.completed_workspaces and r not in coexecuting_roles
+        if r not in self.completed_workspaces
+        and r not in coexecuting_roles
+        and (not planned_roles or r in planned_roles)  # skip if not in plan
       ]
       if missing_upstream:
         raise RuntimeError(
@@ -3431,6 +3488,12 @@ Assigned issues JSON:
           f"{base}/requirements.txt",
           f"{base}/pyproject.toml",
         })
+        # Always permit the required database migration files so retries can write real content.
+        if base == "database":
+          allowed_new.update({
+            f"{base}/migrations/schema.sql",
+            f"{base}/migrations/seed_data.sql",
+          })
 
       tr.retry_allowed_new_paths = allowed_new
       tr.max_writes_per_file = min(int(getattr(tr, "max_writes_per_file", 6) or 6), 2)

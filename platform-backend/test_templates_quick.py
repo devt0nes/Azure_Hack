@@ -35,7 +35,8 @@ use_result = r.execute_tool(
     "use_template",
     {
         "template_id": template_id,
-        "destination_path": "/workspace/frontend/sidebar.jsx"
+        "target_path": "/workspace/frontend/test_file.jsx",
+        "line_number": 100
     }
 )
 
@@ -63,7 +64,7 @@ elif "warning" in use_result:
 
 elif use_result.get("success"):
     print("\n✅ TEMPLATE WRITTEN SUCCESSFULLY")
-    print("📁 Path:", use_result.get("destination_path"))
+    print("📁 Path:", use_result.get("target_path") or use_result.get("destination_path"))
 
 else:
     print("\n⚠️ Unexpected response:\n", use_result)
