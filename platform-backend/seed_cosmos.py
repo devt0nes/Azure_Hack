@@ -146,15 +146,26 @@ def main():
     print(f"  Container : {CONTAINER}  ✓\n")
 
     inserted = 0
+    skipped = 0
     for agent in AGENTS:
         try:
+            # Try to read the existing document first
+            existing = container.read_item(item=agent["id"], partition_key=agent["agent_id"])
+            # Document exists — only update non-score fields, preserve live reputation_score
+            live_score = existing.get("reputation_score", agent["reputation_score"])
+            updated = {**agent, "reputation_score": live_score}
+            container.upsert_item(updated)
+            print(f"  ↺  Updated  {agent['id']}  (reputation_score preserved: {live_score})")
+            skipped += 1
+        except exceptions.CosmosResourceNotFoundError:
+            # Document doesn't exist yet — insert with initial score
             container.upsert_item(agent)
-            print(f"  ✓  Upserted  {agent['id']}")
+            print(f"  ✓  Inserted  {agent['id']}  (initial reputation_score: {agent['reputation_score']})")
             inserted += 1
         except exceptions.CosmosHttpResponseError as e:
             print(f"  ✗  Failed   {agent['id']}  →  {e.message}")
 
-    print(f"\nDone – {inserted}/{len(AGENTS)} agents seeded into {DB_NAME}/{CONTAINER}")
+    print(f"\nDone – {inserted} inserted, {skipped} updated (scores preserved) out of {len(AGENTS)} agents in {DB_NAME}/{CONTAINER}")
 
 
 if __name__ == "__main__":
