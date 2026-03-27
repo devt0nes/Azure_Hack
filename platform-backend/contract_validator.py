@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, List, Set, Tuple, Any
+from typing import Dict, List, Set, Tuple, Any, Optional
 
 
 class ContractValidationError(Exception):
@@ -65,6 +65,69 @@ def _extract_backend_routes(api_contract: Dict[str, Any]) -> Set[str]:
                     routes.add(f"{m.upper()} {_normalize_api_path(str(raw_path))}")
 
     return routes
+
+
+def _validate_backend_smoke_policy(api_contract: Dict[str, Any]) -> Tuple[bool, str]:
+    """Require explicit smoke-test policy for every backend endpoint.
+
+    Supported fields per endpoint/operation:
+      - smoke_test: bool
+      - smoke_test: {"enabled": bool, ...}
+      - smoke_test_enabled: bool
+      - x-smoke-test-enabled: bool (OpenAPI operation extension)
+    """
+    if not isinstance(api_contract, dict):
+        return False, "backend_api_contract.json is invalid"
+
+    def _has_policy(obj: Dict[str, Any]) -> bool:
+        if not isinstance(obj, dict):
+            return False
+        if isinstance(obj.get("smoke_test"), bool):
+            return True
+        if isinstance(obj.get("smoke_test"), dict) and isinstance(obj.get("smoke_test", {}).get("enabled"), bool):
+            return True
+        if isinstance(obj.get("smoke_test_enabled"), bool):
+            return True
+        if isinstance(obj.get("x-smoke-test-enabled"), bool):
+            return True
+        return False
+
+    missing: List[str] = []
+
+    endpoints = api_contract.get("endpoints")
+    if isinstance(endpoints, list) and endpoints:
+        for idx, ep in enumerate(endpoints, 1):
+            if not isinstance(ep, dict):
+                continue
+            method = str(ep.get("method", "")).strip().upper() or "?"
+            path = str(ep.get("path", "")).strip() or "?"
+            route = str(ep.get("route", "")).strip()
+            label = route if route else f"{method} {path}".strip()
+            if not _has_policy(ep):
+                missing.append(f"endpoints[{idx}] {label}")
+
+    paths = api_contract.get("paths")
+    allowed_methods = {"get", "post", "put", "patch", "delete", "head", "options"}
+    if isinstance(paths, dict):
+        for raw_path, path_item in paths.items():
+            if not isinstance(path_item, dict):
+                continue
+            for method in path_item.keys():
+                m = str(method).lower().strip()
+                if m not in allowed_methods:
+                    continue
+                op_obj = path_item.get(m) if isinstance(path_item, dict) else {}
+                if not isinstance(op_obj, dict) or not _has_policy(op_obj):
+                    missing.append(f"paths.{raw_path}.{m}")
+
+    if missing:
+        preview = ", ".join(missing[:8]) + (" ..." if len(missing) > 8 else "")
+        return False, (
+            "backend_api_contract.json must declare smoke_test policy for every endpoint/operation "
+            f"(missing: {preview})"
+        )
+
+    return True, ""
 
 
 def _extract_frontend_routes(route_contract: Dict[str, Any]) -> Set[str]:
@@ -205,10 +268,10 @@ class ContractValidator:
     - duplicate route detection for backend/frontend contracts
     """
 
-    def __init__(self, api_contract: Dict[str, Any], route_contract: Dict[str, Any], directory_contract: Dict[str, Any]):
+    def __init__(self, api_contract: Dict[str, Any], route_contract: Dict[str, Any], directory_contract: Optional[Dict[str, Any]] = None):
         self.api = api_contract
         self.routes = route_contract
-        self.directory = directory_contract
+        self.directory = directory_contract or {}
 
     def validate_all(self) -> Dict[str, Any]:
         backend_routes = _extract_backend_routes(self.api)
@@ -216,6 +279,10 @@ class ContractValidator:
             raise ContractValidationError(
                 "backend_api_contract.json has no usable routes (expected endpoints[] with route or method+path, or OpenAPI paths{})"
             )
+
+        smoke_ok, smoke_err = _validate_backend_smoke_policy(self.api)
+        if not smoke_ok:
+            raise ContractValidationError(smoke_err)
 
         if len(backend_routes) != len(set(backend_routes)):
             raise ContractValidationError("backend_api_contract.json contains duplicate routes")
@@ -230,46 +297,17 @@ class ContractValidator:
             raise ContractValidationError("frontend_route_contract.json contains duplicate routes")
 
         sections = _normalize_directory_structure_sections(self.directory)
-        if not isinstance(sections, dict) or not sections:
-            raise ContractValidationError(
-                "directory_structure.json is empty or invalid (expected object root or {\"structure\": {...}})"
-            )
-
-        missing_sections = [s for s in ["backend", "frontend", "database"] if s not in sections]
-        if missing_sections:
-            raise ContractValidationError(
-                "directory_structure.json missing required top-level sections: " + ", ".join(missing_sections)
-            )
-
         declared_files = set()
-        for section, rel_files in sections.items():
-            for rel in rel_files:
-                declared_files.add(f"{section}/{rel}".strip("/"))
-        if not declared_files:
-            raise ContractValidationError("directory_structure.json declares no files")
-
-        for section in ["backend", "frontend", "database"]:
-            if len(sections.get(section, [])) == 0:
-                raise ContractValidationError(
-                    f"directory_structure.json section '{section}' declares no files"
-                )
-
-        required_database_files = {
-            "database/migrations/schema.sql",
-            "database/migrations/seed_data.sql",
-            "database/README.md",
-        }
-        missing_database_files = sorted(required_database_files - declared_files)
-        if missing_database_files:
-            raise ContractValidationError(
-                "directory_structure.json missing required database files: "
-                + ", ".join(missing_database_files)
-            )
+        if isinstance(sections, dict) and sections:
+            for section, rel_files in sections.items():
+                for rel in rel_files:
+                    declared_files.add(f"{section}/{rel}".strip("/"))
 
         return {
             "ok": True,
             "backend_route_count": len(backend_routes),
             "frontend_route_count": len(frontend_routes),
+            "directory_contract_checked": bool(isinstance(sections, dict) and sections),
             "declared_file_count": len(declared_files),
         }
 
@@ -284,14 +322,19 @@ def validate_system_architect_contracts(
     backend_rel: str = "contracts/backend_api_contract.json",
     frontend_rel: str = "contracts/frontend_route_contract.json",
     directory_rel: str = "contracts/directory_structure.json",
+    require_directory: bool = False,
 ) -> Dict[str, Any]:
     try:
         backend_path = os.path.join(workspace_dir, backend_rel)
         frontend_path = os.path.join(workspace_dir, frontend_rel)
         directory_path = os.path.join(workspace_dir, directory_rel)
 
+        required_paths = [(backend_path, backend_rel), (frontend_path, frontend_rel)]
+        if require_directory:
+            required_paths.append((directory_path, directory_rel))
+
         missing = []
-        for p, rel in [(backend_path, backend_rel), (frontend_path, frontend_rel), (directory_path, directory_rel)]:
+        for p, rel in required_paths:
             if not os.path.exists(p):
                 missing.append(rel)
         if missing:
@@ -299,7 +342,7 @@ def validate_system_architect_contracts(
 
         api = load_json(backend_path)
         routes = load_json(frontend_path)
-        directory = load_json(directory_path)
+        directory = load_json(directory_path) if os.path.exists(directory_path) else {}
 
         validator = ContractValidator(api, routes, directory)
         details = validator.validate_all()

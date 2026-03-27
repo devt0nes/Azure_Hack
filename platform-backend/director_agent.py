@@ -275,6 +275,15 @@ class TaskLedger:
             "user_intent": user_intent,
             "project_name": "",
             "project_description": "",
+            "ui_preferences": {
+                "style_theme": "",
+                "brand_tone": "",
+                "primary_colors": [],
+                "layout_preferences": [],
+                "animation_level": "full",
+                "accessibility_preferences": [],
+                "notes": ""
+            },
             "functional_requirements": [],
             "non_functional_requirements": {
                 "performance": "Standard",
@@ -525,10 +534,13 @@ class LedgerTools:
             warnings = []
             
             # Check required fields
-            required_fields = ["project_id", "user_intent", "agent_specifications"]
+            required_fields = ["project_id", "user_intent", "agent_specifications", "ui_preferences"]
             for field in required_fields:
                 if field not in data:
                     errors.append(f"Missing required field: {field}")
+
+            if "ui_preferences" in data and not isinstance(data.get("ui_preferences"), dict):
+                errors.append("ui_preferences must be an object")
             
             # Validate agent specifications
             if "agent_specifications" in data:
@@ -816,6 +828,7 @@ CONSISTENCY RULES:
 - The first agent and layer must be the system_architect, always
 - Minimize agent count (quality over quantity)
 - Match technology stack to requirements
+- Populate ui_preferences with user-facing design direction (theme, tone, colors, layout and accessibility preferences).
 - Populate feature_catalog with ALL expected product features/capabilities.
 - Populate layer_onboarding with one entry per layer. Each entry must include:
     • layer_index
@@ -942,6 +955,7 @@ CRITICAL RULES:
 ✓ Prefer agent_specifications.layers and minimize total layers by parallelizing where sensible
 ✓ Put heavily blocked/waiting agents in later layers; keep decently coordinating agents together
 ✓ Ensure every required agent role appears exactly once in layers
+✓ Populate ui_preferences with concrete UX/UI direction from user intent and clarifications
 ✓ Populate feature_catalog with ALL expected project features/capabilities
 ✓ Populate layer_onboarding with one detailed onboarding entry per execution layer
 ✓ In layer_onboarding, specify WHAT each layer must deliver, per-role expectations, and next-stage readiness outputs
@@ -1091,7 +1105,8 @@ Ask exactly 3 simple, clear questions to better understand the project requireme
 REQUIREMENTS:
 - Ask exactly 3 questions (no more, no less)
 - Keep questions simple and specific
-- Focus on: scope, timeline, budget/constraints, or specific features
+- Ensure at least one question captures UI preferences (style, color palette, interaction/animation, accessibility)
+- Focus on: scope, timeline, budget/constraints, specific features, and UI preferences
 - Return ONLY a JSON object with this exact structure:
 
 {{
@@ -1111,8 +1126,7 @@ Project intent: {ledger.data['user_intent']}"""
     ]
     
     _throttle_model_call()
-    response = agent.client.chat.completions.create(
-        model=AZURE_MODEL_DEPLOYMENT,
+    response = agent._create_chat_completion(
         messages=messages,
         response_format={"type": "json_object"},
         temperature=0.7
@@ -1208,6 +1222,23 @@ def execute_agent(task):
         if not ledger.data.get("feature_catalog"):
             ledger.data["feature_catalog"] = list(ledger.data.get("functional_requirements", []))
 
+        # Ensure ui_preferences exists and has stable schema defaults.
+        ui_defaults = {
+            "style_theme": "",
+            "brand_tone": "",
+            "primary_colors": [],
+            "layout_preferences": [],
+            "animation_level": "moderate",
+            "accessibility_preferences": [],
+            "notes": ""
+        }
+        if not isinstance(ledger.data.get("ui_preferences"), dict):
+            ledger.data["ui_preferences"] = dict(ui_defaults)
+        else:
+            for k, v in ui_defaults.items():
+                if k not in ledger.data["ui_preferences"]:
+                    ledger.data["ui_preferences"][k] = v
+
         # Ensure workspace layout exists and is production-structured.
         workspace_layout = ledger.data.get("workspace_layout")
         if not isinstance(workspace_layout, dict):
@@ -1269,12 +1300,14 @@ def execute_agent(task):
                 "project_context": {
                     "project_name": ledger.data.get("project_name", ""),
                     "project_description": ledger.data.get("project_description", ""),
-                    "functional_features": list(ledger.data.get("feature_catalog", []) or ledger.data.get("functional_requirements", []))
+                    "functional_features": list(ledger.data.get("feature_catalog", []) or ledger.data.get("functional_requirements", [])),
+                    "ui_preferences": dict(ledger.data.get("ui_preferences", {}))
                 },
                 "objective": f"Deliver layer {idx} outcomes for roles: {', '.join(layer_roles)}",
                 "required_outcomes": [
                     "Implement all functional outcomes assigned to this layer.",
                     "Produce code artifacts in production-style paths under workspace/ (not role-named folders).",
+                    "Respect and implement ui_preferences in all user-facing deliverables.",
                 ],
                 "role_expectations": [
                     f"{role}: deliver role responsibilities with clear file-level outputs in {', '.join((workspace_layout.get('role_output_roots', {}).get(role, [role])))} and assumptions documented"
@@ -1360,6 +1393,13 @@ def execute_agent(task):
                         f.write("- Expected features for overall project:\n")
                         for feat in features:
                             f.write(f"  - {feat}\n")
+                    ui_prefs = project_context.get("ui_preferences", {}) if isinstance(project_context.get("ui_preferences", {}), dict) else {}
+                    if ui_prefs:
+                        f.write("- UI preferences:\n")
+                        for key, value in ui_prefs.items():
+                            if isinstance(value, list):
+                                value = ", ".join([str(x) for x in value])
+                            f.write(f"  - {key}: {value}\n")
                     f.write("\n")
 
                 layout = ledger.data.get("workspace_layout", {}) if isinstance(ledger.data.get("workspace_layout", {}), dict) else {}

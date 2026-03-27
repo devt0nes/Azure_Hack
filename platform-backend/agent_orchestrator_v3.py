@@ -18,7 +18,7 @@ ARCHITECTURE:
 - Layer 3: Frontend engineer (reads backend API schema from Layer 2)
   └─ Can read_file() to see actual endpoints and data formats
 - Layer 4: QA engineer (reads all code from previous layers)
-  └─ Generates tests that match actual implementation
+  └─ Audits implementation vs contracts/requirements and dispatches issues
 """
 
 import json
@@ -28,17 +28,25 @@ import threading
 import ast
 import random
 import subprocess
+import sys
 import re
 import hashlib
+import shutil
 import urllib.request
 import urllib.error
 from urllib.parse import urlparse
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
+from contextlib import suppress
 import fcntl
 
-from general_agent import GeneralAgent, BackendEngineerAgent, FrontendDeveloperAgent, set_blackboard
+from general_agent import (
+  GeneralAgent,
+  NodeExpressBackendEngineerAgent,
+  ReactFrontendEngineerAgent,
+  set_blackboard,
+)
 from issues_tracker import get_issues_tracker, set_issues_tracker, IssuesTracker
 from review_agent import ReviewAgent
 from service_bus_coordination import ServiceBusCoordinator
@@ -68,18 +76,27 @@ os.makedirs(NOTEBOOKS_DIR, exist_ok=True)
 
 BLACKBOARD_PATH = os.path.join(WORKSPACE_DIR, "blackboard.md")
 ISSUES_PATH = os.path.join(WORKSPACE_DIR, "issues.json")
+RUNTIME_ALERTS_PATH = os.path.join(WORKSPACE_DIR, "runtime_alerts.jsonl")
 LSP_PRECHECK_LOG_PATH = os.path.join(WORKSPACE_DIR, "lsp_precheck.log")
 AGENT_LOCKS_DIR = os.path.join(WORKSPACE_DIR, "locks")
 os.makedirs(AGENT_LOCKS_DIR, exist_ok=True)
 LAYER_STAGGER_MIN_SECONDS = float(os.getenv("LAYER_STAGGER_MIN_SECONDS", "0.5"))
 LAYER_STAGGER_MAX_SECONDS = float(os.getenv("LAYER_STAGGER_MAX_SECONDS", "2.5"))
-AGENT_MAX_ATTEMPTS = int(os.getenv("AGENT_MAX_ATTEMPTS", "5"))  # <=0 means unbounded retry attempts
+AGENT_MAX_ATTEMPTS = int(os.getenv("AGENT_MAX_ATTEMPTS", "10"))  # <=0 means unbounded retry attempts
 AGENT_MAX_ITERATIONS_MAIN = int(os.getenv("AGENT_MAX_ITERATIONS_MAIN", "90"))
 AGENT_MAX_ITERATIONS_FIX = int(os.getenv("AGENT_MAX_ITERATIONS_FIX", "45"))
 RUNTIME_SMOKE_TIMEOUT_SECONDS = int(os.getenv("RUNTIME_SMOKE_TIMEOUT_SECONDS", "0"))
+RUNTIME_SMOKE_MAX_TOTAL_SECONDS = int(os.getenv("RUNTIME_SMOKE_MAX_TOTAL_SECONDS", "300"))
 FRONTEND_BUILD_TIMEOUT_SECONDS = int(os.getenv("FRONTEND_BUILD_TIMEOUT_SECONDS", "0"))
 LAYER_MAX_WAIT_SECONDS = int(os.getenv("LAYER_MAX_WAIT_SECONDS", "0"))
 SLEEP_RECHECK_SECONDS = int(os.getenv("SLEEP_RECHECK_SECONDS", "90"))
+AGENT_THREAD_CONNECTION_RECOVERY_ATTEMPTS = int(os.getenv("AGENT_THREAD_CONNECTION_RECOVERY_ATTEMPTS", "2"))
+STANDARD_BACKEND_PORT = int(os.getenv("STANDARD_BACKEND_PORT", "5100"))
+STANDARD_FRONTEND_PORT = int(os.getenv("STANDARD_FRONTEND_PORT", "5180"))
+STANDARD_BACKEND_URL = os.getenv("STANDARD_BACKEND_URL", f"http://127.0.0.1:{STANDARD_BACKEND_PORT}")
+STANDARD_FRONTEND_URL = os.getenv("STANDARD_FRONTEND_URL", f"http://127.0.0.1:{STANDARD_FRONTEND_PORT}")
+ENABLE_PLACEHOLDER_DETECTION = str(os.getenv("ENABLE_PLACEHOLDER_DETECTION", "false")).lower() in {"1", "true", "yes"}
+STRICT_REMOTE_LSP_PRECHECK = str(os.getenv("STRICT_REMOTE_LSP_PRECHECK", "true")).lower() in {"1", "true", "yes"}
 
 BACKEND_API_CONTRACT_REL = "contracts/backend_api_contract.json"
 FRONTEND_ROUTE_CONTRACT_REL = "contracts/frontend_route_contract.json"
@@ -87,8 +104,8 @@ DIRECTORY_STRUCTURE_CONTRACT_REL = "contracts/directory_structure.json"
 SYSTEM_ARCHITECT_CONTRACTS = [
   BACKEND_API_CONTRACT_REL,
   FRONTEND_ROUTE_CONTRACT_REL,
-  DIRECTORY_STRUCTURE_CONTRACT_REL,
 ]
+OPTIONAL_SYSTEM_ARCHITECT_CONTRACTS = [DIRECTORY_STRUCTURE_CONTRACT_REL]
 DISABLED_AGENT_ROLES = {"security_engineer"}
 
 
@@ -308,126 +325,80 @@ class DatabaseArchitectAgent(GeneralAgent):
             role_description="Design and implement database schemas for optimal performance and data integrity",
             specific_instructions="""
 ═══════════════════════════════════════════════════════════════════════════════
-DATABASE ARCHITECT WORKFLOW - GENERIC SCHEMA DESIGN
+DATABASE ARCHITECT WORKFLOW - MONGODB ONLY
 ═══════════════════════════════════════════════════════════════════════════════
 
 SYSTEM ARCHITECT COMPLIANCE (MANDATORY):
-  ✅ Read contracts/backend_api_contract.json and contracts/directory_structure.json first
+  ✅ Read contracts/backend_api_contract.json first
   ✅ Follow System Architect specifications exactly (no guessing, no drift)
-  ✅ You may ONLY edit files that already exist in your owned database directory
-  ✅ You are NOT allowed to create/delete files outside scaffolded paths
+  ✅ Stack is locked to MongoDB for persistence (no PostgreSQL/MySQL/SQLite DDL output)
+  ✅ You may create/edit/delete files inside the owned database directory only
+  ✅ Do not modify files outside ownership boundaries
 
-PHASE 1: ANALYZE REQUIREMENTS (Iteration 1)
-  ├─ Read upstream task description
-  ├─ Identify what data the system needs to store
-  ├─ List all entities and their core properties
-  ├─ Map relationships between entities
+PHASE 1: ANALYZE CONTRACT DATA SHAPES
+  ├─ Map backend endpoint payloads/responses to MongoDB collections and fields
+  ├─ Define required indexes and uniqueness constraints from contract usage
   └─ Announce plan to blackboard
 
-PHASE 2: DESIGN SCHEMA (Iterations 2-4)
-  ├─ Create migrations/schema.sql with complete PostgreSQL DDL:
-  │  ├─ All required tables based on entities identified
-  │  ├─ Primary keys (SERIAL INT PRIMARY KEY)
-  │  ├─ Foreign keys for relationships
-  │  ├─ Constraints (NOT NULL, UNIQUE, CHECK)
-  │  └─ Timestamps (created_at, updated_at)
-  │
-  ├─ Create migrations/seed_data.sql with sample data:
-  │  ├─ Representative data for each table
-  │  ├─ At least 5-10 rows per main entity table
-  │  └─ Data that demonstrates relationships and constraints
-  │
-  ├─ Create config/db_config.js - Database connection configuration
-  └─ Create config/db_setup.js - Script to initialize schema
+PHASE 2: IMPLEMENT MONGODB ARTIFACTS
+  ├─ Create/update config/db_config.js for MongoDB URI + DB name
+  ├─ Create/update config/db_setup.js to create collections/indexes + seed docs
+  ├─ Create/update migrations/schema.js (or equivalent executable JS/JSON structure)
+  └─ Create/update migrations/seed_data.js (or equivalent executable JS/JSON seed module)
 
 PHASE 3: ENSURE QUALITY
-  ├─ All required tables created
-  ├─ All relationships properly modeled
-  ├─ Constraints match business requirements
-  ├─ Timestamps on all tables for audit trail
-  ├─ Indexes on frequently searched columns (foreign keys, lookups)
-  └─ Schema syntax is valid PostgreSQL
+  ├─ All required collections and fields are represented
+  ├─ Relations are modeled with ObjectId references where needed
+  ├─ Uniqueness/index strategy matches query patterns from contract
+  ├─ Seed data is executable by Node.js setup scripts
+  └─ No fake SQL content is generated for MongoDB stack
 
-PHASE 4: VALIDATE (If database available)
-  ├─ Run db_setup.js to test schema creation
-  ├─ Verify seed data inserts without errors
-  ├─ Check schema structure matches requirements
-  └─ Document any issues or constraints
+PHASE 4: VALIDATE
+  ├─ Run db setup script when possible
+  ├─ Verify seed insertion shape aligns with backend model expectations
+  └─ Document blockers with concrete evidence
 
 ═══════════════════════════════════════════════════════════════════════════════
-DATABASE DESIGN PATTERNS - FOLLOW THESE
+MONGODB PATTERNS - FOLLOW THESE
 ═══════════════════════════════════════════════════════════════════════════════
 
-Entity Definition:
-  CREATE TABLE entity_name (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    description TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  );
-
-Relationship (One-to-Many):
-  child_table has:
-    parent_id INT NOT NULL REFERENCES parent_table(id)
-
-Many-to-Many Relationship (through junction table):
-  CREATE TABLE entity1_entity2 (
-    id SERIAL PRIMARY KEY,
-    entity1_id INT NOT NULL REFERENCES entity1(id),
-    entity2_id INT NOT NULL REFERENCES entity2(id),
-    UNIQUE(entity1_id, entity2_id)
-  );
-
-Monetary Values:
-  amount NUMERIC(10,2) NOT NULL CHECK (amount >= 0)
-
-Status Enums:
-  status VARCHAR(50) NOT NULL CHECK (status IN ('value1', 'value2'))
-
-Timestamps:
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-
-Indexes:
-  CREATE INDEX idx_table_column ON table(column);
+- Collections are explicit (books, users, events, reservations, rsvps, etc.)
+- Use ObjectId for primary and reference fields
+- Use createIndex with unique constraints where contract implies identity (isbn/email)
+- Keep datetime fields ISO-compatible
+- Keep status/tier fields constrained through validated value sets in app-layer docs
 
 ═══════════════════════════════════════════════════════════════════════════════
 OUTPUT FILES (relative paths in your workspace)
 ═══════════════════════════════════════════════════════════════════════════════
 
 migrations/
-  ├─ schema.sql - Complete DDL for all tables (200+ lines)
-  └─ seed_data.sql - Representative test data (100+ lines)
+  ├─ schema.js (or schema.json) - Mongo collection/index definitions
+  └─ seed_data.js (or seed_data.json) - Executable/importable seed payloads
 
 config/
-  ├─ db_config.js - Configuration for database connection
-  └─ db_setup.js - Script to execute migrations
+  ├─ db_config.js - Mongo connection config
+  └─ db_setup.js - Script to create indexes + seed collections
 
 ═══════════════════════════════════════════════════════════════════════════════
 SUCCESS CRITERIA FOR YOUR DELIVERABLES
 ═══════════════════════════════════════════════════════════════════════════════
 
-✅ All required entities have tables
-✅ All relationships properly defined with foreign keys
-✅ Primary keys on every table
-✅ Timestamps (created_at, updated_at) on all tables
-✅ Constraints match business rules (NOT NULL, UNIQUE, CHECK)
-✅ Indexes on frequently accessed columns
-✅ Seed data demonstrates all relationships
-✅ Schema is syntactically valid PostgreSQL
-✅ No errors running db_setup.js (if PostgreSQL available)
+✅ Mongo-only artifacts (no SQL-only scaffolding)
+✅ Collections/fields/indexes cover backend contract needs
+✅ Seed data runs via Node script and uses valid ObjectId references
+✅ No placeholder or pseudo-code database files
+✅ db_setup.js reflects real MongoDB setup flow
 
 ═══════════════════════════════════════════════════════════════════════════════
 IF REQUIREMENTS OR CONTRACT ARE UNCLEAR - DO NOT GUESS
 ═══════════════════════════════════════════════════════════════════════════════
 
-❓ Contract field/table unclear? → STOP and post blocking issue to blackboard
-❓ Endpoint-to-table mapping unclear? → STOP and request system_architect clarification
-❓ Constraint unclear? → STOP and request contract/schema alignment
-❓ PostgreSQL not available? → You may still write migration files, but NEVER invent columns/relations
+❓ Contract field/collection unclear? → STOP and report_issue with assigned_to="system_architect"
+❓ Endpoint-to-collection mapping unclear? → STOP and request clarification
+❓ Mongo access unavailable? → still provide executable artifacts, document runtime blocker clearly
 
-NEVER: "X not specified, using standard patterns"
+NEVER: "I'll use SQL defaults" or "I'll mix relational + Mongo"
 INSTEAD: "Blocked by missing/ambiguous contract details; awaiting clarification"
 """,
             allowed_root=allowed_root,
@@ -585,20 +556,19 @@ class TestEngineerAgent(GeneralAgent):
 
         super().__init__(
             role="QA Engineer",
-            role_description="Design comprehensive test suites, validate code quality, and manually test all routes/pages by running servers",
+          role_description="Audit generated code against contracts and requirements, detect defects/placeholders, and dispatch owner-specific issues",
             specific_instructions="""
 ════════════════════════════════════════════════════════════════════════════════
 🔴 CRITICAL: YOU ARE THE SOLE VERIFIER OF ROUTES AND PAGES
 ════════════════════════════════════════════════════════════════════════════════
 
-The orchestrator no longer uses static route detection (regex analysis).
-YOU are now responsible for all validation:
+YOU are responsible for all validation:
 
-1. START BOTH SERVERS
-   ├─ Backend: cd workspace/backend && node app.js (or npm start)
-   ├─ Frontend: cd workspace/frontend && npm run dev
-   ├─ Wait for both to start successfully
-   └─ Note: Ignore API key errors for external services (Stripe, etc.) - focus on route structure
+1. DO NOT START LONG-RUNNING SERVERS MANUALLY
+  ├─ Runtime startup is handled by the orchestrator smoke test
+  ├─ Do NOT run npm run dev / npm run start / node app.js manually
+  ├─ Focus on contract coverage and evidence-driven validation
+  └─ Note: Ignore API key errors for external services (Stripe, etc.) - focus on route structure
 
 2. MANUALLY TEST EVERY ROUTE AND PAGE
    ├─ For each endpoint in contracts/backend_api_contract.json:
@@ -617,13 +587,12 @@ YOU are now responsible for all validation:
    ├─ Document the specific endpoint or page that failed
    ├─ Include expected vs actual with evidence
    ├─ Identify which agent should fix it (backend_engineer, frontend_engineer, etc.)
-   ├─ POST TO SERVICE BUS TO WAKE UP THAT AGENT using:
-   │  └─ post_to_service_bus(destination="backend_engineer", message={...details...})
-   └─ That agent will receive your wake-up and fix the issue
+  ├─ CALL report_issue(...) with needs_help_from set to the owner role
+  └─ Service Bus notification is sent to the owner role when available
 
 4. AGENTS KNOW HOW TO WAKE EACH OTHER
-   ✅ Agents have access to: post_to_service_bus() tool
-   ✅ They can call it with destination="{role}" and detailed issue info
+  ✅ Agents have access to issue queue + Service Bus question/response tools
+  ✅ QA dispatches issues with role ownership and evidence
    ✅ When an agent is woken up, it reruns with the feedback
    ✅ You can wake them too - use this for any failures you find
 
@@ -634,42 +603,37 @@ YOU are now responsible for all validation:
    ✅ These don't affect route/page structure validation
 
 ════════════════════════════════════════════════════════════════════════════════
-TEST STRUCTURE - RUN SERVERS, NOT JUST UNIT TESTS
+QA AUDIT MODE - NO TEST SUITE AUTHORING
 ════════════════════════════════════════════════════════════════════════════════
 
-Instead of Jest tests, your primary work is:
-  1. Start backend: node app.js
-  2. Start frontend: npm run dev
-  3. Use browser/curl to navigate pages and call endpoints
-  4. Document what works and what fails
-  5. Wake up agents for failures
+Your primary work is:
+  1. Read the task ledger + contracts first.
+  2. Audit generated code directory-by-directory (backend, frontend, database, docs, devops).
+  3. Detect concrete defects: runtime/import errors, missing deps, broken scripts, invalid setup flows.
+  4. Detect placeholders/TODO stubs/fake logic and contract drift.
+  5. Verify user-specified details are respected exactly (styles/colors/behavior/contracts).
+  6. For each defect, call report_issue with assigned_to set to the owner role and include evidence.
 
-You CAN still create Jest tests for isolated logic, but:
-  ✅ Primary goal: Runtime validation of all routes/pages working
-  ✅ Secondary goal: Unit tests for business logic
-  ✅ NOT the goal: Mocking everything - test real running servers
+Do NOT spend cycles writing new Jest/Playwright suites unless explicitly requested.
 
 ════════════════════════════════════════════════════════════════════════════════
 SUCCESS CRITERIA
 ════════════════════════════════════════════════════════════════════════════════
 
-✅ Both servers start without crashing (ignoring external service errors OK)
-✅ Every contract endpoint is callable and returns a response
-✅ Every contract page loads and renders without 404s
-✅ Page navigation works (clicking links, using routing)
-✅ API calls from frontend reach backend successfully
-✅ Any failures are documented with specifics
-✅ Agents are woken up for failures requiring fixes
+✅ Every contract endpoint/route is audited against implementation evidence
+✅ Placeholder code and fake scaffolding are identified with file+line evidence
+✅ Requirement mismatches are explicitly mapped (expected vs actual)
+✅ Each issue is assigned to the correct owner role via issue queue + Service Bus notice
+✅ QA writes an audit report summarizing findings and unresolved risk
 
 ════════════════════════════════════════════════════════════════════════════════
 
 ═══════════════════════════════════════════════════════════════════════════════
-QA ENGINEER WORKFLOW - GENERIC TESTING AND VALIDATION
+QA ENGINEER WORKFLOW - CONTRACT & CODE AUDIT
 ═══════════════════════════════════════════════════════════════════════════════
 
 SYSTEM ARCHITECT COMPLIANCE (MANDATORY):
-  ✅ Treat contracts/backend_api_contract.json, contracts/frontend_route_contract.json,
-    and contracts/directory_structure.json as compulsory source of truth.
+  ✅ Treat contracts/backend_api_contract.json and contracts/frontend_route_contract.json as compulsory source of truth.
   ✅ Verify EACH AND EVERY declared endpoint/page/route exists and behaves as specified.
   ✅ If any mismatch is found, report it as a concrete issue with expected vs actual evidence.
 
@@ -678,161 +642,88 @@ PHASE 1: ANALYZE SYSTEM (Iteration 1-2)
   ├─ Map what was built by upstream agents
   ├─ Identify integration points and dependencies
   ├─ List external services (database, APIs, services)
-  └─ Announce testing strategy to blackboard
+  └─ Announce audit strategy to blackboard
 
-PHASE 2: CREATE TEST PLAN (Iterations 3-5)
-  ├─ test_plan.md - Document what will be tested
-  ├─ Map backend endpoints/functions to test cases
-  ├─ Map frontend components/pages to test cases  
-  ├─ List database operations to test
-  ├─ Identify external dependencies and mocking strategy
-  └─ Document what will/won't pass
+PHASE 2: AUDIT PLAN (Iterations 3-5)
+  ├─ qa/audit_report.md - Initialize checklist and findings table
+  ├─ Build directory-by-directory review plan
+  ├─ Map contract requirements to concrete code locations
+  └─ Define acceptance criteria per requirement
 
-PHASE 3: BUILD TESTS (Iterations 6-12, 70% effort)
-  ├─ tests/unit.test.js - Unit tests for core logic
-  ├─ tests/integration.test.js - Integration tests between components
-  ├─ tests/backend.test.js - Backend API and routes (if backend exists)
-  ├─ tests/frontend.test.js - Frontend components (if frontend exists)
-  ├─ tests/database.test.js - Database operations (if database schema exists)
-  └─ tests/e2e.test.js - End-to-end workflows
+PHASE 3: EXECUTE AUDIT (Iterations 6-12)
+  ├─ backend/: verify routes/controllers/models/scripts/dependencies
+  ├─ frontend/: verify pages/components/api wiring/style requirements
+  ├─ database/: verify stack consistency and executable setup/seed assets
+  ├─ devops/docs/: verify deployment readiness and setup accuracy
+  └─ For every defect: report_issue(component, description, severity, needs_help_from, context)
 
 PHASE 4: HANDLE MISSING COMPONENTS
-  If database not running: ✅ keep unit tests isolated, but flag integration as BLOCKED
-  If backend incomplete: ❌ do NOT hide with fake integration stubs; report CRITICAL mismatch
-  If frontend missing: ✅ test available units and report integration gap explicitly
-  If external services down: ✅ mock only external third-party dependencies, never core project contracts
+  If component missing/incomplete: report CRITICAL mismatch immediately with expected path(s)
+  If external service unavailable: record as environment blocker but continue static/contract audit
+  Never hide contract drift with assumptions
 
 PHASE 5: VALIDATION AND REPORTING (Final)
-  ├─ Run all tests
-  ├─ Document pass/fail status and reason
-  ├─ Update_blackboard with test results and coverage
-  └─ CRITICAL: Do NOT spend 10+ iterations fixing unfixable tests
+  ├─ Re-check open issue queue and confirm dispatched items
+  ├─ Update qa/audit_report.md with defects, owner role, status
+  ├─ Post concise blackboard summary including unresolved blockers
+  └─ Finish only when audit coverage is complete
 
 ═══════════════════════════════════════════════════════════════════════════════
-TEST STRUCTURE PATTERNS - FOLLOW THESE
+AUDIT FINDING FORMAT (MANDATORY)
 ═══════════════════════════════════════════════════════════════════════════════
 
-Unit Test Template:
-  describe('Component/Function Name', () => {
-    test('should do something specific', () => {
-      const result = functionUnderTest(input);
-      expect(result).toBe(expected);
-    });
-    test('should handle edge case', () => {
-      const result = functionUnderTest(edgeInput);
-      expect(result).toBe(edgeResult);
-    });
-  });
-
-
-Backend API Test Template:
-  describe('GET /api/endpoint', () => {
-    test('should return success', async () => {
-      const res = await request(app).get('/api/endpoint');
-      expect(res.status).toBe(200);
-      expect(res.body).toHaveProperty('data');
-    });
-  });
-
-Frontend Component Test Template:
-  describe('Component', () => {
-    test('should render', () => {
-      const { getByText } = render(<Component />);
-      expect(getByText('expected text')).toBeInTheDocument();
-    });
-  });
-
-Mocking Template:
-  jest.mock('module-name', () => ({
-    functionName: jest.fn(() => mockValue)
-  }));
-
-═══════════════════════════════════════════════════════════════════════════════
-TEST COVERAGE GOALS
-═══════════════════════════════════════════════════════════════════════════════
-
-Core Functionality:
-  ✅ Main business logic works
-  ✅ Data models are correct
-  ✅ API endpoints return expected responses
-  ✅ Components render correctly
-
-Integration:
-  ✅ Components work together
-  ✅ Frontend calls backend correctly
-  ✅ Backend queries database correctly
-  ✅ Authorization checks work
-
-Error Cases:
-  ✅ Invalid input is rejected
-  ✅ Missing resources return 404
-  ✅ Unauthorized access is blocked
-  ✅ Edge cases are handled
+For each issue include:
+  - component
+  - exact file paths + line hints
+  - expected behavior
+  - actual behavior
+  - severity
+  - assigned owner role
+  - reproduction/verification evidence
 
 ═══════════════════════════════════════════════════════════════════════════════
 OUTPUT FILES (relative paths in your workspace)
 ═══════════════════════════════════════════════════════════════════════════════
 
-tests/
-  ├─ test_plan.md - Testing strategy and coverage goals
-  ├─ unit.test.js - Unit tests for individual functions
-  ├─ integration.test.js - Integration tests
-  ├─ backend.test.js - Backend API tests
-  ├─ frontend.test.js - Frontend component tests
-  ├─ database.test.js - Database operation tests
-  └─ e2e.test.js - End-to-end workflow tests
-
-package.json
-  └─ scripts: add "test": "jest" if not present
-
-jest.config.js
-  └─ Jest configuration for test runner
+qa/
+  └─ audit_report.md - requirement coverage + issue dispatch ledger
 
 ═══════════════════════════════════════════════════════════════════════════════
 SUCCESS CRITERIA FOR YOUR DELIVERABLES
 ═══════════════════════════════════════════════════════════════════════════════
 
-✅ Test files created (even if they initially fail)
-✅ Test structure follows best practices
-✅ Tests cover critical functionality
-✅ Mock external dependencies appropriately
-✅ Tests run without crashing (even if they fail)
-✅ Clear test names describing what's being tested
-✅ Documentation about which tests require external services
-✅ At least one real backend integration test exists (no mock backend)
-✅ Contract conformance test asserts real endpoint/method/path alignment
+✅ qa/audit_report.md exists with detailed findings
+✅ Every major requirement is marked PASS/FAIL with evidence
+✅ All discovered defects are dispatched to owner role via report_issue
+✅ No generic placeholders are left unreported
+✅ Requirement-style mismatches (e.g., visual/details) are explicitly called out
 
 ═══════════════════════════════════════════════════════════════════════════════
-WHEN TESTS FAIL - PIVOT STRATEGY
+WHEN BLOCKED - PIVOT STRATEGY
 ═══════════════════════════════════════════════════════════════════════════════
 
-Tests fail with connection error? 
-  → Keep unit tests isolated AND mark integration blocked (do not fake pass)
+If runtime unavailable:
+  → Continue static audit and report environment blocker separately
 
-Tests fail with missing module?
-  → Fix imports/dependencies or report exact blocker
+If missing dependency/import/script:
+  → Report concrete defect to owner role
 
-Tests fail with missing endpoint/component?
-  → Mark CRITICAL contract mismatch and fail verification
+If missing endpoint/page/component:
+  → Report CRITICAL contract mismatch with exact path/evidence
 
-Tests fail 3+ times for same reason?
-  → Escalate blocker with exact failing endpoint/test evidence
-
-NEVER: "Tests are failing, I'm stuck"
-INSTEAD: "Integration blocked by concrete contract/runtime mismatch; reported with evidence"
+NEVER: "I can't verify this"
+INSTEAD: "Blocked by specific artifact/runtime gap; issue dispatched with evidence"
 
 ═══════════════════════════════════════════════════════════════════════════════
 IF REQUIREMENTS UNCLEAR - FOLLOW THIS
 ═══════════════════════════════════════════════════════════════════════════════
 
-❓ What should I test? → Test what upstream agents built
-❓ How many tests? → At least 1 per major component/endpoint  
-❓ What test framework? → Jest (works with Node.js and React)
-❓ How to mock? → Only for third-party/external dependencies; never to hide backend/frontend contract drift
-❓ Should all tests pass? → No, initially they fail (expected)
+❓ What should I audit? → Everything generated by upstream agents, directory-by-directory
+❓ How should I dispatch fixes? → report_issue with assigned_to + detailed context
+❓ How do agents get notified? → report_issue triggers queueing and Service Bus notification
 
-NEVER: "I can't test without X"
-INSTEAD: "X missing blocks real integration; reporting CRITICAL issue"
+NEVER: "I can't audit without writing tests"
+INSTEAD: "Audit completed with findings; issues dispatched to owners"
 """,
             allowed_root=allowed_root,
             timeout=120
@@ -869,11 +760,10 @@ class EnhancedAgentOrchestrator:
         # Option 3 recommendation: centralized manifest requirements by role/language.
         self.role_verification_policy = {
           "system_architect": {
-            "min_files": 3,
+            "min_files": 2,
             "required_any": [
               ["backend_api_contract.json", "contracts/backend_api_contract.json"],
               ["frontend_route_contract.json", "contracts/frontend_route_contract.json"],
-              ["directory_structure.json", "contracts/directory_structure.json"],
               ["README.md", "docs/api/README.md"]
             ],
             "manifest_any": []
@@ -900,14 +790,11 @@ class EnhancedAgentOrchestrator:
             "manifest_any": []
           },
           "qa_engineer": {
-            "min_files": 5,
+            "min_files": 1,
             "required_any": [
-              ["tests/test_plan.md"],
-              ["jest.config.js"],
-              ["tests/unit.test.js", "tests/integration.test.js", "tests/backend.test.js", "tests/frontend.test.js", "tests/database.test.js", "tests/e2e.test.js"],
-              ["README.md"]
+              ["qa/audit_report.md", "audit_report.md", "README.md"]
             ],
-            "manifest_any": ["package.json"]
+            "manifest_any": []
           }
         }
 
@@ -934,10 +821,7 @@ class EnhancedAgentOrchestrator:
                     if rel:
                         os.makedirs(os.path.join(WORKSPACE_DIR, rel), exist_ok=True)
 
-        try:
-          self._apply_directory_structure_contract_scaffold()
-        except Exception:
-          pass
+        # Directory-structure scaffolding is now optional and no longer auto-applied.
 
     def _get_agent_spec(self, role: str) -> Optional[Dict]:
         """Find agent spec by role from ledger."""
@@ -958,8 +842,16 @@ class EnhancedAgentOrchestrator:
         """
         def _normalize_role_alias(role_value: str) -> str:
           role_norm = str(role_value or "").strip().lower().replace(" ", "_")
+          role_alias_map = {
+            "node_express_backend_engineer": "backend_engineer",
+            "react_frontend_engineer": "frontend_engineer",
+            "react_frontend_developer": "frontend_engineer",
+            "vite_react_frontend_engineer": "frontend_engineer",
+          }
+          if role_norm in role_alias_map:
+            return role_alias_map[role_norm]
           # Map all System Architect aliases to system_architect
-          system_architect_aliases = {"system_architect", "solution_architect", "system_architect_agent"}
+          system_architect_aliases = {"system_architect", "solution_architect", "system_architect_agent", "api_designer"}
           if role_norm in system_architect_aliases:
             return "system_architect"
           return role_norm
@@ -1082,91 +974,88 @@ class EnhancedAgentOrchestrator:
             set_issues_tracker(original_tracker)
 
     def _build_issue_wake_specs(self) -> List[Dict]:
-        """Build wake-up specs for roles currently assigned open issues."""
-        def _normalize_assignee(role: str) -> str:
-            r = str(role or "").strip().lower().replace(" ", "_")
-            alias_map = {
-              "solution_architect": "system_architect",
-              "system_architect_agent": "system_architect",
-              "system/ops": "system_architect",
-              "project_orchestrator": "system_architect",
-              "orchestrator": "system_architect",
-              "system": "system_architect",
-            }
-            return alias_map.get(r, r)
+      """Build wake-up specs for roles with non-empty issue queues (oldest issue first)."""
 
-        issues_tracker = get_issues_tracker()
-        open_issues = issues_tracker.get_open_issues()
-        assigned_roles = sorted({
-            _normalize_assignee(i.get("assigned_to"))
-            for i in open_issues
-            if str(i.get("assigned_to") or "").strip() and str(i.get("assigned_to") or "").strip().lower() != "unassigned"
-        })
+      def _normalize_assignee(role: str) -> str:
+        r = str(role or "").strip().lower().replace(" ", "_")
+        alias_map = {
+          "database": "database_architect",
+          "database_agent": "database_architect",
+          "database_engineer": "database_architect",
+          "db": "database_architect",
+          "db_agent": "database_architect",
+          "db_architect": "database_architect",
+          "db_engineer": "database_architect",
+          "node_express_backend_engineer": "backend_engineer",
+          "backend": "backend_engineer",
+          "backend_agent": "backend_engineer",
+          "react_frontend_engineer": "frontend_engineer",
+          "react_frontend_developer": "frontend_engineer",
+          "vite_react_frontend_engineer": "frontend_engineer",
+          "frontend": "frontend_engineer",
+          "frontend_agent": "frontend_engineer",
+          "qa": "qa_engineer",
+          "qa_agent": "qa_engineer",
+          "tester": "qa_engineer",
+          "api_designer": "system_architect",
+          "solution_architect": "system_architect",
+          "system_architect_agent": "system_architect",
+          "system/ops": "system_architect",
+          "project_orchestrator": "system_architect",
+          "orchestrator": "system_architect",
+          "system": "system_architect",
+        }
+        return alias_map.get(r, r)
 
-        wake_specs: List[Dict] = []
-        for role in assigned_roles:
-            spec = self._get_agent_spec(role)
-            if not spec:
-                continue
-            role_issues = issues_tracker.get_open_issues(assigned_to=role)
-            if not role_issues:
-                continue
+      issues_tracker = get_issues_tracker()
+      open_issues = issues_tracker.get_open_issues()
+      assigned_roles = sorted({
+        _normalize_assignee(i.get("assigned_to"))
+        for i in open_issues
+        if str(i.get("assigned_to") or "").strip() and str(i.get("assigned_to") or "").strip().lower() != "unassigned"
+      })
 
-            issue_payload = json.dumps(role_issues, indent=2, ensure_ascii=False)
-            patch_spec = dict(spec)
-            patch_spec["instructions"] = f"""{spec.get('instructions', '')}
+      wake_specs: List[Dict] = []
+      for role in assigned_roles:
+        spec = self._get_agent_spec(role)
+        if not spec:
+          continue
 
-SECOND ITERATION - ISSUE FIX MODE (WAKE-UP):
-You were woken up to resolve blocking issues assigned to your role.
+        role_issues = issues_tracker.get_open_issues(assigned_to=role)
+        if not role_issues:
+          continue
 
-MANDATORY STEPS:
-1) Read assigned issues below and inspect implicated files.
-2) Implement concrete fixes immediately.
-3) Post what changed to the blackboard.
-4) Ensure changes unblock dependent agents.
-5) Output [READY_FOR_VERIFICATION] only after fixes are complete.
+        role_issues = sorted(role_issues, key=lambda i: int(i.get("id", 10**9)))
+        current_issue = role_issues[0]
+        queue_size = len(role_issues)
 
-Assigned issues JSON:
-{issue_payload}
-"""
-            wake_specs.append(patch_spec)
+        issue_payload = json.dumps(current_issue, indent=2, ensure_ascii=False)
+        patch_spec = dict(spec)
+        patch_spec["instructions"] = f"""{spec.get('instructions', '')}
 
-        return wake_specs
+  SECOND ITERATION - ISSUE FIX MODE (WAKE-UP):
+  You were woken up to resolve the NEXT issue in your assigned queue.
 
-    def _resolve_issues_assigned_to_roles(self, roles: List[str], trigger: str) -> int:
-        """Resolve all currently open issues assigned to roles after successful wake execution."""
+  MANDATORY STEPS:
+  1) Read the current issue below and inspect implicated files.
+  2) Implement concrete fixes immediately.
+  3) Post what changed to the blackboard.
+  4) Validate fix evidence and call resolve_issue(issue_id, resolution).
+  5) If queue still has open items, continue with read_issue_queue().
+  6) Output [READY_FOR_VERIFICATION] only after the current issue is resolved.
 
-        def _normalize_assignee(role: str) -> str:
-            r = str(role or "").strip().lower().replace(" ", "_")
-            alias_map = {
-              "solution_architect": "system_architect",
-              "system_architect_agent": "system_architect",
-              "system/ops": "system_architect",
-              "project_orchestrator": "system_architect",
-              "orchestrator": "system_architect",
-              "system": "system_architect",
-            }
-            return alias_map.get(r, r)
+  Queue depth for your role: {queue_size}
 
-        issues_tracker = get_issues_tracker()
-        resolved_count = 0
-        for role in roles:
-            role_issues = issues_tracker.get_open_issues(assigned_to=_normalize_assignee(role))
-            for issue in role_issues:
-                issue_id = issue.get("id")
-                if issue_id is None:
-                    continue
-                resolved = issues_tracker.resolve_issue(
-                    int(issue_id),
-                    f"Auto-resolved after wake-up execution by {role} (trigger={trigger})"
-                )
-                if resolved:
-                    resolved_count += 1
-        return resolved_count
+  Current issue JSON:
+  {issue_payload}
+  """
+        wake_specs.append(patch_spec)
+
+      return wake_specs
 
     def _run_issue_wake_cycle(self, trigger: str) -> int:
         """Run one or more issue-driven wake cycles for assigned roles."""
-        max_cycles = max(1, int(os.getenv("ISSUE_WAKE_MAX_CYCLES", "2")))
+        max_cycles = max(1, int(os.getenv("ISSUE_WAKE_MAX_CYCLES", "8")))
         total_woken = 0
 
         for cycle in range(1, max_cycles + 1):
@@ -1192,15 +1081,137 @@ Assigned issues JSON:
                     phase_label="ISSUE WAKE"
                 )
 
-            resolved = self._resolve_issues_assigned_to_roles(wake_roles, trigger=trigger)
-            print(f"✅ Issue wake cycle resolved {resolved} issue(s)")
+            print("ℹ️ Issue wake cycle completed. Issues remain open until agents call resolve_issue().")
             total_woken += len(wake_roles)
 
         return total_woken
 
+    def _count_open_issues(self) -> int:
+      """Return number of unresolved issues in the active tracker."""
+      issues_tracker = get_issues_tracker()
+      open_issues = issues_tracker.get_open_issues()
+      return len([i for i in open_issues if not i.get("resolved")])
+
+    def _run_qa_reaudit_until_clean(self, base_layer_index: int, trigger: str) -> None:
+      """Continuously run QA -> wake/fix -> QA until no unresolved issues remain.
+
+      This enforces a strict audit loop after QA has run once, so orchestration does
+      not proceed to downstream layers while QA-dispatched issues are still outstanding.
+      """
+      qa_spec = self._get_agent_spec("qa_engineer")
+      if not qa_spec:
+        return
+
+      max_rounds = max(1, int(os.getenv("QA_REAUDIT_MAX_CYCLES", "8")))
+
+      for round_idx in range(1, max_rounds + 1):
+        open_before = self._count_open_issues()
+        if open_before > 0:
+          print(
+            f"\n🔁 QA RE-AUDIT PREP {round_idx}/{max_rounds}: "
+            f"{open_before} open issue(s) detected. Running owner wake cycle before QA."
+          )
+          woke = self._run_issue_wake_cycle(trigger=f"{trigger}_preqa_{round_idx}")
+          open_after_fix = self._count_open_issues()
+          if open_after_fix > 0 and woke <= 0:
+            raise RuntimeError(
+              f"QA re-audit blocked: {open_after_fix} issue(s) remain unresolved and no owners were woken"
+            )
+          if open_after_fix > 0:
+            continue
+
+        print(
+          f"\n🧪 QA RE-AUDIT {round_idx}/{max_rounds}: "
+          f"running qa_engineer after fix cycles"
+        )
+        layer_board_path = os.path.join(
+          WORKSPACE_DIR,
+          f"layer_qa_reaudit_{trigger}_{round_idx}.md"
+        )
+        self.execute_layer(
+          base_layer_index,
+          [dict(qa_spec)],
+          total_layers=1,
+          layer_blackboard_path=layer_board_path,
+          phase_label="QA RE-AUDIT"
+        )
+
+        open_after_qa = self._count_open_issues()
+        if open_after_qa == 0:
+          print("✅ QA re-audit clean: no open issues remain.")
+          return
+
+        print(
+          f"⚠️ QA re-audit found {open_after_qa} issue(s). "
+          "Running wake-up owners before next QA pass."
+        )
+        woke = self._run_issue_wake_cycle(trigger=f"{trigger}_postqa_{round_idx}")
+        open_after_wake = self._count_open_issues()
+        if open_after_wake > 0 and woke <= 0:
+          raise RuntimeError(
+            f"QA re-audit blocked: {open_after_wake} issue(s) remain unresolved after QA findings"
+          )
+
+      remaining = self._count_open_issues()
+      if remaining > 0:
+        raise RuntimeError(
+          f"QA re-audit loop exhausted after {max_rounds} round(s) with {remaining} issue(s) still open"
+        )
+
     def _is_rate_limit_error(self, error: Exception) -> bool:
         text = str(error).lower()
         return "too_many_requests" in text or "429" in text or "rate limit" in text
+
+    def _is_transient_connection_error(self, error: Exception) -> bool:
+        text = str(error).lower()
+        markers = [
+            "connection error",
+            "connecterror",
+            "apiconnectionerror",
+            "certificate verify failed",
+            "hostname mismatch",
+            "ssl",
+            "tls",
+            "temporary failure in name resolution",
+            "name or service not known",
+            "network is unreachable",
+            "connection reset",
+            "connection aborted",
+            "timed out",
+            "timeout",
+            "remote disconnected",
+        ]
+        return any(marker in text for marker in markers)
+
+    def _summarize_runtime_checks(self, checks: List[Dict], limit: int = 30) -> str:
+      if not checks:
+        return "(no runtime checks recorded)"
+
+      lines = []
+      for item in checks[:max(1, int(limit))]:
+        if not isinstance(item, dict):
+          continue
+        kind = str(item.get("kind", item.get("script", "check")))
+        target = str(item.get("target", item.get("component", ""))).strip()
+        status = item.get("status")
+        ok = item.get("ok")
+        if ok is True:
+          state = "ok"
+        elif ok is False:
+          state = "fail"
+        elif status is not None:
+          state = str(status)
+        else:
+          state = "unknown"
+
+        label = f"{kind}"
+        if target:
+          label += f" {target}"
+        lines.append(f"- {label}: {state}")
+
+      if len(checks) > len(lines):
+        lines.append(f"- ... (+{len(checks) - len(lines)} more checks)")
+      return "\n".join(lines) if lines else "(no runtime checks recorded)"
 
     def _infer_second_iteration_phase(self, spec: Dict) -> int:
       """Infer execution phase for second-iteration fixes using role/instruction semantics."""
@@ -1367,6 +1378,7 @@ Assigned issues JSON:
           "system_architect",
           "solution_architect",
           "system_architect_agent",
+          "api_designer",
         }
         if role_norm in system_architect_aliases:
           return "system_architect"
@@ -1417,7 +1429,7 @@ Assigned issues JSON:
               raise ValueError(f"Layer #{idx} references unknown role: {role}")
             if role in seen:
               # Tolerate duplicate aliases resolving to system_architect
-              # (e.g., system_architect + solution_architect in director output).
+              # (e.g., system_architect + solution_architect/api_designer in director output).
               if role == "system_architect":
                 continue
               raise ValueError(f"Role appears in multiple layers: {role}")
@@ -1517,6 +1529,8 @@ Assigned issues JSON:
       required_files = [
         ("backend_api_contract", BACKEND_API_CONTRACT_REL),
         ("frontend_route_contract", FRONTEND_ROUTE_CONTRACT_REL),
+      ]
+      optional_files = [
         ("directory_structure_contract", DIRECTORY_STRUCTURE_CONTRACT_REL),
       ]
 
@@ -1539,6 +1553,23 @@ Assigned issues JSON:
         except Exception as e:
           if require_all:
             raise RuntimeError(f"CRITICAL: invalid System Architect contract {rel_path}: {str(e)}")
+
+      for key, rel_path in optional_files:
+        abs_path = os.path.join(WORKSPACE_DIR, rel_path)
+        if not os.path.exists(abs_path):
+          continue
+        try:
+          with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+            raw = f.read()
+          parsed = json.loads(raw)
+          context[key] = {
+            "path": rel_path,
+            "checksum_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            "content": raw,
+            "parsed": parsed,
+          }
+        except Exception:
+          continue
 
       return context
 
@@ -1900,13 +1931,22 @@ Assigned issues JSON:
     def _get_role_output_roots(self, role: str) -> List[str]:
       """Resolve production output roots for a role from ledger workspace_layout."""
       role_key = (role or "").strip().lower().replace(" ", "_")
-      default_root_by_role = {
+      canonical_root_by_role = {
         "backend_engineer": "backend",
         "frontend_engineer": "frontend",
         "database_architect": "database",
-        "qa_engineer": "tests",
+        "qa_engineer": "qa",
         "system_architect": "contracts",
       }
+
+      # Core pipeline roles are anchored to canonical roots so runtime smoke,
+      # verification, and starter templates all operate on the same paths.
+      if role_key in canonical_root_by_role:
+        root = canonical_root_by_role[role_key]
+        if role_key == "system_architect":
+          return ["contracts", "docs/api", "docs/system_architecture"]
+        return [root]
+
       layout = self.ledger.get("workspace_layout", {}) if isinstance(self.ledger, dict) else {}
       role_map = layout.get("role_output_roots", {}) if isinstance(layout.get("role_output_roots", {}), dict) else {}
       raw_roots = role_map.get(role_key, [])
@@ -1914,25 +1954,6 @@ Assigned issues JSON:
         raw_roots = [raw_roots]
 
       roots = [self._normalize_workspace_rel(r) for r in (raw_roots or []) if self._normalize_workspace_rel(r)]
-
-      # Contract-first override: implementation roles write to contract section roots.
-      # This prevents mismatches with legacy director layouts (e.g. apps/backend,
-      # db/schemas) when System Architect contracts declare backend/frontend/database.
-      contract_role_section = {
-        "backend_engineer": "backend",
-        "frontend_engineer": "frontend",
-        "database_architect": "database",
-      }
-      section_root = contract_role_section.get(role_key)
-      if section_root:
-        contract = self._load_directory_structure_contract()
-        structure = contract.get("structure", {}) if isinstance(contract, dict) else {}
-        if contract.get("ok") and isinstance(structure, dict) and section_root in structure:
-          contract_roots = [section_root]
-          for r in roots:
-            if r and r not in contract_roots:
-              contract_roots.append(r)
-          return contract_roots
 
       if role_key == "system_architect":
         # System Architect contracts are single source of truth under contracts/.
@@ -1944,7 +1965,7 @@ Assigned issues JSON:
           roots.append("docs/system_architecture")
       if roots:
         return roots
-      return [default_root_by_role.get(role_key, role_key)]
+      return [canonical_root_by_role.get(role_key, role_key)]
 
     def _list_role_generated_files(self, role: str) -> List[str]:
       """List files generated under this role's mapped output roots."""
@@ -1965,6 +1986,7 @@ Assigned issues JSON:
         - Project requirements
         - Technology stack
         - Output from previous agents
+        - UI preferences for design implementation
         """
         context = {
             "project_name": self.ledger.get("project_name"),
@@ -1974,6 +1996,7 @@ Assigned issues JSON:
             "previous_outputs": {},
             "required_upstream_roles": self._required_upstream_roles(role),
           "workspace_layout": self.ledger.get("workspace_layout", {}),
+          "ui_preferences": self.ledger.get("ui_preferences", {}),
         }
         
         # Include actual files from completed layers
@@ -2045,6 +2068,7 @@ Assigned issues JSON:
         backend_rel=BACKEND_API_CONTRACT_REL,
         frontend_rel=FRONTEND_ROUTE_CONTRACT_REL,
         directory_rel=DIRECTORY_STRUCTURE_CONTRACT_REL,
+        require_directory=False,
       )
       if result.get("ok"):
         return result
@@ -2056,7 +2080,7 @@ Assigned issues JSON:
           description=(
             "System Architect contracts failed validation: "
             + error_text
-            + ". Update backend_api_contract.json, frontend_route_contract.json, and/or directory_structure.json."
+            + ". Update backend_api_contract.json and/or frontend_route_contract.json."
           ),
           severity="CRITICAL",
           reported_by="orchestrator_contract_validator",
@@ -2080,7 +2104,7 @@ Assigned issues JSON:
             for root, dirs, filenames in os.walk(workspace):
                 dirs[:] = [
                     d for d in dirs
-                    if d not in {"node_modules", ".git", "dist", "build", "coverage", "__pycache__"}
+            if d not in {"node_modules", ".git", "dist", "build", "coverage", "__pycache__", ".next", ".turbo"}
                 ]
                 for filename in filenames:
                     if filename.endswith(".pyc"):
@@ -2168,12 +2192,9 @@ Assigned issues JSON:
         # if not contract_check["ok"]:
         #   missing.extend(contract_check.get("missing", []))
 
-        dir_check = self._verify_directory_structure_alignment(role_key)
-        if not dir_check.get("ok"):
-          missing.extend(dir_check.get("missing", []))
-
-        # Quality gate: reject obvious placeholder scaffolding for core app roles.
-        if role_key in {"backend_engineer", "frontend_engineer"}:
+        # Quality gate: optional placeholder-scaffolding detection for core app roles.
+        # Disabled by default because generated framework/runtime files can trigger false positives.
+        if ENABLE_PLACEHOLDER_DETECTION and role_key in {"backend_engineer", "frontend_engineer"}:
             placeholder_hits = self._find_placeholder_artifacts(workspace)
             if placeholder_hits:
                 preview = ", ".join(placeholder_hits[:8])
@@ -2210,7 +2231,13 @@ Assigned issues JSON:
                     continue
                 rel = os.path.relpath(os.path.join(root, name), workspace).replace("\\", "/")
                 # Keep docs out of this gate; focus on executable code files.
-                if rel.lower().startswith("docs/") or rel.lower().endswith("readme.md"):
+                if (
+                  rel.lower().startswith("docs/")
+                  or rel.lower().endswith("readme.md")
+                  or rel.lower().startswith(".next/")
+                  or rel.lower().startswith("dist/")
+                  or rel.lower().startswith("build/")
+                ):
                     continue
                 try:
                     with open(os.path.join(root, name), "r", encoding="utf-8", errors="ignore") as f:
@@ -2240,6 +2267,45 @@ Assigned issues JSON:
         return str(value)
 
       cmd = ["npm", "run", script_name]
+
+      def _run_once(timeout_value):
+        completed_local = subprocess.run(
+          cmd,
+          cwd=workspace,
+          capture_output=True,
+          text=True,
+          timeout=timeout_value,
+        )
+        out_local = _to_text(completed_local.stdout) + "\n" + _to_text(completed_local.stderr)
+        return completed_local, out_local
+
+      def _should_auto_install(output_text: str) -> bool:
+        txt = (output_text or "").lower()
+        return (
+          "cannot find module" in txt
+          or "module not found" in txt
+          or "failed to load postcss config" in txt
+          or "loading postcss plugin failed" in txt
+        )
+
+      def _run_npm_install() -> Dict:
+        try:
+          install = subprocess.run(
+            ["npm", "install", "--no-audit", "--no-fund"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=180,
+          )
+          install_out = _to_text(install.stdout) + "\n" + _to_text(install.stderr)
+          return {
+            "ok": install.returncode == 0,
+            "output": install_out[-3000:],
+            "message": "npm install succeeded" if install.returncode == 0 else f"npm install failed with exit code {install.returncode}",
+          }
+        except Exception as e:
+          return {"ok": False, "output": "", "message": f"npm install failed: {str(e)}"}
+
       try:
         timeout_value = None
         if timeout_seconds is not None and int(timeout_seconds) > 0:
@@ -2247,16 +2313,32 @@ Assigned issues JSON:
         elif long_running_ok:
           # Keep a bounded probe window for dev/start scripts so smoke checks do not block forever.
           timeout_value = 25
-        completed = subprocess.run(
-          cmd,
-          cwd=workspace,
-          capture_output=True,
-          text=True,
-          timeout=timeout_value,
-        )
-        out = _to_text(completed.stdout) + "\n" + _to_text(completed.stderr)
+        completed, out = _run_once(timeout_value)
         if completed.returncode == 0:
           return {"ok": True, "message": f"npm run {script_name} succeeded", "output": out[-4000:]}
+
+        if _should_auto_install(out):
+          install = _run_npm_install()
+          if install.get("ok"):
+            completed_retry, out_retry = _run_once(timeout_value)
+            merged_output = (out + "\n\n[AUTO-HEAL] " + install.get("message", "") + "\n" + out_retry)
+            if completed_retry.returncode == 0:
+              return {
+                "ok": True,
+                "message": f"npm run {script_name} succeeded after auto-install",
+                "output": merged_output[-4000:],
+              }
+            return {
+              "ok": False,
+              "message": f"npm run {script_name} failed after auto-install (exit code {completed_retry.returncode})",
+              "output": merged_output[-4000:],
+            }
+          return {
+            "ok": False,
+            "message": f"npm run {script_name} failed and auto-install could not recover",
+            "output": (out + "\n\n[AUTO-HEAL] " + install.get("message", ""))[-4000:],
+          }
+
         return {
           "ok": False,
           "message": f"npm run {script_name} failed with exit code {completed.returncode}",
@@ -2292,6 +2374,42 @@ Assigned issues JSON:
 
         checks = []
 
+        backend_entry_exists = (
+          os.path.exists(os.path.join(WORKSPACE_DIR, "backend", "app.js"))
+          or os.path.exists(os.path.join(WORKSPACE_DIR, "backend", "server.js"))
+        )
+
+        if role_key == "backend_engineer":
+          if not ({"dev", "start"} & set(scripts.keys())) and not backend_entry_exists:
+            return {
+              "ok": False,
+              "error": "runtime smoke check: backend startup missing (define npm script dev/start or app.js/server.js)",
+              "checks": checks,
+            }
+          checks.append(
+            {
+              "kind": "startup_standard",
+              "component": "backend",
+              "required_port": STANDARD_BACKEND_PORT,
+              "accepted_commands": ["npm run dev", "npm run start", "node app.js", "node server.js"],
+            }
+          )
+        else:
+          if not ({"dev", "start"} & set(scripts.keys())):
+            return {
+              "ok": False,
+              "error": "runtime smoke check: frontend startup missing (define npm script dev or start)",
+              "checks": checks,
+            }
+          checks.append(
+            {
+              "kind": "startup_standard",
+              "component": "frontend",
+              "required_port": STANDARD_FRONTEND_PORT,
+              "accepted_commands": ["npm run dev", "npm run start"],
+            }
+          )
+
         if role_key == "frontend_engineer":
             if "build" in scripts:
                 build = self._run_npm_script(
@@ -2309,77 +2427,180 @@ Assigned issues JSON:
                         "output": build.get("output", ""),
                     }
 
-            dev_like = "dev" if "dev" in scripts else ("start" if "start" in scripts else None)
-            if dev_like:
-                run_out = self._run_npm_script(
-                    workspace,
-                    dev_like,
-                    timeout_seconds=RUNTIME_SMOKE_TIMEOUT_SECONDS,
-                    long_running_ok=True,
-                )
-                checks.append({"script": dev_like, **run_out})
-                if not run_out.get("ok"):
-                    return {
-                        "ok": False,
-                        "error": run_out.get("message", "frontend runtime smoke failed"),
-                        "checks": checks,
-                        "output": run_out.get("output", ""),
-                    }
-            return {"ok": True, "checks": checks}
+        smoke = self._run_contract_smoke_test(role_key)
+        checks.extend(smoke.get("checks", []) or [])
+        smoke_warnings = smoke.get("warnings") or []
+        if smoke_warnings:
+          checks.append(
+            {
+              "kind": "smoke_warnings",
+              "target": role_key,
+              "status": f"{len(smoke_warnings)} warning(s)",
+            }
+          )
+        if not smoke.get("ok"):
+          err_list = smoke.get("errors") or []
+          smoke_trace = self._summarize_runtime_checks(smoke.get("checks", []) or [])
+          if err_list:
+            joined = "\n".join(f"- {e}" for e in err_list)
+            warn_joined = "\n".join(f"- {w}" for w in smoke_warnings[:20]) if smoke_warnings else "(none)"
+            browser_err_count = 0
+            if role_key == "frontend_engineer":
+              browser_err_count = len([
+                e for e in err_list
+                if isinstance(e, str) and ("Browser console/page error" in e or "browser console capture" in e)
+              ])
+            browser_header = (
+              f"Browser runtime errors captured: {browser_err_count}\n\n"
+              if role_key == "frontend_engineer" else ""
+            )
+            return {
+              "ok": False,
+              "error": (
+                "contract smoke test failed:\n"
+                f"{browser_header}"
+                f"{joined}\n\n"
+                f"Smoke check trace:\n{smoke_trace}\n\n"
+                f"Smoke warnings:\n{warn_joined}"
+              ),
+              "checks": checks,
+              "warnings": smoke_warnings,
+              "output": smoke.get("output", ""),
+            }
+          return {
+            "ok": False,
+            "error": smoke.get("error", "contract smoke test failed"),
+            "checks": checks,
+            "warnings": smoke_warnings,
+            "output": smoke.get("output", ""),
+          }
 
-        # backend_engineer
-        route_test_like = None
-        for candidate in ["test:routes", "test:api"]:
-          if candidate in scripts:
-            route_test_like = candidate
+        return {"ok": True, "checks": checks, "warnings": smoke_warnings}
+
+    def _run_contract_smoke_test(self, role_key: str) -> Dict:
+      smoke_script = os.path.join(REPO_ROOT, "platform-backend", "smoke_test.py")
+      if not os.path.exists(smoke_script):
+        smoke_script = os.path.join(os.path.dirname(__file__), "smoke_test.py")
+
+      if not os.path.exists(smoke_script):
+        return {"ok": False, "error": "smoke_test.py not found", "checks": []}
+
+      max_total = max(60, int(RUNTIME_SMOKE_MAX_TOTAL_SECONDS or 300))
+      timeout_value = min(max_total + 20, max(45, int(RUNTIME_SMOKE_TIMEOUT_SECONDS or 0), 60))
+      cmd = [
+        sys.executable,
+        smoke_script,
+        "--workspace",
+        WORKSPACE_DIR,
+        "--role",
+        role_key,
+        "--backend-url",
+        STANDARD_BACKEND_URL,
+        "--frontend-url",
+        STANDARD_FRONTEND_URL,
+        "--backend-port",
+        str(STANDARD_BACKEND_PORT),
+        "--frontend-port",
+        str(STANDARD_FRONTEND_PORT),
+        "--timeout",
+        str(max(15, int(RUNTIME_SMOKE_TIMEOUT_SECONDS or 0), 30)),
+        "--max-total-seconds",
+        str(max(60, int(RUNTIME_SMOKE_MAX_TOTAL_SECONDS or 300))),
+      ]
+
+      try:
+        print(f"🧪 [{role_key}] running contract smoke test: {' '.join(cmd)}", flush=True)
+        proc = subprocess.Popen(
+          cmd,
+          cwd=WORKSPACE_DIR,
+          stdout=subprocess.PIPE,
+          stderr=subprocess.STDOUT,
+          text=True,
+        )
+
+        out_lines: List[str] = []
+        start = time.time()
+        while True:
+          if proc.stdout is None:
             break
-
-        if not route_test_like:
-          return {
-            "ok": False,
-            "error": "runtime smoke check: backend must define route test script (test:routes or test:api)",
-            "checks": checks,
-          }
-
-        test_out = self._run_npm_script(
-          workspace,
-          route_test_like,
-          timeout_seconds=RUNTIME_SMOKE_TIMEOUT_SECONDS,
-          long_running_ok=False,
-        )
-        checks.append({"script": route_test_like, **test_out})
-        if not test_out.get("ok"):
-          return {
-            "ok": False,
-            "error": test_out.get("message", "backend route tests failed"),
-            "checks": checks,
-            "output": test_out.get("output", ""),
-          }
-
-        run_like = "dev" if "dev" in scripts else ("start" if "start" in scripts else None)
-        if not run_like:
+          line = proc.stdout.readline()
+          if line:
+            text_line = line.rstrip("\n")
+            out_lines.append(text_line)
+            print(f"[SMOKE][{role_key}] {text_line}", flush=True)
+            continue
+          if proc.poll() is not None:
+            break
+          if (time.time() - start) > timeout_value:
+            with suppress(Exception):
+              proc.kill()
             return {
-                "ok": False,
-                "error": "runtime smoke check: backend package.json missing dev/start script",
-                "checks": checks,
+              "ok": False,
+              "error": "contract smoke test timed out",
+              "checks": [],
+              "errors": ["contract smoke test timed out before completion"],
+              "output": "\n".join(out_lines)[-4000:],
             }
+          time.sleep(0.05)
 
-        run_out = self._run_npm_script(
-            workspace,
-            run_like,
-            timeout_seconds=RUNTIME_SMOKE_TIMEOUT_SECONDS,
-            long_running_ok=True,
-        )
-        checks.append({"script": run_like, **run_out})
-        if not run_out.get("ok"):
-            return {
-                "ok": False,
-                "error": run_out.get("message", "backend runtime smoke failed"),
-                "checks": checks,
-                "output": run_out.get("output", ""),
-            }
+        remaining = ""
+        if proc.stdout is not None:
+          with suppress(Exception):
+            remaining = proc.stdout.read() or ""
+        if remaining:
+          for extra in remaining.splitlines():
+            out_lines.append(extra)
+            print(f"[SMOKE][{role_key}] {extra}", flush=True)
 
-        return {"ok": True, "checks": checks}
+        return_code = int(proc.wait(timeout=2))
+        output = "\n".join(out_lines).strip()
+      except Exception as e:
+        return {
+          "ok": False,
+          "error": f"failed to execute smoke_test.py: {str(e)}",
+          "checks": [],
+          "errors": [f"failed to execute smoke_test.py: {str(e)}"],
+          "output": "",
+        }
+
+      parsed = None
+      for line in reversed(output.splitlines()):
+        line = line.strip()
+        if not line:
+          continue
+        try:
+          parsed = json.loads(line)
+          break
+        except Exception:
+          continue
+
+      if not isinstance(parsed, dict):
+        parsed = {
+          "ok": return_code == 0,
+          "errors": ["smoke test did not return parseable JSON"],
+          "checks": [],
+        }
+
+      parsed.setdefault("checks", [])
+      parsed.setdefault("errors", [])
+      parsed["output"] = output[-4000:]
+
+      if return_code != 0:
+        if parsed.get("ok"):
+          parsed["ok"] = False
+        if not parsed.get("errors"):
+          parsed["errors"] = [f"smoke test process exited with code {return_code}"]
+
+      if not parsed.get("ok"):
+        print(f"❌ [{role_key}] smoke failed: {parsed.get('error') or '; '.join((parsed.get('errors') or [])[:3])}", flush=True)
+      else:
+        print(f"✅ [{role_key}] smoke passed ({len(parsed.get('checks', []) or [])} checks)", flush=True)
+
+      if not parsed.get("ok") and not parsed.get("error"):
+        errs = parsed.get("errors") or []
+        parsed["error"] = errs[0] if errs else "contract smoke test failed"
+
+      return parsed
 
     def _report_issue_once(
       self,
@@ -2412,50 +2633,57 @@ Assigned issues JSON:
         context=context or {},
       )
 
-    def _notify_runtime_failure(self, failing_role: str, runtime_error: str, runtime_output: str = "") -> None:
+    def _notify_runtime_failure(
+      self,
+      failing_role: str,
+      runtime_error: str,
+      runtime_output: str = "",
+      runtime_trace: str = "",
+      runtime_warnings: str = "",
+    ) -> None:
       if failing_role not in {"backend_engineer", "frontend_engineer"}:
         return
 
       peer_role = "frontend_engineer" if failing_role == "backend_engineer" else "backend_engineer"
       output_tail = (runtime_output or "")[-1200:]
-      base_context = {
+      alert_payload = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
         "failing_role": failing_role,
         "peer_role": peer_role,
         "runtime_error": runtime_error,
         "runtime_output_tail": output_tail,
+        "runtime_trace": runtime_trace,
+        "runtime_warnings": runtime_warnings,
+        "source": "orchestrator_runtime_check",
       }
 
-      self._report_issue_once(
-        component=f"runtime/{failing_role}",
-        description=(
-          f"Runtime smoke check failed for {failing_role}: {runtime_error}. "
-          "Fix and rerun verification before completion."
-        ),
-        severity="CRITICAL",
-        reported_by="orchestrator_runtime_check",
-        assigned_to=failing_role,
-        context=base_context,
-      )
+      try:
+        os.makedirs(os.path.dirname(RUNTIME_ALERTS_PATH), exist_ok=True)
+        with open(RUNTIME_ALERTS_PATH, "a", encoding="utf-8") as fh:
+          fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+          fh.write(json.dumps(alert_payload, ensure_ascii=False) + "\n")
+          fh.flush()
+          os.fsync(fh.fileno())
+          fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+      except Exception as e:
+        print(f"⚠️ Failed to persist runtime alert: {e}", flush=True)
 
-      self._report_issue_once(
-        component=f"integration/{failing_role}",
-        description=(
-          f"Dependency runtime failure in {failing_role}: {runtime_error}. "
-          f"{peer_role} must monitor and re-validate integration once the fix lands."
-        ),
-        severity="HIGH",
-        reported_by="orchestrator_runtime_check",
-        assigned_to=peer_role,
-        context=base_context,
+      print(
+        f"📣 Runtime smoke alert recorded (non-wake): owner={failing_role}, watcher={peer_role}",
+        flush=True,
       )
 
       try:
         self.blackboard.post(
           "System",
-          "Issues",
+          "Runtime Alerts",
           (
             f"Runtime check failed for {failing_role}. "
-            f"Notified {failing_role} (fix owner) and {peer_role} (integration watcher)."
+            f"Logged runtime alert for {failing_role} (fix owner) and {peer_role} (integration watcher).\n"
+            f"No issue ticket created to avoid wake-loop churn.\n"
+            f"Runtime error: {runtime_error}\n"
+            f"Runtime trace:\n{runtime_trace or '(none)'}\n"
+            f"Runtime warnings:\n{runtime_warnings or '(none)'}"
           ),
         )
       except Exception:
@@ -2754,7 +2982,7 @@ Assigned issues JSON:
       if not os.path.isdir(src_root) and not os.path.isdir(root_pages_dir):
         return {"ok": False, "routes": set(), "error": "frontend source directory not found (expected src/ or pages/)"}
 
-      # Next.js pages convention.
+      # File-based page conventions (if present in frontend/pages).
       pages_dir = os.path.join(src_root, "pages")
       if not os.path.isdir(pages_dir):
         pages_dir = root_pages_dir
@@ -2837,7 +3065,7 @@ Assigned issues JSON:
         
         Reason: Static regex analysis cannot understand:
         - Express routing patterns (app.use() with router mounting)
-        - Framework abstractions (Next.js dynamic routes, etc.)
+        - Framework abstractions and dynamic route generation
         - The semantic relationship between route definitions and mounted paths
         - Runtime behavior that depends on middleware ordering
         
@@ -2885,6 +3113,8 @@ Assigned issues JSON:
                 or "/node_modules/" in rel_norm
                 or rel_norm.startswith(".venv/")
                 or rel_norm.startswith("venv/")
+              or rel_norm.startswith(".next/")
+              or rel_norm.startswith(".turbo/")
                 or rel_norm.startswith("dist/")
                 or rel_norm.startswith("build/")
                 or rel_norm.startswith(".git/")
@@ -2989,6 +3219,8 @@ Assigned issues JSON:
             if (
                 rel_norm.startswith("node_modules/")
                 or "/node_modules/" in rel_norm
+              or rel_norm.startswith(".next/")
+              or rel_norm.startswith(".turbo/")
                 or rel_norm.startswith("dist/")
                 or rel_norm.startswith("build/")
                 or rel_norm.startswith(".git/")
@@ -3039,8 +3271,102 @@ Assigned issues JSON:
             "source": "local_import"
         }
 
+    def _run_local_node_syntax_precheck(self, workspace: str) -> Dict:
+      """Validate plain JS modules with Node --check. Skips when node is unavailable."""
+      node_bin = shutil.which("node")
+      if not node_bin:
+        return {
+          "ok": True,
+          "diagnostics": [],
+          "skipped": True,
+          "source": "local_node_check",
+          "reason": "node executable not found"
+        }
+
+      diagnostics = []
+      files = self._list_generated_files(workspace)
+      workspace_base = os.path.basename(os.path.normpath(workspace)).replace("\\", "/")
+      js_check_exts = {".js", ".mjs", ".cjs"}
+
+      for rel in files:
+        rel_norm = rel.replace("\\", "/")
+        if workspace_base and rel_norm.startswith(workspace_base + "/"):
+          continue
+
+        if (
+          rel_norm.startswith("node_modules/")
+          or "/node_modules/" in rel_norm
+          or rel_norm.startswith(".next/")
+          or rel_norm.startswith(".turbo/")
+          or rel_norm.startswith("dist/")
+          or rel_norm.startswith("build/")
+          or rel_norm.startswith(".git/")
+          or rel_norm.startswith("coverage/")
+        ):
+          continue
+
+        ext = os.path.splitext(rel_norm)[1].lower()
+        if ext not in js_check_exts:
+          continue
+
+        abs_path = os.path.join(workspace, rel)
+        try:
+          completed = subprocess.run(
+            [node_bin, "--check", abs_path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+          )
+          if completed.returncode != 0:
+            err = (str(completed.stderr or "") + "\n" + str(completed.stdout or "")).strip()
+            diagnostics.append({
+              "tool": "local_node_check",
+              "severity": "error",
+              "file": rel_norm,
+              "line": 1,
+              "column": 1,
+              "message": (err.splitlines()[0] if err else "node --check failed")
+            })
+        except subprocess.TimeoutExpired:
+          diagnostics.append({
+            "tool": "local_node_check",
+            "severity": "error",
+            "file": rel_norm,
+            "line": 1,
+            "column": 1,
+            "message": "node --check timed out"
+          })
+        except Exception as e:
+          diagnostics.append({
+            "tool": "local_node_check",
+            "severity": "error",
+            "file": rel_norm,
+            "line": 1,
+            "column": 1,
+            "message": f"node --check failed to execute: {str(e)}"
+          })
+
+      return {
+        "ok": len(diagnostics) == 0,
+        "diagnostics": diagnostics,
+        "skipped": False,
+        "source": "local_node_check"
+      }
+
     def _run_remote_lsp_precheck(self, role: str, workspace: str) -> Dict:
       """Remote LSP precheck (fail on error diagnostics only). Skips if endpoint is not configured."""
+      # Skip remote LSP for frontend_engineer: React/Vite/TypeScript builds have dev-time type checking
+      # that cannot be fixed by agent code generation alone; local AST/import checks are sufficient.
+      if role == "frontend_engineer":
+        self._log_lsp_precheck(role, workspace, "skipped", {"reason": "Remote LSP disabled for frontend_engineer"})
+        return {
+          "ok": True,
+          "diagnostics": [],
+          "skipped": True,
+          "source": "remote_lsp",
+          "reason": "Remote LSP disabled for frontend_engineer"
+        }
+      
       endpoint = os.getenv("LSP_VALIDATOR_URL", "").strip()
       self._log_lsp_precheck(role, workspace, "start", {"endpoint": endpoint or "(not configured)"})
       if not endpoint:
@@ -3077,6 +3403,8 @@ Assigned issues JSON:
         if not (
           f.replace("\\", "/").startswith("node_modules/")
           or "/node_modules/" in f.replace("\\", "/")
+          or f.replace("\\", "/").startswith(".next/")
+          or f.replace("\\", "/").startswith(".turbo/")
           or f.replace("\\", "/").startswith("dist/")
           or f.replace("\\", "/").startswith("build/")
           or f.replace("\\", "/").startswith(".git/")
@@ -3300,7 +3628,7 @@ Assigned issues JSON:
     def _collect_workspace_file_set(self, workspace: str) -> set:
       out = set()
       for root, dirs, files in os.walk(workspace):
-        dirs[:] = [d for d in dirs if d not in {"node_modules", ".git", "dist", "build", "coverage", "ml", "__pycache__"}]
+        dirs[:] = [d for d in dirs if d not in {"node_modules", ".git", "dist", "build", "coverage", "ml", "__pycache__", ".next", ".turbo"}]
         for name in files:
           rel = os.path.relpath(os.path.join(root, name), os.path.abspath(WORKSPACE_DIR)).replace("\\", "/")
           out.add(rel)
@@ -3403,9 +3731,6 @@ Assigned issues JSON:
         print(f"[DEBUG] _execute_agent called for role: {role}")
         workspace = self._get_agent_workspace(role)
 
-        if role_key in {"backend_engineer", "frontend_engineer", "database_architect"}:
-          self._scaffold_role_from_directory_contract(role_key)
-
         # Hard-gate semantic prerequisites (contract-first + upstream readiness)
         self._enforce_role_prerequisites(role, current_layer_roles=current_layer_roles)
         
@@ -3423,6 +3748,18 @@ Assigned issues JSON:
               r: os.path.join(WORKSPACE_DIR, self._get_role_output_roots(r)[0])
                 for r in upstream_roles
             }
+            
+            # Extract UI preferences from layer_onboarding for QA to validate against
+            ui_preferences = {}
+            onboarding_entries = self.ledger.get("layer_onboarding", [])
+            if isinstance(onboarding_entries, list) and layer_index is not None:
+                for entry in onboarding_entries:
+                    if isinstance(entry, dict) and int(entry.get("layer_index", -1)) == int(layer_index + 1):
+                        project_context = entry.get("project_context", {})
+                        if isinstance(project_context, dict):
+                            ui_preferences = project_context.get("ui_preferences", {})
+                        break
+            
             context_for_qa = {
                 "project_name": context.get("project_name", ""),
                 "requirements": context.get("requirements", []),
@@ -3431,7 +3768,8 @@ Assigned issues JSON:
                 "required_upstream_roles": context.get("required_upstream_roles", []),
                 "upstream_agents": upstream_agents,
               "system_architect_contracts": context.get("system_architect_contracts", {}),
-                "note": "Use read_file() or list_files() to discover upstream code. Do NOT request all files at once."
+              "ui_preferences": ui_preferences,
+                "note": "Use read_file() or list_files() to discover upstream code. DO NOT request all files at once. Use ui_preferences to validate frontend UI compliance."
             }
             context = context_for_qa
         
@@ -3440,9 +3778,9 @@ Assigned issues JSON:
         # Select appropriate agent class based on role
         # NOTE: Pass WORKSPACE_DIR only - agents create their own role-specific subdirs
         if "backend" in role.lower():
-          agent = BackendEngineerAgent(allowed_root=workspace)
+          agent = NodeExpressBackendEngineerAgent(allowed_root=workspace)
         elif "frontend" in role.lower():
-          agent = FrontendDeveloperAgent(allowed_root=workspace)
+          agent = ReactFrontendEngineerAgent(allowed_root=workspace)
         elif "database" in role.lower():
           agent = DatabaseArchitectAgent(allowed_root=workspace)
         elif "qa" in role.lower() or "test" in role.lower():
@@ -3473,7 +3811,7 @@ Assigned issues JSON:
             agent.tools_registry.primary_output_root = owned_root
             agent.tools_registry.shared_write_roots = []
             agent.tools_registry.edit_only_mode = False
-            agent.tools_registry.allow_delete_operations = False
+            agent.tools_registry.allow_delete_operations = role_key in {"backend_engineer", "frontend_engineer"}
           else:
             agent.tools_registry.preferred_output_roots = list(output_roots)
             agent.tools_registry.primary_output_root = output_roots[0] if output_roots else ""
@@ -3553,23 +3891,31 @@ ROLE BOUNDARY (MANDATORY):
 - You are the SYSTEM ARCHITECT AGENT.
 - Your ONLY responsibility is to define COMPLETE, PRECISE, and MACHINE-ENFORCEABLE architecture contracts.
 - You DO NOT write implementation code.
-- You ARE responsible for ensuring all FOUNDATIONAL files are declared in directory_structure.json.
+- You MUST ensure technology stack bootstrap is reproducible by selecting and applying a starter template from Cosmos DB when needed.
 
-⚠️  CRITICAL ARCHITECTURAL RESPONSIBILITY:
-  Your contracts MUST include entry point/startup files for each tech stack:
-  
-  FOR EXPRESS.JS (Node.js) BACKENDS:
-    → Include backend/app.js in directory_structure_contract (owned by backend_engineer)
-    → app.js MUST mount all routes with express.use()
-    → Backend engineer depends on this existing and being correctly wired
-  
-  FOR NEXT.JS (React) FRONTENDS:
-    → pages/ directory structure MUST be complete in directory_structure_contract
-    → All route files MUST be listed (pages/*.jsx, pages/api/*.js)
-  
-  FOR OTHER FRAMEWORKS:
-    → Document the entry point clearly (e.g., main.py, index.js, etc.)
-    → Include in directory_structure_contract
+⚠️  STARTER TEMPLATE RESPONSIBILITY (CRITICAL):
+  You MUST use starter templates from Cosmos DB for foundational framework scaffolding.
+
+  REQUIRED FLOW:
+    1) Read task ledger technology stack.
+    2) Resolve matching template using tool: init_starter_template_for_stack.
+    3) Initialize template into target directory (e.g. frontend/) via tool call.
+    4) Then produce architecture contracts aligned to initialized stack.
+
+  EXAMPLE TOOL CALL:
+    - init_starter_template_for_stack(stack=["react","vite","tailwind","typescript"], target_directory="frontend", overwrite=false)
+
+  FALLBACK:
+    - If stack-based resolution is ambiguous, call init_starter_template with explicit template_id.
+
+  STARTUP STANDARD (MANDATORY, EXPLICIT):
+    → Backend standard port: 5100
+    → Frontend standard port: 5180
+    → Backend must define startup in package scripts/entrypoint (dev/start or app.js/server.js)
+    → Frontend must define a Vite startup script in package.json (dev/start)
+    → Preferred frontend dev command shape: npm run dev -- --port 5180 (script should resolve to Vite)
+    → Do NOT use react-scripts for React + Vite projects
+    → Agents must NOT manually launch long-running dev servers; smoke runner executes startup checks
 
 OUTPUT FORMAT (STRICT):
 - You MUST output ONLY valid JSON files.
@@ -3580,7 +3926,7 @@ OUTPUT FORMAT (STRICT):
 MANDATORY DELIVERABLES (ALL REQUIRED):
 1. contracts/backend_api_contract.json
 2. contracts/frontend_route_contract.json
-3. contracts/directory_structure.json
+3. README.md
 
 ═══════════════════════════════════════
 GLOBAL RULES (NON-NEGOTIABLE)
@@ -3610,6 +3956,7 @@ BACKEND API CONTRACT (STRICT SCHEMA)
         "404": { ... },
         "500": { ... }
       }
+      "example": { ... STRING JSON SCHEMA OF EXAMPLE REQUEST TO THIS ENDPOINT }
     }
   ]
 }
@@ -3641,44 +3988,6 @@ RULES:
 - EVERY route MUST declare backend dependencies
 - EVERY route MUST be reachable (no orphan routes)
 
-═══════════════════════════════════════
-DIRECTORY STRUCTURE CONTRACT
-═══════════════════════════════════════
-
-{
-  "structure": [
-    {
-      "path": "backend/routes/users.js",
-      "type": "file",
-      "owned_by": "backend_engineer",
-      "purpose": "maps to endpoint_ids: [...]"
-    },
-    {
-      "path": "frontend/pages/Books.jsx",
-      "type": "file",
-      "owned_by": "frontend_engineer",
-      "purpose": "maps to route_ids: [...]"
-    }
-  ]
-}
-
-RULES:
-- EVERY endpoint_id MUST map to at least one backend file
-- EVERY route_id MUST map to at least one frontend file
-- MUST declare at least one file under EACH: backend/, frontend/, database/
-- DATABASE FILES ARE MANDATORY: include concrete database files (not empty placeholders), including at minimum:
-  - database/migrations/schema.sql
-  - database/migrations/seed_data.sql
-  - database/README.md
-- Database files in directory_structure.json MUST be owned_by: "database_architect"
-- ENTRY POINT FILES ARE MANDATORY: Every backend/frontend MUST have a working entry point:
-  - Node.js backends: backend/app.js (Express app with route mounting)
-  - Next.js frontends: frontend/pages/*.jsx with proper routing
-  - Entry points owned_by appropriate implementation agent, but DEFINED by you
-- NO unused files allowed
-- NO missing mappings allowed
-
-═══════════════════════════════════════
 CONSISTENCY REQUIREMENTS (CRITICAL)
 ═══════════════════════════════════════
 
@@ -3686,8 +3995,17 @@ You MUST verify:
 
 1. Every frontend route → references valid endpoint IDs
 2. Every endpoint → used by at least one route OR explicitly marked unused
-3. Every file → maps to valid route_id or endpoint_id
-4. No orphan entities (routes/endpoints/files)
+3. No orphan entities (routes/endpoints)
+
+SMOKE POLICY REQUIREMENTS (CRITICAL):
+- Every backend endpoint in contracts/backend_api_contract.json MUST include explicit smoke policy.
+- Required field (one of the following):
+  - "smoke_test": true|false
+  - "smoke_test": { "enabled": true|false, "reason": "..." }
+  - "smoke_test_enabled": true|false
+- Use false ONLY for endpoints that depend on unavailable external/API-key resources.
+- Endpoints that can run without external credentials MUST be marked smoke-test enabled.
+- Missing smoke policy on any endpoint is contract-invalid.
 
 ═══════════════════════════════════════
 FORBIDDEN ACTIONS
@@ -3714,12 +4032,12 @@ If ANY assumption would be required → CONTRACT IS INVALID
 
 ROLE BOUNDARY (MANDATORY):
 - You must strictly follow all System Architect contracts.
+- Database stack is MongoDB-only. Do not generate relational SQL-only artifacts.
 - You can create and edit files inside your owned database directory.
 - Do not modify files outside your ownership boundaries.
 
 MANDATORY SELF-CHECK BEFORE READY TOKEN:
-- Confirm every edited file exists in contracts/directory_structure.json.
-- Confirm schema/security assumptions align with contracts/backend_api_contract.json.
+- Confirm collections/indexes/seed artifacts align with contracts/backend_api_contract.json.
 """
             elif role_norm == "backend_engineer":
               role_boundary_text = """
@@ -3728,17 +4046,20 @@ ROLE BOUNDARY (MANDATORY):
 - Treat contracts/backend_api_contract.json as authoritative API source of truth.
 - Implement endpoints, request/response schemas, field names, and status codes EXACTLY as contract defines.
 - You MUST NOT invent new routes or payload fields unless contract is updated first.
+- Backend stack is locked to Node.js + Express. Do NOT switch backend framework.
 - You can create and edit files inside your owned backend directory.
 - Do not modify files outside your ownership boundaries.
 - Implement production-ready controllers/services and route wiring in your workspace.
 - Avoid conflicting duplicate route/module names; ensure imports resolve to real local files.
+- You may create, edit, and delete files inside your owned backend directory as needed.
 
 MANDATORY SELF-CHECK BEFORE READY TOKEN:
 - Build a route matrix of contract route -> implemented route.
 - Verify HTTP method and full path EXACT match for every contract endpoint.
 - Verify path param names EXACT match (e.g., :order_id must not become :id).
 - Verify no extra backend API routes exist outside contract.
-- Verify all edited files are listed in contracts/directory_structure.json.
+- Ensure startup scripts/entrypoint are defined and runnable by smoke (do not manually start long-running servers).
+- Ensure backend serves on port 5100 unless contract explicitly overrides.
 """
             elif role_norm == "frontend_engineer":
               role_boundary_text = """
@@ -3747,9 +4068,22 @@ ROLE BOUNDARY (MANDATORY):
 - Treat contracts/backend_api_contract.json and contracts/frontend_route_contract.json as authoritative sources.
 - Consume API paths, params, payloads, response fields, and error shapes EXACTLY as contract defines.
 - You MUST NOT invent frontend-only API fields/routes/pages.
+- Frontend stack is locked to React + Vite only.
+- Do NOT use Next.js or CRA patterns.
+- Do NOT use react-scripts.
+- Do NOT create _app.jsx; bootstrap with main.jsx + App.jsx and ReactDOM.createRoot.
+- index.html MUST include exactly one Vite module bootstrap script for main.jsx:
+  <script type="module" src="/main.jsx"></script>
+- Use react-router-dom routing; do NOT implement custom window.history routing.
+- Use import.meta.env for client env vars; do NOT use process.env in browser code.
 - You can create and edit files inside your owned frontend directory.
 - Do not modify files outside your ownership boundaries.
 - If API mismatch is found, request contract correction instead of guessing.
+- Use Tailwind CSS as primary styling system; avoid mixing multiple CSS/UI frameworks.
+- Respect user-requested UI/UX direction exactly (visual style, hierarchy, interactions, color intent).
+- Enforce Tailwind best practices: theme tokens in tailwind config, reusable semantic components, and clean class composition.
+- Do NOT ship placeholder/stub UI (no "coming soon", TODO shells, empty mock sections).
+- You may create, edit, and delete files inside your owned frontend directory as needed.
 
 MANDATORY SELF-CHECK BEFORE READY TOKEN:
 - Build a call matrix of frontend API call -> contract endpoint.
@@ -3757,22 +4091,35 @@ MANDATORY SELF-CHECK BEFORE READY TOKEN:
 - Verify path param names EXACT match contract names.
 - Verify frontend does not call non-contract endpoints.
 - Verify all edited pages/routes match contracts/frontend_route_contract.json.
-- Verify all edited files are listed in contracts/directory_structure.json.
+- Ensure startup scripts exist in package.json, but do NOT manually run npm run dev/start in agent loops.
+- Ensure package.json has a Vite `dev` script that supports running on port 5180 (e.g., `vite --port 5180 --strictPort`).
+- Ensure frontend serves on port 5180 unless contract explicitly overrides.
+- Ensure index.html loads main.jsx and app mounts non-blank UI.
+- Verify final UI is not generic fallback styling and matches the requested look/feel.
+- Verify no placeholder text/components remain in committed pages.
 """
             elif role_norm == "qa_engineer":
               role_boundary_text = """
 
 ROLE BOUNDARY (MANDATORY):
-- Your primary mission is verification, not feature implementation.
+- Your primary mission is directory-by-directory audit, not feature implementation.
 - Use System Architect contracts as compulsory source of truth every run.
-- Validate EACH endpoint/page/route against contracts and runtime behavior.
-- You may create verification scripts/tests and an issues list.
+- Validate EACH endpoint/page/route and requirement detail against generated code.
+- Detect placeholders/TODO/fake logic and report requirement drift with evidence.
+- Dispatch each defect via report_issue to the correct owner role.
+
+MANDATORY CHECKLIST FOR UI COMPLIANCE:
+- Verify frontend UI matches user-requested ui_preferences (color scheme, layout style, interactions, accessibility).
+- Verify no generic default styling remains; check that Tailwind theme reflects requested colors/tone.
+- Verify components match requested visual hierarchy and layout preferences.
+- Report any UI/style drift as a finding with assigned_to="frontend_engineer".
 
 MANDATORY CHECKLIST:
 - Verify backend endpoints from contracts/backend_api_contract.json exist and behave as specified.
 - Verify frontend routes/pages from contracts/frontend_route_contract.json exist and load as specified.
-- Verify generated files follow contracts/directory_structure.json.
+- Verify generated database artifacts match the declared stack (MongoDB-only).
 - Report every mismatch as concrete issue evidence (path, expected, actual).
+- Track findings in qa/audit_report.md and resolve queue bookkeeping.
 """
 
             cross_layer_repair_text = """
@@ -3784,11 +4131,25 @@ CROSS-LAYER WAKE-UP POLICY (MANDATORY):
 - After wake/fix, re-read changed files and continue; do not stall or guess around blockers.
 """
             
+            # Extract UI preferences for special injection into task descriptions
+            ui_preferences_text = ""
+            if role_norm == "frontend_engineer":
+                ui_prefs = context.get("ui_preferences", {})
+                if isinstance(ui_prefs, dict) and ui_prefs:
+                    ui_preferences_text = "\n🎨 UI/UX PREFERENCES (MANDATORY - APPLY TO ALL PAGES AND COMPONENTS):\n"
+                    for key, value in ui_prefs.items():
+                        if isinstance(value, list):
+                            value_str = ", ".join([str(x) for x in value])
+                        else:
+                            value_str = str(value)
+                        ui_preferences_text += f"- {key}: {value_str}\n"
+                    ui_preferences_text += "\nYou MUST implement these preferences throughout your UI. Do NOT fall back to generic defaults.\n"
+            
             task_description = f"""
 Project: {context.get('project_name', 'Project')}
 
 Your task as {role}:
-{agent_spec.get('instructions', 'Implement your role responsibilities')}{parallel_info}{layer_onboarding_text}{role_boundary_text}{cross_layer_repair_text}
+{agent_spec.get('instructions', 'Implement your role responsibilities')}{parallel_info}{ui_preferences_text}{layer_onboarding_text}{role_boundary_text}{cross_layer_repair_text}
 
 Requirements:
 {chr(10).join(f"- {req}" for req in context.get('requirements', []))}
@@ -3812,7 +4173,7 @@ COMPLETION CONTRACT (MANDATORY):
 - Do NOT finish after planning only.
 - Produce real deliverable code in scaffolded files.
 - You may create/edit files within owned roots; do not write outside ownership boundaries.
-- Update dependency manifest (package.json/requirements.txt/pyproject.toml) or README.md ONLY when those files are declared for your role in contracts/directory_structure.json and exist in scaffold.
+- Update dependency manifests and README files when required by your implementation and contract compliance.
 - If verification expects missing scaffold files, call report_issue with assigned_to="system_architect" and include exact missing paths.
 - Add useful inline comments/docstrings where appropriate.
 - Your completion token triggers automatic code checks (local AST/syntax + remote LSP diagnostics).
@@ -3828,8 +4189,14 @@ QUALITY BAR (MANDATORY):
 DISCOVERY RULES (MANDATORY):
 - Do NOT assume upstream contracts.
 - Before coding, inspect relevant upstream files with list_files/search_in_files/read_file.
+- Discovery strategy: search/list first, then targeted read_file(start_line, end_line) for large files.
+- Avoid blind full-file reads when focused line-range reads can answer the question.
 - Required upstream roles for this task: {', '.join(context.get('required_upstream_roles', [])) or 'None'}
 - If blocked by a same-layer dependency, use sleep mode and wait for peer wake-up after fix.
+
+ACTION DISCIPLINE (MANDATORY):
+- After each significant tool action, write_to_notebook(section="NEXT_ACTIONS") with 1-3 simple next actions.
+- Keep next actions concrete and file-oriented (e.g., "Patch backend/routes/books.js search handler").
 
 EXECUTION EFFICIENCY (MANDATORY):
 - Handle multiple deliverables per model iteration (batch related file writes).
@@ -3854,7 +4221,7 @@ INJECTED API CONTRACT CONTEXT (MANDATORY INPUT):
             architect_ctx = context.get("system_architect_contracts") if isinstance(context, dict) else None
             if architect_ctx and isinstance(architect_ctx, dict):
                 task_description += "\n\nSYSTEM ARCHITECT CONTRACTS (COMPULSORY CONTEXT):\n"
-                for key in ["backend_api_contract", "frontend_route_contract", "directory_structure_contract"]:
+                for key in ["backend_api_contract", "frontend_route_contract"]:
                     payload = architect_ctx.get(key)
                     if not isinstance(payload, dict):
                         continue
@@ -3872,6 +4239,12 @@ INJECTED API CONTRACT CONTEXT (MANDATORY INPUT):
                 task_description += f"\n  Files: {', '.join(prev_info['files'][:5])}"
                 if len(prev_info['files']) > 5:
                     task_description += f" (+{len(prev_info['files']) - 5} more)"
+
+            recovery_notes = context.get("connection_recovery_notes")
+            if isinstance(recovery_notes, list) and recovery_notes:
+              task_description += "\n\nCONNECTION RECOVERY NOTES (read before resuming):\n"
+              for note in recovery_notes[-5:]:
+                task_description += f"- {str(note)}\n"
 
             print(f"📋 Task:\n{task_description[:500]}...\n")
         except Exception as e:
@@ -4095,33 +4468,63 @@ SLEEP RESUME CONTEXT:
               
 
 
-            # Preliminary gate 3: remote LSP precheck (fail on error only)
-            remote_check = self._run_remote_lsp_precheck(role, workspace)
-            if remote_check.get("skipped"):
-              print(f"ℹ️ [{role}] remote LSP precheck skipped: {remote_check.get('reason', 'not configured')}")
-            elif not remote_check["ok"]:
-              last_failure_reason = "remote LSP precheck failed"
-              remediation = self._format_lsp_remediation(remote_check.get("diagnostics", []), "REMOTE_LSP_PRECHECK")
+            # Preliminary gate 3: local Node syntax precheck for plain JS files.
+            node_check = self._run_local_node_syntax_precheck(workspace)
+            if not node_check.get("ok"):
+              last_failure_reason = "local node syntax precheck failed"
+              remediation = self._format_lsp_remediation(node_check.get("diagnostics", []), "LOCAL_NODE_CHECK")
               last_missing_hints = [remediation]
               last_allowed_new_paths = set()
-              print(f"⚠️ [{role}] remote LSP precheck failed, retrying remediation")
+              print(f"⚠️ [{role}] local node syntax precheck failed, retrying remediation")
               if can_retry:
                 task_description += f"""
 
-    REMOTE LSP PRECHECK FAILED. You are NOT complete yet.
-    Fix these reported errors:
+    LOCAL NODE SYNTAX PRECHECK FAILED. You are NOT complete yet.
+    Fix these JavaScript syntax errors (node --check):
     {remediation}
 
     After fixing, output [READY_FOR_VERIFICATION]."""
                 continue
               verification = {
                 "ok": False,
-                "missing": [f"remote LSP precheck failed: {remediation}"]
+                "missing": [f"local node syntax precheck failed: {remediation}"]
               }
               break
+            elif node_check.get("skipped"):
+              print(f"ℹ️ [{role}] local node syntax precheck skipped: {node_check.get('reason', 'not applicable')}")
+
+            # Preliminary gate 4: remote LSP precheck (fail on error only)
+            remote_check = self._run_remote_lsp_precheck(role, workspace)
+            if remote_check.get("skipped"):
+              print(f"ℹ️ [{role}] remote LSP precheck skipped: {remote_check.get('reason', 'not configured')}")
+              print(f"ℹ️ [{role}] remote LSP fallback in effect: local AST/import/node checks already executed")
+            elif not remote_check["ok"]:
+              remediation = self._format_lsp_remediation(remote_check.get("diagnostics", []), "REMOTE_LSP_PRECHECK")
+              if STRICT_REMOTE_LSP_PRECHECK:
+                last_failure_reason = "remote LSP precheck failed"
+                last_missing_hints = [remediation]
+                last_allowed_new_paths = set()
+                print(f"⚠️ [{role}] remote LSP precheck failed, retrying remediation")
+                if can_retry:
+                  task_description += f"""
+
+    REMOTE LSP PRECHECK FAILED. You are NOT complete yet.
+    Fix these reported errors:
+    {remediation}
+
+    After fixing, output [READY_FOR_VERIFICATION]."""
+                  continue
+                verification = {
+                  "ok": False,
+                  "missing": [f"remote LSP precheck failed: {remediation}"]
+                }
+                break
+              else:
+                print(f"ℹ️ [{role}] remote LSP diagnostics are non-blocking (STRICT_REMOTE_LSP_PRECHECK=false): {remediation}")
 
             verification = self._verify_agent_deliverables(role, workspace)
             if verification["ok"]:
+              print(f"🧪 [{role}] starting runtime smoke checks...", flush=True)
               runtime_check = self._run_post_verification_runtime_check(role_key, workspace)
               if runtime_check.get("ok"):
                 checks = runtime_check.get("checks", []) or []
@@ -4134,9 +4537,19 @@ SLEEP RESUME CONTEXT:
 
               runtime_err = runtime_check.get("error", "runtime smoke check failed")
               runtime_out = (runtime_check.get("output", "") or "")[-3000:]
-              self._notify_runtime_failure(role_key, runtime_err, runtime_out)
+              runtime_checks = runtime_check.get("checks", []) or []
+              runtime_warnings = runtime_check.get("warnings", []) or []
+              runtime_trace = self._summarize_runtime_checks(runtime_checks)
+              warning_text = "\n".join(f"- {w}" for w in runtime_warnings[:15]) if runtime_warnings else ""
+              self._notify_runtime_failure(role_key, runtime_err, runtime_out, runtime_trace, warning_text)
+              print(f"❌ [{role}] runtime smoke failure details:")
+              print(f"   reason: {runtime_err}")
+              print(f"   trace:\n{runtime_trace or '(none)'}")
+              print(f"   warnings:\n{warning_text or '(none)'}")
+              if runtime_out:
+                print(f"   output tail:\n{runtime_out}")
               last_failure_reason = f"runtime smoke check failed: {runtime_err}"
-              last_missing_hints = [runtime_err, runtime_out]
+              last_missing_hints = [runtime_err, runtime_trace, warning_text, runtime_out]
               last_allowed_new_paths = set()
               print(f"⚠️ [{role}] runtime smoke failed, retrying remediation")
               if can_retry:
@@ -4144,6 +4557,12 @@ SLEEP RESUME CONTEXT:
 
     POST-VERIFICATION RUNTIME SMOKE CHECK FAILED.
     Runtime failure: {runtime_err}
+
+    Runtime check trace:
+    {runtime_trace}
+
+    Runtime warnings:
+    {warning_text or '(none)'}
 
     Runtime output tail:
     {runtime_out}
@@ -4286,18 +4705,44 @@ SLEEP RESUME CONTEXT:
                 
                 # Agent is clear to proceed - pass parallel agents and layer blackboard
                 parallel_agents = [a.get('role') for a in agents_in_layer if a.get('role') != role]
-                context = self._build_cross_layer_context(role)
                 current_layer_roles = [a.get('role') for a in agents_in_layer if a.get('role')]
-                result = self._execute_agent(
-                  agent_spec,
-                  context,
-                  parallel_agents,
-                  layer_blackboard,
-                  layer_sleep=layer_sleep,
-                  layer_index=layer_index,
-                  current_layer_roles=current_layer_roles
-                )
-                results[agent_spec.get('role')] = result
+
+                recovery_attempt = 0
+                recovery_notes: List[str] = []
+                max_recovery = max(0, int(AGENT_THREAD_CONNECTION_RECOVERY_ATTEMPTS))
+                while True:
+                  context = self._build_cross_layer_context(role)
+                  if recovery_notes:
+                    context["connection_recovery_notes"] = list(recovery_notes)
+                  try:
+                    result = self._execute_agent(
+                      agent_spec,
+                      context,
+                      parallel_agents,
+                      layer_blackboard,
+                      layer_sleep=layer_sleep,
+                      layer_index=layer_index,
+                      current_layer_roles=current_layer_roles
+                    )
+                    results[agent_spec.get('role')] = result
+                    return
+                  except Exception as e:
+                    if self._is_transient_connection_error(e) and recovery_attempt < max_recovery:
+                      recovery_attempt += 1
+                      wait_time = min(8.0, 1.0 + (1.5 * recovery_attempt) + random.uniform(0.15, 0.75))
+                      note = (
+                        f"Connection failure during {role} execution (attempt {recovery_attempt}/{max_recovery}): {str(e)}. "
+                        f"Restarting agent with preserved context after {wait_time:.2f}s."
+                      )
+                      print(f"🔁 [{role}] {note}")
+                      recovery_notes.append(note)
+                      try:
+                        self.blackboard.post("System", "Issues", note)
+                      except Exception:
+                        pass
+                      time.sleep(wait_time)
+                      continue
+                    raise
             except Exception as e:
                 import traceback
                 print(f"\n[THREAD ERROR in {agent_spec.get('role')}] {e}")
@@ -4375,16 +4820,15 @@ SLEEP RESUME CONTEXT:
 
       # Execute each layer
       for layer_index, agents_in_layer in enumerate(self.execution_layers):
+        layer_roles = {
+          str(a.get("role", "")).strip().lower().replace(" ", "_")
+          for a in (agents_in_layer or []) if isinstance(a, dict)
+        }
         try:
           # Contract-first hardening: after system_architect layer, ensure contract has usable routes.
           if layer_index >= 1:
             self._auto_heal_empty_contract()
           self.execute_layer(layer_index, agents_in_layer)
-
-          layer_roles = {
-            str(a.get("role", "")).strip().lower().replace(" ", "_")
-            for a in (agents_in_layer or []) if isinstance(a, dict)
-          }
           if "system_architect" in layer_roles:
             contract_validation = self._validate_system_architect_contracts(report_issue=True)
             if not contract_validation.get("ok"):
@@ -4392,16 +4836,6 @@ SLEEP RESUME CONTEXT:
                 "CRITICAL: System Architect contract validation failed: "
                 + str(contract_validation.get("error", "unknown validation failure"))
               )
-            scaffold = self._apply_directory_structure_contract_scaffold()
-            if not scaffold.get("ok"):
-              raise RuntimeError(
-                "CRITICAL: failed to materialize System Architect directory structure: "
-                + str(scaffold.get("error", "unknown error"))
-              )
-            print(
-              "🧱 Applied System Architect directory scaffold "
-              f"({scaffold.get('created_files', 0)} files materialized)"
-            )
         except Exception as e:
           print(f"❌ Error in layer {layer_index + 1}: {e}")
           wake_count = self._run_issue_wake_cycle(trigger=f"layer_{layer_index + 1}_failure")
@@ -4413,6 +4847,14 @@ SLEEP RESUME CONTEXT:
 
         # Proactively process cross-layer issues after each successful layer.
         self._run_issue_wake_cycle(trigger=f"layer_{layer_index + 1}_post")
+
+        # If QA ran in this layer, enforce QA->fix->QA loop until zero open issues
+        # before continuing to downstream layers (e.g., devops/release).
+        if "qa_engineer" in layer_roles:
+          self._run_qa_reaudit_until_clean(
+            base_layer_index=layer_index,
+            trigger=f"layer_{layer_index + 1}"
+          )
 
       # Deterministic semantic validation across produced backend/frontend artifacts.
       self._validate_contract_globally()

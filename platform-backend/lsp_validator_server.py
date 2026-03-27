@@ -268,14 +268,27 @@ def _js_ts_diagnostics(workspace: str, files: List[str]) -> List[Dict]:
             })
             continue
 
-        cmd = tsc_cmd + [
-            "--pretty", "false",
-            "--noEmit",
-            "--allowJs", "true",
-            "--checkJs", "false",
-            "--jsx", "preserve",
-            abs_file,
-        ]
+        # Respect the workspace's tsconfig.json if it exists (e.g., for React+Vite projects).
+        # This ensures proper configuration for jsx, module resolution, esModuleInterop, etc.
+        tsconfig_path = os.path.join(workspace, "tsconfig.json")
+        if os.path.exists(tsconfig_path):
+            # When tsconfig.json exists, tsc will automatically respect it.
+            # We only need to specify the file and noEmit flag.
+            cmd = tsc_cmd + [
+                "--pretty", "false",
+                "--noEmit",
+                abs_file,
+            ]
+        else:
+            # Fallback to generic flags if no tsconfig exists
+            cmd = tsc_cmd + [
+                "--pretty", "false",
+                "--noEmit",
+                "--allowJs", "true",
+                "--checkJs", "false",
+                "--jsx", "preserve",
+                abs_file,
+            ]
 
         try:
             proc = subprocess.run(

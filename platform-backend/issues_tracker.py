@@ -37,6 +37,20 @@ ISSUES_FILE = os.path.join(REPO_ROOT, "workspace", "issues.json")
 def _normalize_assigned_role(role: str) -> str:
     r = str(role or "").strip().lower().replace(" ", "_")
     alias_map = {
+        "database": "database_architect",
+        "database_agent": "database_architect",
+        "database_engineer": "database_architect",
+        "db": "database_architect",
+        "db_agent": "database_architect",
+        "db_architect": "database_architect",
+        "db_engineer": "database_architect",
+        "backend": "backend_engineer",
+        "backend_agent": "backend_engineer",
+        "frontend": "frontend_engineer",
+        "frontend_agent": "frontend_engineer",
+        "qa": "qa_engineer",
+        "qa_agent": "qa_engineer",
+        "tester": "qa_engineer",
         "solution_architect": "system_architect",
         "system_architect_agent": "system_architect",
         "system/ops": "system_architect",

@@ -73,6 +73,33 @@ def set_layer_blackboard(layer_blackboard, agent_role, notebooks_dir):
     return
 
 
+def _normalize_agent_role_name(role: str) -> str:
+    r = str(role or "").strip().lower().replace(" ", "_")
+    alias_map = {
+        "database": "database_architect",
+        "database_agent": "database_architect",
+        "database_engineer": "database_architect",
+        "db": "database_architect",
+        "db_agent": "database_architect",
+        "db_architect": "database_architect",
+        "db_engineer": "database_architect",
+        "backend": "backend_engineer",
+        "backend_agent": "backend_engineer",
+        "frontend": "frontend_engineer",
+        "frontend_agent": "frontend_engineer",
+        "qa": "qa_engineer",
+        "qa_agent": "qa_engineer",
+        "tester": "qa_engineer",
+        "solution_architect": "system_architect",
+        "system_architect_agent": "system_architect",
+        "system/ops": "system_architect",
+        "project_orchestrator": "system_architect",
+        "orchestrator": "system_architect",
+        "system": "system_architect",
+    }
+    return alias_map.get(r, r)
+
+
 class CWDAwareToolRegistry:
     """Wrapper around ToolRegistry that makes tools workspace-aware"""
     
@@ -224,6 +251,16 @@ class CWDAwareToolRegistry:
             if self._is_within(workspace_abs, resolved_abs):
                 return resolved_abs
 
+        # Case 4a: Single-segment workspace directory shortcut
+        # Example from frontend agent: "frontend" should map to workspace/frontend,
+        # not workspace/frontend/frontend.
+        if "/" not in file_path and not file_path.startswith("./"):
+            candidate_dir = os.path.join(workspace_abs, file_path)
+            if os.path.isdir(candidate_dir):
+                candidate_abs = os.path.abspath(candidate_dir)
+                if self._is_within(workspace_abs, candidate_abs):
+                    return candidate_abs
+
         # Case 4: Cross-workspace direct path "other_agent/file.js"
         # Only treat as cross-workspace if first segment is an existing workspace subdir.
         if "/" in file_path and not file_path.startswith("./"):
@@ -352,6 +389,46 @@ class CWDAwareToolRegistry:
                             "description": "Filter by severity"
                         }
                     }
+                }
+            }
+        })
+
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "read_issue_queue",
+                "description": "Read your assigned issue queue (oldest first). Use this to pick the next issue to fix.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of queued issues to return",
+                            "default": 20
+                        }
+                    }
+                }
+            }
+        })
+
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "resolve_issue",
+                "description": "Mark one assigned issue as resolved after implementing and validating the fix.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "issue_id": {
+                            "type": "integer",
+                            "description": "Issue ID from read_issue_queue"
+                        },
+                        "resolution": {
+                            "type": "string",
+                            "description": "Concrete fix summary and validation evidence"
+                        }
+                    },
+                    "required": ["issue_id", "resolution"]
                 }
             }
         })
@@ -614,6 +691,7 @@ class CWDAwareToolRegistry:
             severity = function_args.get("severity", "HIGH")
             tried = function_args.get("tried", "")
             needs_help = function_args.get("needs_help_from", "")
+            needs_help_norm = _normalize_agent_role_name(needs_help) if needs_help else ""
             context = function_args.get("context", {})
             if not isinstance(context, dict):
                 context = {}
@@ -622,8 +700,8 @@ class CWDAwareToolRegistry:
             issue_msg = f"🚨 [{severity}] {component}: {description}"
             if tried:
                 issue_msg += f" | Tried: {tried}"
-            if needs_help:
-                issue_msg += f" | Needs: {needs_help}"
+            if needs_help_norm:
+                issue_msg += f" | Needs: {needs_help_norm}"
             
             try:
                 if _BLACKBOARD:
@@ -636,10 +714,26 @@ class CWDAwareToolRegistry:
                     description=description,
                     severity=severity,
                     reported_by=role,
-                    assigned_to=needs_help if needs_help else "unassigned",
+                    assigned_to=needs_help_norm if needs_help_norm else "unassigned",
                     tried=tried,
                     context=context,
                 )
+
+                if needs_help_norm and needs_help_norm != role and self.service_bus is not None and self.service_bus.is_enabled():
+                    detail_lines = [
+                        f"Issue #{issue.get('id')} assigned to you.",
+                        f"Severity: {severity}",
+                        f"Component: {component}",
+                        f"Description: {description}",
+                    ]
+                    if tried:
+                        detail_lines.append(f"Already tried: {tried}")
+                    if context:
+                        try:
+                            detail_lines.append("Context: " + json.dumps(context, ensure_ascii=False)[:1200])
+                        except Exception:
+                            detail_lines.append(f"Context: {str(context)[:1200]}")
+                    self.service_bus.send_question(role, needs_help_norm, "\n".join(detail_lines))
                 
                 return f"✅ Issue reported: [{severity}] {component}"
             except Exception as e:
@@ -666,6 +760,61 @@ class CWDAwareToolRegistry:
                 return output
             except Exception as e:
                 return f"ERROR reading issues: {str(e)}"
+
+        if function_name == "read_issue_queue":
+            try:
+                # Process ONE issue at a time (FIFO), not all at once.
+                # This ensures the agent focuses on one fix before claiming readiness.
+                issues_tracker = get_issues_tracker()
+                queued = issues_tracker.get_open_issues(assigned_to=role)
+                queued = sorted(queued, key=lambda i: int(i.get("id", 10**9)))
+                if not queued:
+                    return "✅ Issue queue is empty."
+
+                # Return only the NEXT (oldest) issue, not all
+                next_issue = queued[0]
+                total_remaining = len(queued)
+                
+                return (
+                    f"📬 Next issue for {role} ({next_issue.get('id')}/{total_remaining} total):\n"
+                    f"  Component: {next_issue.get('component')}\n"
+                    f"  Severity: {next_issue.get('severity')}\n"
+                    f"  Description: {next_issue.get('description')}\n\n"
+                    f"Fix this issue first, then call resolve_issue(#{next_issue.get('id')}) when done. "
+                    f"After resolution, call read_issue_queue() again for the next issue."
+                )
+            except Exception as e:
+                return f"ERROR reading issue queue: {str(e)}"
+
+        if function_name == "resolve_issue":
+            try:
+                issue_id = int(function_args.get("issue_id", 0) or 0)
+                resolution = str(function_args.get("resolution", "")).strip()
+                if issue_id <= 0 or not resolution:
+                    return "ERROR: resolve_issue requires positive issue_id and non-empty resolution"
+
+                issues_tracker = get_issues_tracker()
+                open_for_role = issues_tracker.get_open_issues(assigned_to=role)
+                allowed_ids = {int(i.get("id")) for i in open_for_role if i.get("id") is not None}
+                if issue_id not in allowed_ids:
+                    return f"ERROR: Issue #{issue_id} is not currently assigned to {role}"
+
+                resolved = issues_tracker.resolve_issue(issue_id, resolution)
+                if not resolved:
+                    return f"ERROR: Issue #{issue_id} not found or already resolved"
+
+                reporter = str(resolved.get("reported_by") or "").strip()
+                if reporter and reporter != role and self.service_bus is not None and self.service_bus.is_enabled():
+                    self.service_bus.send_response(
+                        role,
+                        reporter,
+                        str(issue_id),
+                        f"Issue #{issue_id} resolved by {role}. Resolution: {resolution}"
+                    )
+
+                return f"✅ Resolved issue #{issue_id}"
+            except Exception as e:
+                return f"ERROR resolving issue: {str(e)}"
         
         # Handle asking other agents questions
         if function_name == "ask_agent":
@@ -815,6 +964,64 @@ class CWDAwareToolRegistry:
         # For command tools, we need to run with correct CWD
         if function_name == "run_command":
             cmd = function_args.get("command", "")
+            cmd_norm = " ".join(str(cmd or "").strip().lower().split())
+            allowed_frontend_dev_probe = {
+                "npm run dev -- --port 5180",
+                "npm run dev -- --port 5180 --strictport",
+                "npm run dev -- --strictport --port 5180",
+            }
+            if cmd_norm in allowed_frontend_dev_probe:
+                cwd_arg = function_args.get("cwd")
+                if cwd_arg:
+                    if os.path.isabs(str(cwd_arg)):
+                        probe_cwd = os.path.abspath(str(cwd_arg))
+                    else:
+                        probe_cwd = os.path.abspath(os.path.join(self.workspace_root, str(cwd_arg)))
+                else:
+                    probe_cwd = os.path.abspath(self.allowed_root)
+
+                workspace_abs = os.path.abspath(self.workspace_root)
+                if not self._is_within(workspace_abs, probe_cwd):
+                    return "ERROR: Unsafe working directory"
+
+                try:
+                    result = subprocess.run(
+                        shlex.split(str(cmd)),
+                        shell=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=12,
+                        cwd=probe_cwd,
+                    )
+                    status = "SUCCESS" if result.returncode == 0 else "FAILED"
+                    return (
+                        f"STATUS: {status}\nEXIT_CODE: {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+                    )
+                except subprocess.TimeoutExpired as te:
+                    out = (te.stdout or "")
+                    err = (te.stderr or "")
+                    return (
+                        "STATUS: SUCCESS\n"
+                        "EXIT_CODE: 0\n"
+                        "STDOUT:\n"
+                        f"{out}\n"
+                        "STDERR:\n"
+                        f"{err}\n"
+                        "INFO: Frontend dev server appears to be running on port 5180 (timeout expected for long-running process)."
+                    )
+
+            if cmd_norm in {
+                "npm run dev",
+                "npm run start",
+                "node app.js",
+                "node server.js",
+                "npx vite",
+            } or cmd_norm.startswith("npm run dev ") or cmd_norm.startswith("npm run start ") or cmd_norm.startswith("npx vite "):
+                return (
+                    "ERROR: Manual long-running startup commands are disabled for agents. "
+                    "Do not run dev servers directly; rely on runtime smoke verification instead. "
+                    "Use build/syntax/test commands only."
+                )
             self.validation_actions += 1
             if getattr(self, "write_scope", "role") == "workspace":
                 cmd_text = str(cmd or "")
@@ -934,6 +1141,8 @@ class CWDAwareToolRegistry:
         # For read operations, use cross-workspace-aware path resolution
         if function_name == "read_file":
             file_path = function_args.get("file_path", "")
+            start_line = function_args.get("start_line")
+            end_line = function_args.get("end_line")
             try:
                 resolved_path = self._resolve_read_path(file_path)
                 self.read_operations += 1
@@ -948,8 +1157,28 @@ class CWDAwareToolRegistry:
                     if not os.path.exists(resolved_path):
                         return f"ERROR: File not found: {file_path}"
                     try:
-                        with open(resolved_path, 'r') as f:
+                        with open(resolved_path, 'r', encoding='utf-8', errors='ignore') as f:
                             content = f.read()
+
+                        if start_line is not None or end_line is not None:
+                            lines = content.splitlines()
+                            total = len(lines)
+                            if total == 0:
+                                return ""
+
+                            s = 1 if start_line is None else int(start_line)
+                            e = total if end_line is None else int(end_line)
+
+                            if s < 1:
+                                s = 1
+                            if e < s:
+                                return ""
+                            if s > total:
+                                return ""
+                            if e > total:
+                                e = total
+
+                            content = "\n".join(lines[s - 1:e])
                         
                         # CONTEXT PROTECTION: Truncate very large files to prevent token overflow
                         # 50KB limit per file read to prevent context explosion
@@ -1403,6 +1632,8 @@ GOLDEN RULES (Non-Negotiable)
 6. ✅ BATCH OPERATIONS - Write multiple files in one iteration, not sequentially
 7. ✅ DOCUMENT YOUR OUTPUT - Add inline comments/docs and create README.md in your workspace
 8. ✅ PLAN FIDELITY - Write and follow a concrete file/flow plan; if you deviate, note why in notebook
+9. ✅ THINK → ACT → REFLECT - After each meaningful tool action, log next 1-3 actions in notebook
+10. ✅ CONTRACT SUPREMACY - If specific instructions or peer messages contradict a JSON contract in the /contracts folder, the CONTRACT WINS. Report the contradiction and follow the contract
 
 ═══════════════════════════════════════════════════════════════════════════════
 WORK MODE (Iterative, not Waterfall)
@@ -1417,14 +1648,16 @@ Use a BUILD → VALIDATE → REFINE loop. You may revisit planning whenever need
 
 2) BUILD WITH FILE-FIRST SOURCE OF TRUTH
     • Read upstream code first (list_files/search_in_files/read_file)
+    • Use discovery intelligently: search/list first, then targeted read_file(start_line/end_line)
     • Prefer reading files over asking peers when code already answers the question
-    • Write multiple deliverables per iteration (batch write_file calls)
+    • Read and Write multiple deliverables per iteration (batch read_file and write_file calls)
     • Create/update dependency manifest + README.md only when required by your role contract/policy
 
 3) VALIDATE + REFINE
     • Non-QA: run targeted checks (run_command/check_syntax)
-    • QA: run/fix tests with realistic imports and runnable syntax
+    • QA: audit generated code and contracts end-to-end; report actionable issues with evidence
     • If a contract mismatch is found, fix code first, then post concise updates
+    • After each significant action, append NEXT_ACTIONS (1-3 bullets) to notebook
 
 4) COMPLETE
     • update_blackboard() summary
@@ -1469,7 +1702,8 @@ CRITICAL NOTES
 • PARALLEL AGENTS: Check task description for agent list
 • Package Dependencies: Always list requirements (package.json, requirements.txt, etc)
 • Documentation: Always create README.md in your workspace with setup + file overview
-• Testing: QA Engineer writes tests. Everyone else writes code only.
+• QA focus: QA Engineer performs code/contract audit and issue dispatch; implementation agents write code.
+• If issues are assigned to you, process them in queue order (read_issue_queue → fix → resolve_issue) before final ready token.
 • If blocked by a same-layer dependency, use sleep_agent() and resume only after wake_agent() signal
 • Error Strategy: If same error 3x → it's external, work around it and continue
 • Mocks are allowed only as clearly temporary fallbacks and must be documented
@@ -2182,42 +2416,49 @@ BUILD FAST. COORDINATE ON LAYER BLACKBOARD. END WITH [READY_FOR_VERIFICATION].""
 
 
 # Pre-configured agent roles
-class BackendEngineerAgent(GeneralAgent):
-    """Backend Engineer Agent - for API/server development"""
+class NodeExpressBackendEngineerAgent(GeneralAgent):
+    """Node/Express Backend Engineer Agent - API/server development only"""
     
     def __init__(self, allowed_root=DEFAULT_WORKSPACE_DIR, timeout=60):
         super().__init__(
-            role="Backend Engineer",
+            role="Node/Express Backend Engineer",
             role_description=(
-                "Develop server-side logic, APIs, database access, and business logic. "
-                "You implement controllers, routes, models, and integrate with upstream architecture."
+                "Develop server-side logic using Node.js + Express only. "
+                "You implement Express middleware, routes, controllers, and data access aligned to contracts."
             ),
             specific_instructions="""
 
 ═══════════════════════════════════════════════════════════════════════════════
-BACKEND ENGINEER WORKFLOW - CONTRACT-DRIVEN API DEVELOPMENT
+NODE/EXPRESS BACKEND ENGINEER WORKFLOW - CONTRACT-DRIVEN API DEVELOPMENT
 ═══════════════════════════════════════════════════════════════════════════════
+
+🔴 STACK LOCK (NON-NEGOTIABLE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- You MUST implement backend using Node.js + Express only.
+- Do NOT generate FastAPI, Django, Flask, NestJS, Spring, Rails, Go, or other backend stacks.
+- Prefer CommonJS unless existing project is explicitly ESM.
+- Entry point must be Express-app compatible (app.js/server.js per contract).
+- Keep runtime/startup scripts and entrypoints defined in package.json (dev/start) and standard backend port.
+- Do NOT manually run persistent dev servers (`npm run dev`, `npm run start`, `node app.js`, `node server.js`) during implementation.
+- Runtime startup is validated by smoke tests automatically.
+- Use `zod` to enforce request body schemas defined in the contract. Do NOT rely on manual if checks for complex objects.
 
 🔴 CRITICAL: CONTRACT IS SOURCE OF TRUTH
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DO NOT assume or prescribe files. READ THE CONTRACT:
-  1. Read contracts/directory_structure.json
-  2. List all files marked with "owned_by": "backend_engineer"
-  3. Read contracts/backend_api_contract.json
-  4. Those files + endpoints = your complete scope
-  5. Implement EXACTLY what's in the contract, nothing more
-  6. If contract doesn't list a file, DON'T create it
-  7. If you think a file is needed beyond the contract, raise an issue
+DO NOT assume API behavior. READ THE CONTRACT:
+    1. Read contracts/backend_api_contract.json
+    2. Implement EXACTLY the endpoints and schemas in contract
+    3. You MAY create, edit, and delete backend files as needed to satisfy the contract
+    4. Do not invent non-contract API routes/fields
 
 ═══════════════════════════════════════════════════════════════════════════════
 WORKFLOW
 ═══════════════════════════════════════════════════════════════════════════════
 
 1. READ CONTRACTS (First)
-   ├─ list_files() on contracts/ directory
-   ├─ read_file("contracts/directory_structure.json") → identify all YOUR files
-   ├─ read_file("contracts/backend_api_contract.json") → understand endpoints
-   ├─ write_to_notebook with the file list and endpoint map
+    ├─ list_files() on contracts/ directory
+    ├─ read_file("contracts/backend_api_contract.json") → understand endpoints
+    ├─ write_to_notebook with endpoint map and implementation plan
    └─ announce_plan() with contract-verified deliverables
 
 2. READ UPSTREAM (Before Writing)
@@ -2226,18 +2467,17 @@ WORKFLOW
    └─ Check for any middleware/auth patterns from other layers
 
 3. IMPLEMENT (Iteratively)
-   ├─ For each file in YOUR list from contract:
-   │  ├─ Understand its purpose (read the entry in directory_structure.json)
-   │  ├─ Implement it according to backend_api_contract.json
-   │  ├─ Write FULL production code (no stubs)
-   │  └─ Batch multiple files per iteration
+    ├─ Create/modify backend files needed to implement contract endpoints
+    ├─ Implement according to backend_api_contract.json
+    ├─ Write FULL production code (no stubs)
+    └─ Batch multiple files per iteration
    ├─ All endpoints, response fields, status codes EXACT to contract
    ├─ All field names, types, validation rules from contract
    └─ No invented routes, endpoints, or response formats
+   ├─ Security Baseline: You MUST use helmet for security headers, cors for cross-origin management, and express.json() for body parsing.
 
 4. VALIDATE (Before Completion)
    ├─ run_command() to validate syntax/imports
-   ├─ cross-check files against directory_structure.json
    ├─ verify all contract endpoints are implemented
    └─ test database connectivity (if available)
 
@@ -2245,6 +2485,15 @@ WORKFLOW
    ├─ post_to_layer_blackboard() final status
    ├─ reply to any direct backend questions from frontend
    └─ output [READY_FOR_VERIFICATION]
+
+🔴 DATA INTEGRITY GUARDRAILS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Schema Alignment: Field names in your SQL queries MUST match the database_architect schema exactly (snake_case vs camelCase).
+
+JSON Transformation: If the database uses snake_case and the contract requires camelCase responses, you MUST implement a mapping layer. Do NOT leak database naming conventions into the API response if they contradict the contract.
+
+Async Safety: Every database call MUST be wrapped in a try/catch block that specifically logs the query error before sending a generic 500 to the user.
 
 ═══════════════════════════════════════════════════════════════════════════════
 KEY PATTERNS FOR BACKEND IMPLEMENTATION
@@ -2303,13 +2552,14 @@ MANDATORY COMPLIANCE CHECKS
 ✅ Database queries use parameterized statements (no SQL injection)
 ✅ All secrets from environment variables (no hardcoding)
 ✅ No unhandled promise rejections in async handlers
+✅ All database/API calls in try/catch handlers
 
 ═══════════════════════════════════════════════════════════════════════════════
 IF SOMETHING IS MISSING OR AMBIGUOUS
 ═══════════════════════════════════════════════════════════════════════════════
 
-❓ Contract doesn't specify a file you think is needed?
-   → Do NOT invent it. Post on blackboard or raise an issue.
+❓ Need additional backend files to satisfy endpoint contract?
+    → Create them within backend scope and keep API behavior contract-compliant.
 
 ❓ Endpoint fields are unclear?
    → STOP and ask for contract clarification via blackboard.
@@ -2319,8 +2569,7 @@ IF SOMETHING IS MISSING OR AMBIGUOUS
    → If still unclear, report missing alignment issue.
 
 ❓ Should I create [specific middleware/config]?
-   → Only if it's in contracts/directory_structure.json
-   → Otherwise, it's out of scope.
+    → Create it if required to implement contract endpoints safely and correctly.
 
 ═══════════════════════════════════════════════════════════════════════════════
 PRODUCTION-GRADE REQUIREMENTS
@@ -2351,32 +2600,46 @@ SUCCESS = CONTRACT FULFILLMENT + PRODUCTION QUALITY
         )
 
 
-class FrontendDeveloperAgent(GeneralAgent):
-    """Frontend Developer Agent - for UI development"""
+class ReactFrontendEngineerAgent(GeneralAgent):
+    """React Frontend Engineer Agent - for React + Vite UI development"""
     
     def __init__(self, allowed_root=DEFAULT_WORKSPACE_DIR, timeout=60):
         super().__init__(
-            role="Frontend Developer",
+            role="React Frontend Engineer (Vite)",
             role_description=(
-                "Build responsive, accessible user interfaces using modern frameworks. "
-                "You handle component design, state management, and user interactions."
+                "Build responsive, accessible user interfaces using React + Vite + Tailwind CSS only. "
+                "You handle routing with react-router-dom, component design, and user interactions."
             ),
             specific_instructions="""
 ═══════════════════════════════════════════════════════════════════════════════
-FRONTEND DEVELOPER WORKFLOW - CONTRACT-DRIVEN UI DEVELOPMENT
+REACT FRONTEND ENGINEER WORKFLOW - CONTRACT-DRIVEN UI DEVELOPMENT
 ═══════════════════════════════════════════════════════════════════════════════
+
+🔴 STACK LOCK (NON-NEGOTIABLE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- You MUST use React + Vite only.
+- You MUST use Tailwind CSS as the primary styling system.
+- You MUST implement the visual style requested by the user (layout, colors, tone, interaction style) and not fall back to generic defaults.
+- You MUST keep frontend on port 5180 for dev runtime checks.
+- Do NOT use Next.js or CRA conventions.
+- Do NOT use `react-scripts`.
+- Do NOT create `_app.jsx` (Next.js convention).
+- You MUST create/use `main.jsx` with `ReactDOM.createRoot(...)` mounting the app root.
+- You MUST use `App.jsx` as root UI shell (or contract-declared equivalent) and wire routes there.
+- Use `react-router-dom` for routing (`BrowserRouter`, `Routes`, `Route`).
+- Do NOT implement custom routing with `window.history.pushState`.
+- Use `import.meta.env` for client env vars. Do NOT use `process.env` in browser code.
+- Do NOT manually run persistent dev servers (`npm run dev`, `npm run start`, `npx vite`) during implementation.
+- Runtime startup is validated by smoke tests automatically.
+- DO NOT default to "safe" tailwindCSS conventions - create UI/UX exactly in the style requested by the user
 
 🔴 CRITICAL: CONTRACT IS SOURCE OF TRUTH
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DO NOT assume or prescribe pages/components. READ THE CONTRACTS:
-  1. Read contracts/directory_structure.json
-  2. List all files marked with "owned_by": "frontend_engineer"
-  3. Read contracts/frontend_route_contract.json → routes you must implement
-  4. Read contracts/backend_api_contract.json → endpoints you will call
-  5. Those files + routes = your complete scope
-  6. Implement EXACTLY what's in the contract, nothing more
-  7. If contract doesn't list a page, DON'T create it
-  8. If you think a component is needed beyond the contract, raise an issue
+DO NOT assume API/route behavior. READ THE CONTRACTS:
+    1. Read contracts/frontend_route_contract.json → routes you must implement
+    2. Read contracts/backend_api_contract.json → endpoints you will call
+    3. Implement EXACTLY those routes/endpoints with no contract drift
+    4. You MAY create, edit, and delete frontend files as needed
 
 ═══════════════════════════════════════════════════════════════════════════════
 WORKFLOW
@@ -2384,10 +2647,9 @@ WORKFLOW
 
 1. READ ALL CONTRACTS (First)
    ├─ list_files() on contracts/ directory
-   ├─ read_file("contracts/directory_structure.json") → identify all YOUR pages/files
    ├─ read_file("contracts/frontend_route_contract.json") → understand routes
    ├─ read_file("contracts/backend_api_contract.json") → what endpoints to call
-   ├─ write_to_notebook with file list, route map, and endpoint map
+    ├─ write_to_notebook with route map and endpoint map
    └─ announce_plan() with contract-verified deliverables
 
 2. READ UPSTREAM (Before Writing)
@@ -2396,37 +2658,54 @@ WORKFLOW
    └─ Search for any frontend utilities already defined
 
 3. IMPLEMENT PAGES (Iteratively)
-   ├─ For each page/route in YOUR list from contract:
-   │  ├─ Understand the route (from frontend_route_contract.json)
-   │  ├─ Identify backend endpoints it needs (uses_endpoints field)
-   │  ├─ Implement page wired to EXACT API contract paths/fields
-   │  ├─ Write FULL production-grade React code (no stubs)
-   │  └─ Batch multiple pages per iteration
+    ├─ For each route in frontend_route_contract.json:
+    │  ├─ Identify backend endpoints it needs (uses_endpoints field)
+    │  ├─ Implement page wired to EXACT API contract paths/fields
+    │  ├─ Write FULL production-grade React code (no stubs/placeholders)
+    │  └─ Batch multiple pages per iteration
    ├─ All API field names, types, validation from backend_api_contract
    ├─ All response shapes match contract exactly
    └─ No invented fields, routes, or endpoints
 
 4. IMPLEMENT COMPONENTS (Support)
    ├─ Reusable components that multiple pages need
-   ├─ Consistent with Tailwind design system
+    ├─ Consistent with project design system declared by contract
    ├─ Proper accessibility (semantic HTML, ARIA)
    └─ Well-documented prop interfaces
 
-5. SETUP (Foundation)
+5. APPLICATION BOOTSTRAP (MANDATORY)
+    ├─ Ensure index.html includes EXACT entry script: <script type="module" src="/main.jsx"></script>
+    ├─ Ensure main.jsx mounts app with ReactDOM.createRoot
+    ├─ Ensure App.jsx renders visible UI and route shell
+    └─ Ensure app is runnable without blank screen
+
+6. SETUP (Foundation + Tailwind)
    ├─ API utilities (fetch wrappers, contract-aligned)
    ├─ Environment configuration (.env.example)
-   ├─ Tailwind + PostCSS bootstrap (if in contract)
-   ├─ Styling system (colors, spacing, typography)
+    ├─ Vite-compatible config and scripts
+    ├─ package.json MUST include a `dev` script using Vite on 5180 (recommended: `vite --port 5180 --strictPort`)
+    ├─ If `dev` script is missing, create/fix package.json script entries; do NOT install/switch to react-scripts
+    ├─ Tailwind setup: include tailwindcss + postcss + autoprefixer and configure content globs correctly
+    ├─ Define and use Tailwind theme tokens (colors, typography, spacing) in tailwind.config.js; avoid hardcoded color hex in classNames
+    ├─ Keep styles utility-first with reusable semantic components (Button/Card/Section/etc), not ad-hoc utility spam
+    ├─ Use class composition helpers (e.g., clsx/classnames) for conditional variants; avoid long repeated ternary class strings
+    ├─ Keep a small global stylesheet; avoid inline style-object hacks
    └─ State management (Context API or Redux)
+   ├─ CRITICAL: Define all custom colors, fonts (Serif/Mono), and spacing scales from the user's intent within tailwind.config.js first. Use these theme tokens throughout the app to ensure visual consistency.
 
-6. VALIDATE (Before Completion)
+7. VALIDATE (Before Completion)
    ├─ run_command() to verify build succeeds
-   ├─ cross-check files against directory_structure.json
-   ├─ verify all routes from contract are implemented
+    ├─ Do NOT run dev/start servers manually; smoke test handles runtime startup and browser checks
+    ├─ verify all routes from contract are implemented with final UX (no "coming soon", "todo", placeholder cards/buttons)
    ├─ verify all API calls match backend_api_contract
-   └─ check console for errors (run_command with dev server)
+    └─ verify app root mounts successfully (no blank bootstrap)
+   ├─ Use list_files() on frontend/ directory to go through all your generated files
+    └─ Ensure that there is NO placeholder code - If there is, add real, functioning code
+    └─ Make sure UI and page aesthetic properties match those requested by the user
+    └─ Make sure all API calls are wrapped in try-catch - handle all errors gracefully
 
-7. COORDINATE & COMPLETE
+
+8. COORDINATE & COMPLETE
    ├─ post_to_layer_blackboard() final status
    ├─ reply to any direct frontend questions from backend
    └─ output [READY_FOR_VERIFICATION]
@@ -2436,7 +2715,7 @@ API INTEGRATION PATTERNS
 ═══════════════════════════════════════════════════════════════════════════════
 
 Environment-Driven Base URL (MUST DO):
-  const BASE_URL = import.meta?.env?.VITE_API_URL || process.env.REACT_APP_API_URL || 'http://localhost:5000';
+    const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5100';
 
 API Utilities Module:
   export const api = {
@@ -2480,15 +2759,43 @@ MANDATORY QUALITY STANDARDS
 
 ✅ RESPONSIVENESS
    - Mobile-first design
-   - Tailwind responsive classes (md:, lg:, etc.)
+   - Responsive layout utilities per selected design system
    - Touch-friendly tap targets (48px min)
    - Flexible layouts (no fixed widths for content)
+
+✅ UI
+   - User Intent (colors, style, layout) Respected
+   - All UI features implemented EXACTLY in the style requested
+   - Task ledger used as Source of Truth for UI
+   - Tailwind utilized to its fullest extent - responsive, modern UI with features such as fade-ins, animations throughout the app etc. unless explicitly specified otherwise
 
 ✅ USER EXPERIENCE
    - Loading states on all async operations
    - Error messages (user-friendly, not stack traces)
    - Form validation before submit
    - Clear call-to-action buttons
+
+✅ API INTEGRATION CLEANLINESS
+   - Wrap all API calls in try-catch
+   - Provide sensible defaults when API fails
+   - Show loading states (not errors) during fetch
+
+═══════════════════════════════════════════════════════════════════════════════
+ISSUE FIX WORKFLOW (IF ASSIGNED ISSUES IN QUEUE)
+═══════════════════════════════════════════════════════════════════════════════
+
+If you are WOKEN UP with issues assigned to you (Issue Fix Mode):
+
+1. Call read_issue_queue() to get the NEXT issue (oldest first, one at a time)
+2. Inspect the implicated file(s) mentioned in the issue  
+3. Fix the issue completely (write real code, not placeholders)
+4. Call resolve_issue(issue_id) with your fix summary when done
+5. Call read_issue_queue() AGAIN to get the next issue
+6. Repeat steps 2-5 until the response is "Issue queue is empty"
+7. ONLY THEN output [READY_FOR_VERIFICATION]
+
+CRITICAL: Do NOT output [READY_FOR_VERIFICATION] until ALL assigned issues are resolved.
+CRITICAL: Process one issue at a time; do NOT try to fix all issues in one iteration.
 
 ✅ CODE QUALITY
    - No console errors or warnings
@@ -2497,10 +2804,19 @@ MANDATORY QUALITY STANDARDS
    - Clean, readable code with inline comments
 
 ✅ DESIGN CONSISTENCY
-   - Tailwind-based color system (not scattered hex codes)
+     - Follow user-requested UI direction and contract-declared design system consistently
+   - Use Tailwind utility patterns consistently (layout, spacing, typography, states)
+   - Prefer composition helpers for repeated class sets (avoid copy-paste class sprawl)
+    - Extract repeated UI patterns into reusable components and variant APIs
+    - Use clear visual hierarchy, spacing rhythm, and constrained readable content widths
+    - Implement interaction states (hover/focus/active) and subtle depth/motion where design calls for it
    - Consistent spacing/typography throughout
    - Visual hierarchy clear and intentional
-   - Dark mode support (if in contract)
+    - Avoid ad-hoc mixed UI frameworks
+
+✅ STRICT COMPLETENESS
+    - NEVER leave placeholders/stubs like "coming soon", "to be implemented", empty shells, or fake static mocks unless explicitly requested.
+    - If requirements are missing, raise an issue; do not ship placeholder UI.
 
 ═══════════════════════════════════════════════════════════════════════════════
 IF CONTRACT DOESN'T MATCH REALITY
@@ -2516,7 +2832,7 @@ IF CONTRACT DOESN'T MATCH REALITY
    → Do NOT create it. Post on blackboard asking if it should be in scope.
 
 ❓ Environment variable not set?
-   → Use default (localhost:5000) and document in README.
+    → Use default (localhost:5100) and document in README.
 
 ❓ Cannot connect to backend?
    → Build UI skeleton anyway. Create mock API responses temporarily.
@@ -2528,19 +2844,34 @@ SUCCESS = CONTRACT FULFILLMENT + PRODUCTION QUALITY
 
 ✅ All pages/routes from contract implemented
 ✅ All pages render without errors
-✅ Navigation between pages works
+✅ Navigation between pages works (react-router-dom)
 ✅ API calls use exact contract paths/field names
+✅ API call errors handled gracefully with fallbacks
 ✅ Response data mapped to UI correctly
+✅ UI designed exactly as requested by user
+✅ Interactive and Responsive CSS features throughout website - unless explicitly specified otherwise
 ✅ Loading + error states visible
 ✅ Mobile responsive
 ✅ Accessible (semantic HTML, ARIA, keyboard nav)
-✅ Production-grade styling (Tailwind, no inline hacks)
-✅ No console errors
+✅ Single frontend stack (React + Vite only)
+✅ No process.env in browser code
+✅ No stubs/placeholder code in any file
 ✅ Build succeeds (npm run build or equivalent)
 """,
             allowed_root=allowed_root,
             timeout=timeout
         )
+
+
+# Backward-compatible aliases (deprecated names)
+class BackendEngineerAgent(NodeExpressBackendEngineerAgent):
+    """Backward-compatible alias for NodeExpressBackendEngineerAgent."""
+    pass
+
+
+class FrontendDeveloperAgent(ReactFrontendEngineerAgent):
+    """Backward-compatible alias for ReactFrontendEngineerAgent."""
+    pass
 
 
 class DevOpsEngineerAgent(GeneralAgent):
@@ -2592,7 +2923,7 @@ def main():
     """Example usage of the agent framework"""
     
     # Example: Create a backend engineer for a specific task
-    agent = BackendEngineerAgent()
+    agent = NodeExpressBackendEngineerAgent()
     
     result = agent.execute(
         task_description="Create a RESTFUL API for a bakery website with full CRUD functionality.",

@@ -27,6 +27,14 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from blob_workspace import build_blob_workspace_from_env
+from cosmos_client import (
+    get_cosmos_client,
+    get_starter_template,
+    init_cosmos_db,
+    resolve_starter_template_for_stack,
+    seed_default_templates,
+    seed_starter_templates,
+)
 
 
 load_dotenv()
@@ -125,6 +133,7 @@ class HealthResponse(BaseModel):
     status: str
     timestamp: str
     version: str
+    cosmos: Optional[Dict[str, Any]] = None
 
 
 class ClarifyRequest(BaseModel):
@@ -279,6 +288,16 @@ AGENT_CATALOG: List[Dict[str, Any]] = [
     },
 ]
 
+COSMOS_STARTUP_STATUS: Dict[str, Any] = {
+    "enabled": False,
+    "required": False,
+    "initialized": False,
+    "containers": [],
+    "template_seed": None,
+    "starter_template_seed": None,
+    "error": None,
+}
+
 _ORCHESTRATOR_MODULE = None
 DISABLED_AGENT_ROLES = {"security_engineer"}
 
@@ -364,6 +383,69 @@ def _discover_frontend_preview_entry(project_id: str) -> Optional[str]:
         return None
     _base, rel = target
     return rel
+
+
+def _inject_preview_console_bridge(html: str, project_id: str) -> str:
+        """Inject script that forwards generated-frontend console output to preview parent window."""
+        if not isinstance(html, str) or not html:
+                return html
+
+        marker = "data-nexus-preview-bridge=\"1\""
+        if marker in html:
+                return html
+
+        bridge = f"""
+<script {marker}>
+(function() {{
+    if (window.__NEXUS_PREVIEW_BRIDGE__) return;
+    window.__NEXUS_PREVIEW_BRIDGE__ = true;
+
+    var PROJECT_ID = {json.dumps(project_id)};
+    function send(level, msg) {{
+        try {{
+            var text = (typeof msg === 'string') ? msg : (msg && msg.message ? String(msg.message) : String(msg));
+            window.parent && window.parent.postMessage({{
+                type: 'nexus_generated_frontend_output',
+                project_id: PROJECT_ID,
+                level: String(level || 'log'),
+                message: text,
+                ts: Date.now()
+            }}, '*');
+        }} catch (_e) {{}}
+    }}
+
+    ['log', 'info', 'warn', 'error', 'debug'].forEach(function(level) {{
+        var orig = console[level];
+        console[level] = function() {{
+            try {{
+                var args = Array.prototype.slice.call(arguments || []);
+                var msg = args.map(function(a) {{
+                    if (typeof a === 'string') return a;
+                    try {{ return JSON.stringify(a); }} catch (_err) {{ return String(a); }}
+                }}).join(' ');
+                send(level, msg);
+            }} catch (_err) {{}}
+            if (typeof orig === 'function') return orig.apply(console, arguments);
+        }};
+    }});
+
+    window.addEventListener('error', function(evt) {{
+        var msg = (evt && (evt.message || (evt.error && evt.error.message))) || 'window error';
+        send('error', msg);
+    }});
+
+    window.addEventListener('unhandledrejection', function(evt) {{
+        var reason = evt && evt.reason;
+        var msg = (reason && reason.message) ? reason.message : String(reason || 'unhandled rejection');
+        send('error', msg);
+    }});
+}})();
+</script>
+"""
+
+        if "</body>" in html:
+                return html.replace("</body>", bridge + "</body>")
+        return html + bridge
 
 
 def _append_project_log(project_id: str, event: str, **data: Any) -> None:
@@ -1018,11 +1100,91 @@ def _check_input_safety(text: str) -> Dict[str, Any]:
 
 @app.get("/api/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
+    cosmos_payload = {
+        "enabled": COSMOS_STARTUP_STATUS.get("enabled", False),
+        "required": COSMOS_STARTUP_STATUS.get("required", False),
+        "initialized": COSMOS_STARTUP_STATUS.get("initialized", False),
+        "containers": COSMOS_STARTUP_STATUS.get("containers", []),
+        "template_seed": COSMOS_STARTUP_STATUS.get("template_seed"),
+        "starter_template_seed": COSMOS_STARTUP_STATUS.get("starter_template_seed"),
+        "error": COSMOS_STARTUP_STATUS.get("error"),
+    }
     return {
-        "status": "healthy",
+        "status": "healthy" if (not cosmos_payload["required"] or cosmos_payload["initialized"]) else "degraded",
         "timestamp": datetime.utcnow().isoformat(),
         "version": "1.0.0",
+        "cosmos": cosmos_payload,
     }
+
+
+@app.get("/api/cosmos/health", tags=["Health", "Cosmos"])
+async def cosmos_health_check():
+    if not COSMOS_STARTUP_STATUS.get("enabled", False):
+        return {
+            "status": "disabled",
+            "startup": COSMOS_STARTUP_STATUS,
+            "health": None,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    try:
+        health = await asyncio.to_thread(get_cosmos_client().health_check)
+        status = "healthy" if health.get("connected") and not health.get("error") else "degraded"
+        return {
+            "status": status,
+            "startup": COSMOS_STARTUP_STATUS,
+            "health": health,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "startup": COSMOS_STARTUP_STATUS,
+            "health": None,
+            "error": str(exc),
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+
+@app.post("/api/cosmos/templates/seed", tags=["Cosmos"])
+async def seed_cosmos_templates():
+    result = await asyncio.to_thread(seed_default_templates)
+    status = "seeded" if result.get("ok") else "failed"
+    return {
+        "status": status,
+        "result": result,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/api/cosmos/starter-templates/seed", tags=["Cosmos"])
+async def seed_cosmos_starter_templates():
+    result = await asyncio.to_thread(seed_starter_templates)
+    status = "seeded" if result.get("ok") else "failed"
+    return {
+        "status": status,
+        "result": result,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@app.get("/api/cosmos/starter-templates/resolve/by-stack", tags=["Cosmos"])
+async def resolve_cosmos_starter_template(stack: str = Query(..., description="Comma-separated stack tokens")):
+    tokens = [token.strip().lower() for token in str(stack or "").split(",") if token.strip()]
+    if not tokens:
+        raise HTTPException(status_code=400, detail="stack query parameter is required")
+    doc = await asyncio.to_thread(resolve_starter_template_for_stack, tokens)
+    if not isinstance(doc, dict):
+        raise HTTPException(status_code=404, detail=f"No starter template matched stack tokens: {tokens}")
+    return {"template": doc, "timestamp": datetime.utcnow().isoformat()}
+
+
+@app.get("/api/cosmos/starter-templates/{template_id}", tags=["Cosmos"])
+async def get_cosmos_starter_template(template_id: str):
+    doc = await asyncio.to_thread(get_starter_template, template_id)
+    if not isinstance(doc, dict):
+        raise HTTPException(status_code=404, detail=f"Starter template not found: {template_id}")
+    return {"template": doc, "timestamp": datetime.utcnow().isoformat()}
 
 
 @app.get("/api/status", tags=["Health"])
@@ -1037,6 +1199,15 @@ async def status():
         "active_projects": len(active),
         "total_projects": len(store.projects),
         "firebase_configured": firebase_meta.get("configured", False),
+        "cosmos": {
+            "enabled": COSMOS_STARTUP_STATUS.get("enabled", False),
+            "required": COSMOS_STARTUP_STATUS.get("required", False),
+            "initialized": COSMOS_STARTUP_STATUS.get("initialized", False),
+            "containers": COSMOS_STARTUP_STATUS.get("containers", []),
+            "template_seed": COSMOS_STARTUP_STATUS.get("template_seed"),
+            "starter_template_seed": COSMOS_STARTUP_STATUS.get("starter_template_seed"),
+            "error": COSMOS_STARTUP_STATUS.get("error"),
+        },
     }
 
 
@@ -1369,6 +1540,14 @@ async def preview(project_id: str, path: str = ""):
         ".gif": "image/gif",
         ".svg": "image/svg+xml",
     }
+    if suffix == ".html":
+        try:
+            raw = target.read_text(encoding="utf-8", errors="ignore")
+            patched = _inject_preview_console_bridge(raw, project_id=project_id)
+            return HTMLResponse(content=patched, status_code=200)
+        except Exception:
+            # Fall back to regular file response if injection fails.
+            pass
     return FileResponse(target, media_type=content_types.get(suffix, "application/octet-stream"))
 
 
@@ -1744,6 +1923,60 @@ async def general_exception_handler(_request, _exc: Exception):
 @app.on_event("startup")
 async def startup_event():
     logger.info("🚀 Nexus platform-compatible backend starting")
+
+    cosmos_connection = (os.getenv("COSMOS_CONNECTION_STR") or "").strip()
+    persist_code_to_db = str(os.getenv("PERSIST_CODE_TO_DB", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    require_cosmos = str(os.getenv("REQUIRE_COSMOS_ON_STARTUP", "true")).strip().lower() in {"1", "true", "yes", "on"}
+
+    COSMOS_STARTUP_STATUS["required"] = require_cosmos and (persist_code_to_db or bool(cosmos_connection))
+    COSMOS_STARTUP_STATUS["enabled"] = bool(cosmos_connection)
+
+    if not cosmos_connection:
+        msg = "COSMOS_CONNECTION_STR not configured"
+        COSMOS_STARTUP_STATUS["error"] = msg
+        if COSMOS_STARTUP_STATUS["required"]:
+            logger.error("❌ %s (required by startup policy)", msg)
+            raise RuntimeError(msg)
+        logger.warning("⚠️ %s; continuing startup", msg)
+        return
+
+    ok = await asyncio.to_thread(init_cosmos_db)
+    if not ok:
+        COSMOS_STARTUP_STATUS["initialized"] = False
+        COSMOS_STARTUP_STATUS["error"] = "Failed to initialize Cosmos DB containers"
+        logger.error("❌ Cosmos DB initialization failed")
+        if COSMOS_STARTUP_STATUS["required"]:
+            raise RuntimeError(COSMOS_STARTUP_STATUS["error"])
+        return
+
+    health = get_cosmos_client().health_check()
+    COSMOS_STARTUP_STATUS["initialized"] = True
+    COSMOS_STARTUP_STATUS["containers"] = health.get("containers", [])
+    COSMOS_STARTUP_STATUS["error"] = health.get("error")
+
+    try:
+        seed_result = await asyncio.to_thread(seed_default_templates)
+        COSMOS_STARTUP_STATUS["template_seed"] = seed_result
+        if seed_result.get("ok"):
+            logger.info("✅ Cosmos TemplateLibrary seeded: %s", seed_result.get("upserted", []))
+        else:
+            logger.warning("⚠️ Cosmos template seeding incomplete: %s", seed_result)
+    except Exception as exc:
+        COSMOS_STARTUP_STATUS["template_seed"] = {"ok": False, "error": str(exc)}
+        logger.warning("⚠️ Cosmos template seeding failed: %s", exc)
+
+    try:
+        starter_seed_result = await asyncio.to_thread(seed_starter_templates)
+        COSMOS_STARTUP_STATUS["starter_template_seed"] = starter_seed_result
+        if starter_seed_result.get("ok"):
+            logger.info("✅ Cosmos starter_templates seeded: %s", starter_seed_result.get("upserted", []))
+        else:
+            logger.warning("⚠️ Cosmos starter template seeding incomplete: %s", starter_seed_result)
+    except Exception as exc:
+        COSMOS_STARTUP_STATUS["starter_template_seed"] = {"ok": False, "error": str(exc)}
+        logger.warning("⚠️ Cosmos starter template seeding failed: %s", exc)
+
+    logger.info("✅ Cosmos DB initialized with containers: %s", COSMOS_STARTUP_STATUS["containers"])
 
 
 @app.on_event("shutdown")

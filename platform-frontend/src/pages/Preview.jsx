@@ -18,6 +18,7 @@ export default function Preview({ currentProjectId, projectData }) {
   const [deploymentError, setDeploymentError] = useState(null)
   const [deploymentNotice, setDeploymentNotice] = useState('')
   const [deployMenuOpen, setDeployMenuOpen] = useState(false)
+  const [previewOutput, setPreviewOutput] = useState([])
   const deployMenuRef = useRef(null)
 
   useEffect(() => {
@@ -28,6 +29,7 @@ export default function Preview({ currentProjectId, projectData }) {
     if (!currentProjectId) {
       setDeploymentInfo(null)
       setDeploymentError(null)
+      setPreviewOutput([])
       return
     }
 
@@ -61,6 +63,30 @@ export default function Preview({ currentProjectId, projectData }) {
   }, [projectData])
 
   useEffect(() => {
+    const onPreviewMessage = (event) => {
+      const data = event?.data
+      if (!data || data.type !== 'nexus_generated_frontend_output') return
+      if (currentProjectId && data.project_id && data.project_id !== currentProjectId) return
+
+      const level = String(data.level || 'log').toLowerCase()
+      const message = String(data.message || '').trim()
+      if (!message) return
+
+      setPreviewOutput((prev) => {
+        const next = [...prev, {
+          ts: Number(data.ts || Date.now()),
+          level,
+          message,
+        }]
+        return next.slice(-120)
+      })
+    }
+
+    window.addEventListener('message', onPreviewMessage)
+    return () => window.removeEventListener('message', onPreviewMessage)
+  }, [currentProjectId])
+
+  useEffect(() => {
     const handleDocumentClick = (event) => {
       if (!deployMenuRef.current) return
       if (!deployMenuRef.current.contains(event.target)) {
@@ -77,6 +103,7 @@ export default function Preview({ currentProjectId, projectData }) {
     setError(null)
     setIframeError(false)
     setTunnelInfo(null)  // Clear tunnel info to prevent old iframe from loading
+    setPreviewOutput([])
     
     try {
       if (!currentProjectId) {
@@ -390,6 +417,35 @@ export default function Preview({ currentProjectId, projectData }) {
         <p className="text-xs text-foreground/60">
           <span className="font-semibold">Info:</span> The preview shows the generated frontend code in real-time
         </p>
+      </div>
+
+      {/* Generated frontend output (console/page runtime) */}
+      <div className="mt-3 rounded-lg border border-border bg-secondary/40 px-3 py-2">
+        <div className="mb-2 flex items-center justify-between">
+          <p className="text-xs font-semibold text-foreground/70">Generated Frontend Output</p>
+          <button
+            type="button"
+            onClick={() => setPreviewOutput([])}
+            className="rounded border border-border px-2 py-0.5 text-[11px] text-foreground/60 hover:bg-accent"
+          >
+            Clear
+          </button>
+        </div>
+
+        {previewOutput.length === 0 ? (
+          <p className="text-xs text-foreground/50">No browser output captured yet.</p>
+        ) : (
+          <div className="max-h-40 overflow-auto rounded border border-border/60 bg-card/80 p-2">
+            {previewOutput.map((item, idx) => (
+              <div key={`${item.ts}-${idx}`} className="mb-1 text-[11px] font-mono leading-snug text-foreground/75">
+                <span className={`mr-2 inline-block rounded px-1 ${item.level === 'error' ? 'bg-red-100 text-red-700' : item.level === 'warn' || item.level === 'warning' ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-700'}`}>
+                  {item.level}
+                </span>
+                {item.message}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   )

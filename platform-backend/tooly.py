@@ -31,26 +31,69 @@ def _detect_repo_root() -> Path:
 
 REPO_ROOT = _detect_repo_root()
 DEFAULT_WORKSPACE_DIR = str((REPO_ROOT / "workspace").resolve())
+KNOWN_WORKSPACE_ROOT_DIRS = {
+    "backend",
+    "frontend",
+    "database",
+    "contracts",
+    "tests",
+    "infra",
+    "docs",
+    "api",
+    "config",
+}
 
 
 class ToolConfig:
     """Configuration for tool execution"""
     def __init__(self, allowed_root=DEFAULT_WORKSPACE_DIR, timeout=60):
-        self.allowed_root = allowed_root
+        self.allowed_root = str(Path(allowed_root).resolve())
         self.timeout = timeout
+        self.workspace_root = str(self._infer_workspace_root())
         os.makedirs(self.allowed_root, exist_ok=True)
+
+    def _infer_workspace_root(self) -> Path:
+        root = Path(self.allowed_root).resolve()
+        if any((root / d).exists() for d in KNOWN_WORKSPACE_ROOT_DIRS):
+            return root
+
+        parent = root.parent
+        if parent and parent.exists() and any((parent / d).exists() for d in KNOWN_WORKSPACE_ROOT_DIRS):
+            return parent
+
+        return root
     
     def resolve_path(self, path):
         """
         Maps agent paths (/workspace/...) to local paths (./workspace/...)
         Ensures all file operations stay within allowed root.
         """
-        path = str(path or "")
-        if path.startswith("/workspace"):
-            relative_path = path[len("/workspace"):].lstrip("/")
-            candidate = Path(self.allowed_root) / relative_path
-        else:
-            candidate = Path(self.allowed_root) / path.lstrip("/")
+        raw = str(path or "").strip()
+        allowed_root = Path(self.allowed_root).resolve()
+        workspace_root = Path(self.workspace_root).resolve()
+
+        if raw in {"", ".", "./"}:
+            return str(allowed_root)
+
+        if raw.startswith("/workspace"):
+            relative_path = raw[len("/workspace"):].lstrip("/")
+            candidate = workspace_root / relative_path
+            return str(candidate.resolve())
+
+        if os.path.isabs(raw):
+            candidate = Path(raw)
+            return str(candidate.resolve())
+
+        normalized = raw.lstrip("./")
+        candidate = allowed_root / normalized
+
+        first_segment = normalized.split("/", 1)[0] if normalized else ""
+        if (not candidate.exists()) and first_segment in KNOWN_WORKSPACE_ROOT_DIRS:
+            candidate = workspace_root / normalized
+
+        if (not candidate.exists()) and first_segment == allowed_root.name:
+            candidate = workspace_root / normalized
+
         return str(candidate.resolve())
     
     def is_safe_path(self, full_path):
@@ -68,15 +111,42 @@ class FilesTools:
     def __init__(self, config):
         self.config = config
     
-    def read_file(self, file_path):
-        """Read the contents of a file from the workspace"""
+    def read_file(self, file_path, start_line=None, end_line=None):
+        """Read the contents of a file from the workspace.
+
+        Optional line slicing:
+        - start_line: 1-based inclusive start line
+        - end_line: 1-based inclusive end line
+        """
         try:
             full_path = self.config.resolve_path(file_path)
             if not self.config.is_safe_path(full_path):
                 return "ERROR: Access Denied. You may only access files in the workspace directory."
-            
-            with open(full_path, 'r') as f:
-                return f.read()
+
+            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+
+            if start_line is None and end_line is None:
+                return content
+
+            lines = content.splitlines()
+            total = len(lines)
+            if total == 0:
+                return ""
+
+            s = 1 if start_line is None else int(start_line)
+            e = total if end_line is None else int(end_line)
+
+            if s < 1:
+                s = 1
+            if e < s:
+                return ""
+            if s > total:
+                return ""
+            if e > total:
+                e = total
+
+            return "\n".join(lines[s - 1:e])
         except FileNotFoundError:
             return f"ERROR: File not found: {file_path}"
         except Exception as e:
@@ -99,12 +169,22 @@ class FilesTools:
     def list_files(self, directory):
         """List all files in a directory"""
         try:
-            full_path = self.config.resolve_path(directory)
+            requested = str(directory or ".")
+            full_path = self.config.resolve_path(requested)
             if not self.config.is_safe_path(full_path):
                 return "ERROR: Access Denied."
             
             if not os.path.isdir(full_path):
-                return f"ERROR: Directory not found: {directory}"
+                root_name = Path(self.config.allowed_root).name
+                guidance = (
+                    f"Try '.' to list the current root ({self.config.allowed_root}), "
+                    f"or '/workspace/<dir>' from workspace root ({self.config.workspace_root})."
+                )
+                if requested.strip("/") == root_name:
+                    guidance = (
+                        f"You are already rooted at '{root_name}'. Try '.' or a subdirectory like 'pages', 'components', or 'routes'."
+                    )
+                return f"ERROR: Directory not found: {directory} (resolved: {full_path}). {guidance}"
             
             files = os.listdir(full_path)
             return json.dumps(files)
@@ -232,6 +312,24 @@ class ValidationTools:
     
     def __init__(self, config):
         self.config = config
+
+    def _resolve_case_insensitive(self, full_path):
+        candidate = Path(full_path)
+        if candidate.exists():
+            return str(candidate.resolve())
+
+        parent = candidate.parent
+        if not parent.exists() or not parent.is_dir():
+            return None
+
+        target_name = candidate.name.lower()
+        try:
+            for child in parent.iterdir():
+                if child.name.lower() == target_name:
+                    return str(child.resolve())
+        except Exception:
+            return None
+        return None
     
     def check_syntax(self, file_path, language=None):
         """
@@ -242,6 +340,10 @@ class ValidationTools:
             full_path = self.config.resolve_path(file_path)
             if not self.config.is_safe_path(full_path):
                 return "ERROR: Access Denied."
+
+            ci_path = self._resolve_case_insensitive(full_path)
+            if ci_path and self.config.is_safe_path(ci_path):
+                full_path = ci_path
             
             if not os.path.exists(full_path):
                 return f"ERROR: File not found: {file_path}"
@@ -339,9 +441,23 @@ class ValidationTools:
             full_path = self.config.resolve_path(file_path)
             if not self.config.is_safe_path(full_path):
                 return "ERROR: Access Denied."
+
+            ci_path = self._resolve_case_insensitive(full_path)
+            if ci_path and self.config.is_safe_path(ci_path):
+                full_path = ci_path
             
             if not os.path.exists(full_path):
-                return f"ERROR: File not found: {file_path}"
+                root_name = Path(self.config.allowed_root).name
+                guidance = (
+                    f"Try a path relative to current root ({self.config.allowed_root}) "
+                    f"or use '/workspace/<path>' rooted at ({self.config.workspace_root})."
+                )
+                if str(file_path or "").strip("/").startswith(root_name + "/"):
+                    guidance = (
+                        f"Path appears to include duplicated root '{root_name}'. "
+                        f"Try dropping that prefix (example: 'pages/index.jsx' instead of '{root_name}/pages/index.jsx')."
+                    )
+                return f"ERROR: File not found: {file_path} (resolved: {full_path}). {guidance}"
             
             _, ext = os.path.splitext(file_path)
             ext = ext.lower()
@@ -409,6 +525,120 @@ class ValidationTools:
             return "⚠️ ESLint not found in environment"
 
 
+class TemplateTools:
+    """Starter-template tools backed by Cosmos DB."""
+
+    def __init__(self, config):
+        self.config = config
+
+    def _resolve_target_dir(self, target_directory: str) -> Path:
+        workspace_root = Path(self.config.workspace_root).resolve()
+        target_raw = str(target_directory or "").strip().replace("\\", "/")
+        if not target_raw:
+            target_raw = "."
+
+        if target_raw.startswith("/workspace/"):
+            target_raw = target_raw[len("/workspace/"):]
+        elif target_raw == "/workspace":
+            target_raw = "."
+
+        target_abs = (workspace_root / target_raw).resolve()
+        if not str(target_abs).startswith(str(workspace_root)):
+            raise ValueError(f"Target directory is outside workspace: {target_directory}")
+        return target_abs
+
+    def _write_template_files(self, target_abs: Path, files_map: dict, overwrite: bool = False) -> dict:
+        created = 0
+        updated = 0
+        skipped = 0
+        errors = []
+
+        workspace_root = Path(self.config.workspace_root).resolve()
+
+        for rel_path, content in (files_map or {}).items():
+            try:
+                rel = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+                if not rel:
+                    continue
+                abs_file = (target_abs / rel).resolve()
+                if not str(abs_file).startswith(str(workspace_root)):
+                    errors.append(f"Skipped unsafe file path: {rel}")
+                    continue
+
+                os.makedirs(abs_file.parent, exist_ok=True)
+                if abs_file.exists() and not overwrite:
+                    skipped += 1
+                    continue
+
+                with open(abs_file, "w", encoding="utf-8") as f:
+                    f.write(str(content or ""))
+
+                if abs_file.exists() and overwrite:
+                    updated += 1
+                else:
+                    created += 1
+            except Exception as e:
+                errors.append(f"{rel_path}: {str(e)}")
+
+        return {
+            "created": created,
+            "updated": updated,
+            "skipped": skipped,
+            "errors": errors,
+        }
+
+    def init_starter_template(self, template_id: str, target_directory: str, overwrite: bool = False):
+        """Initialize a specific starter template into a target directory."""
+        try:
+            from cosmos_client import get_starter_template
+
+            target_abs = self._resolve_target_dir(target_directory)
+            doc = get_starter_template(template_id)
+            if not isinstance(doc, dict):
+                return f"ERROR: Starter template not found in Cosmos DB: {template_id}"
+
+            files_map = doc.get("files") if isinstance(doc.get("files"), dict) else {}
+            if not files_map:
+                return f"ERROR: Starter template has no files payload: {template_id}"
+
+            write_result = self._write_template_files(target_abs, files_map, overwrite=bool(overwrite))
+            status = "ok" if not write_result.get("errors") else "partial"
+            return json.dumps({
+                "status": status,
+                "template_id": doc.get("template_id") or doc.get("id"),
+                "target_directory": str(target_abs),
+                **write_result,
+            })
+        except Exception as e:
+            return f"ERROR: Failed to initialize starter template: {str(e)}"
+
+    def init_starter_template_for_stack(self, stack: list, target_directory: str, overwrite: bool = False):
+        """Resolve starter template from stack tokens, then initialize it."""
+        try:
+            from cosmos_client import resolve_starter_template_for_stack
+
+            tokens = []
+            if isinstance(stack, list):
+                tokens = [str(s).strip().lower() for s in stack if str(s).strip()]
+            elif isinstance(stack, str):
+                tokens = [s.strip().lower() for s in stack.split(",") if s.strip()]
+
+            if not tokens:
+                return "ERROR: stack must be a non-empty list or comma-separated string"
+
+            doc = resolve_starter_template_for_stack(tokens)
+            if not isinstance(doc, dict):
+                return f"ERROR: No starter template matched stack tokens: {tokens}"
+
+            template_id = str(doc.get("template_id") or doc.get("id") or "").strip()
+            if not template_id:
+                return "ERROR: Matched starter template is missing template_id"
+
+            return self.init_starter_template(template_id, target_directory, overwrite=overwrite)
+        except Exception as e:
+            return f"ERROR: Failed to resolve starter template by stack: {str(e)}"
+
+
 class ToolRegistry:
     """Registry of all available tools"""
     
@@ -421,6 +651,7 @@ class ToolRegistry:
         self.commands = CommandTools(config)
         self.search = SearchTools(config)
         self.validation = ValidationTools(config)
+        self.templates = TemplateTools(config)
     
     def get_tool_definitions(self):
         """Return OpenAI-compatible tool definitions"""
@@ -429,13 +660,21 @@ class ToolRegistry:
                 "type": "function",
                 "function": {
                     "name": "read_file",
-                    "description": "Read the contents of a file from the workspace",
+                    "description": "Read the contents of a file from the workspace (optionally by line range)",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "file_path": {
                                 "type": "string",
                                 "description": "Path to the file, e.g. /workspace/api.js"
+                            },
+                            "start_line": {
+                                "type": "integer",
+                                "description": "Optional 1-based inclusive start line"
+                            },
+                            "end_line": {
+                                "type": "integer",
+                                "description": "Optional 1-based inclusive end line"
                             }
                         },
                         "required": ["file_path"]
@@ -467,13 +706,13 @@ class ToolRegistry:
                 "type": "function",
                 "function": {
                     "name": "list_files",
-                    "description": "List all files in a directory",
+                    "description": "List files in a directory. Prefer '.' for current role root, or '/workspace/<dir>' for workspace-root paths.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "directory": {
                                 "type": "string",
-                                "description": "Directory path to list"
+                                "description": "Directory to list. Examples: '.', 'pages', '/workspace/frontend'"
                             }
                         },
                         "required": ["directory"]
@@ -572,16 +811,74 @@ class ToolRegistry:
                 "type": "function",
                 "function": {
                     "name": "lint_file",
-                    "description": "Run linting on a file to find code quality issues",
+                    "description": "Lint one file. Use path relative to current role root (e.g., 'pages/index.jsx') or '/workspace/<path>'.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "file_path": {
                                 "type": "string",
-                                "description": "Path to the file to lint"
+                                "description": "File path to lint. Examples: 'pages/index.jsx', '/workspace/frontend/pages/index.jsx'"
                             }
                         },
                         "required": ["file_path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "init_starter_template",
+                    "description": "Initialize a starter template from Cosmos DB into a target directory.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "template_id": {
+                                "type": "string",
+                                "description": "Template ID in Cosmos starter_templates container"
+                            },
+                            "target_directory": {
+                                "type": "string",
+                                "description": "Target directory under workspace (e.g., '/workspace/frontend' or 'frontend')"
+                            },
+                            "overwrite": {
+                                "type": "boolean",
+                                "description": "Overwrite existing files if true"
+                            }
+                        },
+                        "required": ["template_id", "target_directory"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "init_starter_template_for_stack",
+                    "description": "Resolve and initialize a starter template based on stack tokens (e.g. ['react','vite','tailwind','typescript']).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "stack": {
+                                "description": "Stack tokens list or comma-separated string",
+                                "anyOf": [
+                                    {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    },
+                                    {
+                                        "type": "string"
+                                    }
+                                ]
+                            },
+                            "target_directory": {
+                                "type": "string",
+                                "description": "Target directory under workspace (e.g., '/workspace/frontend' or 'frontend')"
+                            },
+                            "overwrite": {
+                                "type": "boolean",
+                                "description": "Overwrite existing files if true"
+                            }
+                        },
+                        "required": ["stack", "target_directory"]
                     }
                 }
             }
@@ -591,7 +888,11 @@ class ToolRegistry:
         """Execute a tool by name with given arguments"""
         try:
             if function_name == "read_file":
-                return self.files.read_file(function_args.get("file_path", ""))
+                return self.files.read_file(
+                    function_args.get("file_path", ""),
+                    function_args.get("start_line"),
+                    function_args.get("end_line"),
+                )
             
             elif function_name == "write_file":
                 return self.files.write_file(
@@ -629,6 +930,20 @@ class ToolRegistry:
             
             elif function_name == "lint_file":
                 return self.validation.lint_file(function_args.get("file_path", ""))
+
+            elif function_name == "init_starter_template":
+                return self.templates.init_starter_template(
+                    function_args.get("template_id", ""),
+                    function_args.get("target_directory", ""),
+                    bool(function_args.get("overwrite", False)),
+                )
+
+            elif function_name == "init_starter_template_for_stack":
+                return self.templates.init_starter_template_for_stack(
+                    function_args.get("stack", []),
+                    function_args.get("target_directory", ""),
+                    bool(function_args.get("overwrite", False)),
+                )
             
             else:
                 return f"ERROR: Unknown tool: {function_name}"

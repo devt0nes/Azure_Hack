@@ -179,7 +179,7 @@ class ReviewAgent:
             "database_architect": ["database/README.md", "database/schemas/README.md", "database_architect/README.md"],
             "backend_engineer": ["backend/README.md", "backend/src/README.md", "backend_engineer/README.md"],
             "frontend_engineer": ["frontend/README.md", "frontend/src/README.md", "frontend_engineer/README.md"],
-            "qa_engineer": ["tests/README.md", "tests/reports/README.md", "qa_engineer/README.md"],
+            "qa_engineer": ["qa/README.md", "qa/audit_report.md", "qa_engineer/README.md"],
         }
         candidates = role_readme_candidates.get(role, [f"{role}/README.md"])
         if not any(self._exists(path) for path in candidates):

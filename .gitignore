@@ -30,6 +30,7 @@ Thumbs.db
 /generated/
 build/
 dist/
+.next/
 
 # Python
 __pycache__/
