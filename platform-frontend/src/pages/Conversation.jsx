@@ -4,6 +4,8 @@ import {
   checkQuestionReadiness,
   clarifyWithAnswers,
   executeFromSpecs,
+  getProjectApiKeyStatus,
+  getProjectLedger,
   ingestProjectContext,
   loadCanvas,
   uploadCanvasFile,
@@ -83,12 +85,43 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
   const [isExecuting, setIsExecuting] = useState(false)
   const [nextTopics, setNextTopics] = useState([])
   const [ingestionHint, setIngestionHint] = useState('')
+  const [requiredApiKeyServices, setRequiredApiKeyServices] = useState([])
+  const [serviceApiKeys, setServiceApiKeys] = useState({})
+  const [savedApiKeyServices, setSavedApiKeyServices] = useState([])
 
   const messagesContainerRef = useRef(null)
   const messagesEndRef = useRef(null)
   const referenceInputRef = useRef(null)
+  const previousProjectIdRef = useRef(activeProjectId)
 
   const sortedMessages = useMemo(() => messages, [messages])
+
+  useEffect(() => {
+    if (!projectId) return
+    if (projectId !== activeProjectId) {
+      setActiveProjectId(projectId)
+    }
+  }, [projectId])
+
+  useEffect(() => {
+    const previousProjectId = previousProjectIdRef.current
+    previousProjectIdRef.current = activeProjectId
+
+    // Reset conversation state only when switching between existing projects.
+    // Do not reset on initial project assignment after first user message.
+    if (!previousProjectId || !activeProjectId || previousProjectId === activeProjectId) return
+
+    setQuestionCount(0)
+    setCompleteness(0)
+    setSpecReady(false)
+    setSpecPreview('')
+    setNextTopics([])
+    setPendingQuestions([])
+    setAnswerDrafts({})
+    setRequiredApiKeyServices([])
+    setServiceApiKeys({})
+    setSavedApiKeyServices([])
+  }, [activeProjectId])
 
   useEffect(() => {
     const container = messagesContainerRef.current
@@ -110,8 +143,69 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
       setIsCheckingReadiness(true)
       try {
         const response = await checkQuestionReadiness({ projectId: activeProjectId })
-        setSpecReady(Boolean(response?.is_ready))
+        const isReady = Boolean(response?.is_ready)
+        setSpecReady(isReady)
         setCompleteness(Number(response?.completeness || 0))
+
+        const readinessServices = Array.isArray(response?.required_api_key_services)
+          ? response.required_api_key_services.map((service) => String(service || '').trim()).filter(Boolean)
+          : []
+
+        if (isReady) {
+          setRequiredApiKeyServices(readinessServices)
+          setServiceApiKeys((prev) => {
+            const next = { ...prev }
+            readinessServices.forEach((service) => {
+              if (!(service in next)) next[service] = ''
+            })
+            return next
+          })
+        } else {
+          setRequiredApiKeyServices([])
+          setServiceApiKeys({})
+        }
+
+        if (isReady) {
+          const ledgerResponse = await getProjectLedger({ projectId: activeProjectId })
+          const ledger = ledgerResponse?.ledger_data || {}
+          const services = Array.isArray(ledger?.required_api_key_services)
+            ? ledger.required_api_key_services
+            : []
+          const cleanServices = services
+            .map((service) => String(service || '').trim())
+            .filter(Boolean)
+          if (cleanServices.length > 0) {
+            setRequiredApiKeyServices(cleanServices)
+            setServiceApiKeys((prev) => {
+              const next = { ...prev }
+              cleanServices.forEach((service) => {
+                if (!(service in next)) next[service] = ''
+              })
+              return next
+            })
+          }
+
+          try {
+            const keyStatus = await getProjectApiKeyStatus({ projectId: activeProjectId })
+            const savedServices = Array.isArray(keyStatus?.saved_services)
+              ? keyStatus.saved_services.map((service) => String(service || '').trim()).filter(Boolean)
+              : []
+            setSavedApiKeyServices(savedServices)
+            if (savedServices.length > 0) {
+              setServiceApiKeys((prev) => {
+                const next = { ...prev }
+                savedServices.forEach((service) => {
+                  if (!(service in next)) next[service] = ''
+                })
+                return next
+              })
+            }
+          } catch {
+            setSavedApiKeyServices([])
+          }
+        } else {
+          setSavedApiKeyServices([])
+        }
       } catch {
         // no-op: readiness is best-effort
       } finally {
@@ -363,10 +457,48 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
       return
     }
 
+    if (!specReady) {
+      setError('Specifications are not ready yet. Please answer more questions first.')
+      return
+    }
+
     setError('')
     setIsExecuting(true)
     try {
-      await executeFromSpecs({ projectId: activeProjectId })
+      if (requiredApiKeyServices.length > 0) {
+        const missing = requiredApiKeyServices.filter(
+          (service) => !String(serviceApiKeys[service] || '').trim()
+        )
+        if (missing.length > 0) {
+          setError(`Please provide API keys for: ${missing.join(', ')}`)
+          setIsExecuting(false)
+          return
+        }
+      }
+
+      const nonEmptyApiKeys = Object.fromEntries(
+        Object.entries(serviceApiKeys).filter(([, value]) => String(value || '').trim())
+      )
+
+      const response = await executeFromSpecs({
+        projectId: activeProjectId,
+        serviceApiKeys: nonEmptyApiKeys,
+      })
+
+      if (response?.status && response.status !== 'running') {
+        const backendMessage = response?.message || 'Execution did not start.'
+        const missingServices = Array.isArray(response?.missing_services)
+          ? response.missing_services
+          : []
+        if (missingServices.length > 0) {
+          setError(`${backendMessage} Missing: ${missingServices.join(', ')}`)
+        } else {
+          setError(backendMessage)
+        }
+        setIsExecuting(false)
+        return
+      }
+
       const executionMessage = {
         id: `execution-${Date.now()}`,
         role: 'system',
@@ -601,6 +733,39 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
               </details>
             ) : null}
 
+            {specReady && requiredApiKeyServices.length > 0 ? (
+              <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 py-3 text-sm">
+                <p className="font-semibold text-amber-800 mb-2">API keys required before execution</p>
+                <p className="text-amber-700 text-xs mb-3">
+                  Enter keys for the services detected in your finalized task ledger.
+                </p>
+                <div className="space-y-2">
+                  {requiredApiKeyServices.map((service) => (
+                    <div key={service} className="space-y-1">
+                      <label className="text-xs font-medium text-amber-800">
+                        {service} API Key
+                        {savedApiKeyServices.includes(service) ? (
+                          <span className="ml-2 text-[11px] font-semibold text-emerald-700">Saved on backend</span>
+                        ) : null}
+                      </label>
+                      <input
+                        type="password"
+                        value={serviceApiKeys[service] || ''}
+                        onChange={(event) =>
+                          setServiceApiKeys((prev) => ({
+                            ...prev,
+                            [service]: event.target.value,
+                          }))
+                        }
+                        placeholder={`Enter ${service} API key`}
+                        className="w-full rounded-xl border border-amber-300/60 bg-card px-3 py-2 text-sm text-foreground outline-none focus:border-amber-500"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
             {questionCount >= 10 ? (
               <div className="rounded-lg border border-blue-500/50 bg-blue-500/10 px-4 py-3 text-sm dark:border-blue-600/50 dark:bg-blue-950/20">
                 <p className="font-semibold text-blue-900 dark:text-blue-200 mb-1">✓ Questions Target Reached</p>
@@ -613,7 +778,7 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
             {showExecuteButton ? (
               <button
                 onClick={handleExecuteFromSpecs}
-                disabled={isExecuting || isSending || !activeProjectId}
+                disabled={isExecuting || isSending || !activeProjectId || !specReady}
                 className="w-full rounded-full border border-green-500/50 bg-green-500/10 px-5 py-3 text-sm font-semibold text-green-600 transition hover:border-green-500/80 hover:bg-green-500/20 disabled:cursor-not-allowed disabled:opacity-70"
               >
                 {isExecuting

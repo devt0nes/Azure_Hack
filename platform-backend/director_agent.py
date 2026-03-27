@@ -407,6 +407,7 @@ class TaskLedger:
                 "cloud_services": [],
                 "development_tools": []
             },
+            "required_api_key_services": [],
             "feature_catalog": [],
             "layer_onboarding": [],
             "workspace_layout": {
@@ -914,6 +915,7 @@ CONSISTENCY RULES:
 - Minimize agent count (quality over quantity)
 - Match technology stack to requirements
 - Populate feature_catalog with ALL expected product features/capabilities.
+- Populate required_api_key_services with service names that require user-provided API keys before execution.
 - Populate layer_onboarding with one entry per layer. Each entry must include:
     • layer_index
     • stage_name
@@ -931,6 +933,9 @@ CONSISTENCY RULES:
 - Do NOT prescribe exact implementation internals (e.g., concrete API spec code/tasks) in the ledger.
 - The ledger should state WHAT needs to be done; agents decide HOW via detailed blackboard discussion.
 - Status flow: "DRAFT" (building) → "DONE" (ready for execution)
+- Technology selections must be singular in final outputs: one choice per category.
+- Do NOT include multi-option stack outputs such as "A or B", "A/B", or comma-separated alternatives.
+- For technology_stack fields, include at most one selected value per category list.
 
 AGENT SELECTION RULES — READ CAREFULLY:
 You must ONLY include agents that are genuinely required by the user intent.
@@ -1061,12 +1066,16 @@ CRITICAL RULES:
 ✓ Put heavily blocked/waiting agents in later layers; keep decently coordinating agents together
 ✓ Ensure every required agent role appears exactly once in layers
 ✓ Populate feature_catalog with ALL expected project features/capabilities
+✓ Populate required_api_key_services with services needing user API keys (for example: OpenAI, Stripe, Twilio)
 ✓ Populate layer_onboarding with one detailed onboarding entry per execution layer
 ✓ In layer_onboarding, specify WHAT each layer must deliver, per-role expectations, and next-stage readiness outputs
 ✓ Populate workspace_layout with production-style directories and role_output_roots per role
 ✓ Do NOT prescribe exact implementation internals (e.g., concrete API spec code tasks) in ledger fields
 ✓ Return ONLY valid JSON - no explanations outside JSON
 ✓ Use null/empty arrays for fields with no data yet
+✓ Technology selections must be singular in final output (one choice per category)
+✓ Never return alternatives like "A or B", "A/B", or multi-option stack lists
+✓ For technology_stack categories, include at most one selected value per list
 
 AGENT SELECTION RULES — READ CAREFULLY:
 You must ONLY include agents that are genuinely required by the user intent.

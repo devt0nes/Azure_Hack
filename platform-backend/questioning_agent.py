@@ -203,6 +203,11 @@ RESPONSE STRUCTURE:
 3. Ask ONE clarifying follow-up question
 4. If {questions_remaining} == 0 after this, indicate conversation is ending
 
+FINAL SPECIFICATION RULE:
+- In the written specification, commit to ONE selected technology per category.
+- Do not present alternatives like "A or B", "A/B", or comma-separated options.
+- If requirements are unclear, make a best-fit recommendation and state assumptions.
+
 IMPORTANT: Count the questions you ask. You've asked {question_count} so far.
 
 Do NOT:
@@ -266,7 +271,7 @@ Generate a comprehensive markdown document with these sections (only include sec
 - Include brief descriptions
 
 ## Technical Considerations
-- Technology stack ideas based on requirements
+- Selected technology stack (single choice per category)
 - Performance requirements
 - Security/compliance needs
 - Integration requirements
@@ -287,10 +292,14 @@ Generate a comprehensive markdown document with these sections (only include sec
 - Hosting preferences
 
 ## Agent's Implementation Ideas
-- Tech stack considerations
+- Finalized tech stack decisions (single choice per category)
 - Architecture approach
 - Feature prioritization
 - Design direction
+
+GLOBAL OUTPUT RULES:
+- The final specification must never include multiple alternatives for stack choices.
+- Avoid any wording like "or", slashes, or multi-option lists for technology selections.
 
 Keep it concise but comprehensive."""
             }
@@ -344,10 +353,11 @@ Keep it concise but comprehensive."""
                 "Timeline and deployment strategy"
             ]
         
-        # Count questions in the agent response
+        # Count only explicit follow-up question lines and bound per-turn increments.
         new_question_count = self._count_questions(agent_response)
-        updated_question_count = question_count + new_question_count
+        updated_question_count = min(10, question_count + new_question_count)
         updated_questions_remaining = max(0, 10 - updated_question_count)
+        reached_limit = updated_question_count >= 10
         
         # Create a brief preview of the spec
         spec_lines = updated_spec.split('\n')
@@ -363,7 +373,7 @@ Keep it concise but comprehensive."""
             "spec_preview": spec_preview,
             "question_count": updated_question_count,
             "questions_remaining": updated_questions_remaining,
-            "must_execute": False,
+            "must_execute": reached_limit,
             "full_spec_path": self._get_spec_file_path(project_id)
         }
 
@@ -391,8 +401,18 @@ Keep it concise but comprehensive."""
         return "Gathering information about project vision and requirements..."
 
     def _count_questions(self, text: str) -> int:
-        """Count the number of questions in a text (by counting '?')."""
-        return text.count('?')
+        """Count explicit follow-up questions, capped to expected turn behavior."""
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        question_lines = [line for line in lines if line.endswith('?')]
+
+        if question_lines:
+            return min(2, len(question_lines))
+
+        # Fallback for one-line responses that contain a single inline question.
+        if '?' in text:
+            return 1
+
+        return 0
 
     def suggest_execution(self, project_id: str, conversation_history: List[Dict[str, str]]) -> Dict[str, Any]:
         """

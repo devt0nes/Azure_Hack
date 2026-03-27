@@ -16,6 +16,7 @@ import shutil
 import sys
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -62,12 +63,22 @@ logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(l
 logging.getLogger("azure.servicebus").setLevel(logging.WARNING)
 logging.getLogger("azure.core").setLevel(logging.WARNING)
 
+
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    logger.info("🚀 Nexus platform-compatible backend starting")
+    try:
+        yield
+    finally:
+        logger.info("🛑 Nexus platform-compatible backend shutting down")
+
 app = FastAPI(
     title="Nexus Platform Backend",
     description="Platform-compatible API surface for frontend integration",
     version="1.0.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
+    lifespan=app_lifespan,
 )
 
 app.add_middleware(
@@ -136,6 +147,7 @@ class ClarifyRequest(BaseModel):
 class ExecuteRequest(BaseModel):
     project_id: str
     user_intent: Optional[str] = None
+    service_api_keys: Optional[Dict[str, str]] = None
 
 
 class TutorRequest(BaseModel):
@@ -390,6 +402,85 @@ def _append_project_log(project_id: str, event: str, **data: Any) -> None:
             f.write(line + "\n")
     except Exception as exc:
         logger.warning("Could not append project log for %s: %s", project_id, exc)
+
+
+def _service_api_keys_file(project_id: str) -> Path:
+    workspace_dir = REPO_ROOT / "workspace"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    return workspace_dir / f"service_api_keys_{project_id}.json"
+
+
+def _load_service_api_keys(project_id: str) -> Dict[str, str]:
+    path = _service_api_keys_file(project_id)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        result: Dict[str, str] = {}
+        for service, key in data.items():
+            service_name = str(service or "").strip()
+            key_value = str(key or "").strip()
+            if service_name and key_value:
+                result[service_name] = key_value
+        return result
+    except Exception:
+        return {}
+
+
+def _save_service_api_keys(project_id: str, keys: Dict[str, str]) -> Dict[str, str]:
+    sanitized: Dict[str, str] = {}
+    for service, key in (keys or {}).items():
+        service_name = str(service or "").strip()
+        key_value = str(key or "").strip()
+        if service_name and key_value:
+            sanitized[service_name] = key_value
+
+    path = _service_api_keys_file(project_id)
+    path.write_text(json.dumps(sanitized, indent=2, ensure_ascii=False), encoding="utf-8")
+    return sanitized
+
+
+def _set_runtime_api_key_envs(service_api_keys: Dict[str, str]) -> Dict[str, Optional[str]]:
+    """Temporarily set runtime env vars from saved service keys and return previous values."""
+    env_map: Dict[str, str] = {
+        "openai": "OPENAI_API_KEY",
+        "azure_openai": "AZURE_OPENAI_API_KEY",
+        "stripe": "STRIPE_API_KEY",
+        "twilio": "TWILIO_API_KEY",
+        "sendgrid": "SENDGRID_API_KEY",
+        "github": "GITHUB_TOKEN",
+        "google_maps": "GOOGLE_MAPS_API_KEY",
+        "weather": "WEATHER_API_KEY",
+    }
+
+    previous: Dict[str, Optional[str]] = {}
+    clean_keys: Dict[str, str] = {}
+    for service, key in (service_api_keys or {}).items():
+        service_name = str(service or "").strip()
+        key_value = str(key or "").strip()
+        if not service_name or not key_value:
+            continue
+        clean_keys[service_name] = key_value
+        env_var = env_map.get(service_name.lower())
+        if env_var:
+            previous[env_var] = os.environ.get(env_var)
+            os.environ[env_var] = key_value
+
+    if clean_keys:
+        previous["NEXUS_SERVICE_API_KEYS_JSON"] = os.environ.get("NEXUS_SERVICE_API_KEYS_JSON")
+        os.environ["NEXUS_SERVICE_API_KEYS_JSON"] = json.dumps(clean_keys, ensure_ascii=False)
+
+    return previous
+
+
+def _restore_runtime_api_key_envs(previous_env: Dict[str, Optional[str]]) -> None:
+    for env_var, old_value in (previous_env or {}).items():
+        if old_value is None:
+            os.environ.pop(env_var, None)
+        else:
+            os.environ[env_var] = old_value
 
 
 def _sync_project_from_blob(project_id: str) -> None:
@@ -683,6 +774,107 @@ def _normalize_workspace_layout_paths(ledger_data: Dict[str, Any]) -> None:
         layout["role_output_roots"] = cleaned_role_map
 
 
+def _normalize_required_api_key_services(ledger_data: Dict[str, Any]) -> List[str]:
+    """Return a cleaned, de-duplicated list of service names requiring API keys."""
+    if not isinstance(ledger_data, dict):
+        return []
+
+    raw = ledger_data.get("required_api_key_services", [])
+    if not isinstance(raw, list):
+        raw = []
+
+    cleaned: List[str] = []
+    seen = set()
+    for item in raw:
+        name = str(item or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(name)
+    return cleaned
+
+
+def _infer_required_api_key_services(ledger_data: Dict[str, Any]) -> List[str]:
+    """Infer likely API-key services from ledger stack/integration hints."""
+    text_chunks: List[str] = []
+
+    def _collect(value: Any) -> None:
+        if isinstance(value, str):
+            text_chunks.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                _collect(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                _collect(item)
+
+    _collect(ledger_data.get("technology_stack", {}))
+    _collect(ledger_data.get("integration_targets", []))
+    _collect(ledger_data.get("tech_constraints", {}))
+    _collect(ledger_data.get("functional_requirements", []))
+    _collect(ledger_data.get("feature_catalog", []))
+
+    haystack = " ".join(text_chunks).lower()
+    service_rules = [
+        ("openai", "OpenAI"),
+        ("anthropic", "Anthropic"),
+        ("claude", "Anthropic"),
+        ("gemini", "Google Gemini"),
+        ("stripe", "Stripe"),
+        ("twilio", "Twilio"),
+        ("sendgrid", "SendGrid"),
+        ("mailgun", "Mailgun"),
+        ("resend", "Resend"),
+        ("supabase", "Supabase"),
+        ("firebase", "Firebase"),
+        ("pinecone", "Pinecone"),
+        ("serpapi", "SerpAPI"),
+        ("hugging face", "Hugging Face"),
+    ]
+
+    inferred: List[str] = []
+    for needle, service_name in service_rules:
+        if needle in haystack and service_name not in inferred:
+            inferred.append(service_name)
+
+    return inferred
+
+
+def _infer_required_api_key_services_from_text(spec_text: str) -> List[str]:
+    """Infer likely API-key services from plain specification text."""
+    haystack = str(spec_text or "").lower()
+    if not haystack.strip():
+        return []
+
+    service_rules = [
+        ("openai", "OpenAI"),
+        ("anthropic", "Anthropic"),
+        ("claude", "Anthropic"),
+        ("gemini", "Google Gemini"),
+        ("stripe", "Stripe"),
+        ("twilio", "Twilio"),
+        ("sendgrid", "SendGrid"),
+        ("mailgun", "Mailgun"),
+        ("resend", "Resend"),
+        ("supabase", "Supabase"),
+        ("firebase", "Firebase"),
+        ("pinecone", "Pinecone"),
+        ("serpapi", "SerpAPI"),
+        ("hugging face", "Hugging Face"),
+        ("google cloud vision", "Google Cloud Vision API"),
+    ]
+
+    inferred: List[str] = []
+    for needle, service_name in service_rules:
+        if needle in haystack and service_name not in inferred:
+            inferred.append(service_name)
+
+    return inferred
+
+
 def _generate_director_questions(user_intent: str) -> List[str]:
     """Generate 3 concise clarification questions from Director context."""
     try:
@@ -733,8 +925,13 @@ async def _invoke_real_orchestrator(project_id: str, project_data: Dict[str, Any
     director_iteration_timeout: Optional[int] = (
         director_iteration_timeout_env if director_iteration_timeout_env > 0 else None
     )
+    previous_env: Dict[str, Optional[str]] = {}
 
     try:
+        saved_service_keys = _load_service_api_keys(project_id)
+        if saved_service_keys:
+            previous_env = _set_runtime_api_key_envs(saved_service_keys)
+
         # Step 0: Read project specifications file if it exists
         project_specs = _read_project_specs_file(project_id)
         if project_specs:
@@ -822,6 +1019,11 @@ async def _invoke_real_orchestrator(project_id: str, project_data: Dict[str, Any
             ledger.data["workspace_layout"] = default_workspace_layout()
         _ensure_minimum_agent_spec(ledger.data)
         _normalize_workspace_layout_paths(ledger.data)
+        explicit_services = _normalize_required_api_key_services(ledger.data)
+        if explicit_services:
+            ledger.data["required_api_key_services"] = explicit_services
+        else:
+            ledger.data["required_api_key_services"] = _infer_required_api_key_services(ledger.data)
         ledger.data["status"] = "DONE"
 
         ledger_id = str(ledger.data.get("project_id") or project_id)
@@ -883,6 +1085,8 @@ async def _invoke_real_orchestrator(project_id: str, project_data: Dict[str, Any
         logger.exception("Orchestration failed for %s: %s", project_id, exc)
         _append_project_log(project_id, "orchestration_failed", error=str(exc)[:500])
         raise RuntimeError(f"Orchestration pipeline failed: {exc}")
+    finally:
+        _restore_runtime_api_key_envs(previous_env)
 
 
 # ------------------------------
@@ -1119,6 +1323,24 @@ async def get_project(project_id: str):
         progress=project["progress"],
         error=project.get("error"),
     )
+
+
+@app.get("/api/projects/{project_id}/service-api-keys/status", tags=["Projects"])
+async def get_project_service_api_key_status(project_id: str):
+    project = store.get(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    saved_keys = _load_service_api_keys(project_id)
+    saved_services = sorted(saved_keys.keys())
+    last_saved_at = project.get("service_api_keys_last_saved_at")
+
+    return {
+        "project_id": project_id,
+        "saved_services": saved_services,
+        "saved_count": len(saved_services),
+        "last_saved_at": last_saved_at,
+    }
 
 
 @app.get("/api/projects/{project_id}/storage", tags=["Projects"])
@@ -1434,7 +1656,7 @@ async def get_context(project_id: str):
         "task_ledger": {
             "app_type": "Agentic Nexus",
             "auth": "Firebase JWT",
-            "database": "CosmosDB/JSON",
+            "database": "CosmosDB",
             "framework": "FastAPI",
         },
         "aeg": {
@@ -1643,9 +1865,12 @@ async def question_endpoint(request: QuestionRequest):
     """
     try:
         from questioning_agent import QuestioningAgent
-        
+
         project = store.get(request.project_id)
-        current_question_count = request.question_count or 0
+        requested_question_count = int(request.question_count or 0)
+        history_count = len(request.conversation_history or [])
+
+        current_question_count = requested_question_count
         
         if not project:
             created = store.create_with_id(
@@ -1655,8 +1880,19 @@ async def question_endpoint(request: QuestionRequest):
                 None
             )
             project = created
+            current_question_count = int(project.get("question_count", 0) or 0)
         else:
-            current_question_count = project.get("question_count", 0)
+            stored_question_count = int(project.get("question_count", 0) or 0)
+
+            # If the client clearly starts a fresh questioning session on an existing
+            # project, allow question flow to restart from zero.
+            if requested_question_count == 0 and history_count <= 1 and stored_question_count >= 10:
+                stored_question_count = 0
+                project["question_count"] = 0
+                project["updated_at"] = datetime.utcnow().isoformat()
+                store._save()
+
+            current_question_count = max(stored_question_count, requested_question_count)
         
         agent = QuestioningAgent()
         conversation_history = request.conversation_history or []
@@ -1668,11 +1904,16 @@ async def question_endpoint(request: QuestionRequest):
             question_count=current_question_count
         )
         
-        # Update project with new question count
-        if not response.get("must_execute"):
-            project["question_count"] = response["question_count"]
-            project["updated_at"] = datetime.utcnow().isoformat()
-            store._save()
+        # Always persist the latest question count, including terminal 10/10 state.
+        response_question_count = response.get("question_count", current_question_count)
+        try:
+            persisted_question_count = int(response_question_count)
+        except (TypeError, ValueError):
+            persisted_question_count = current_question_count
+
+        project["question_count"] = max(0, min(10, persisted_question_count))
+        project["updated_at"] = datetime.utcnow().isoformat()
+        store._save()
         
         _append_project_log(
             request.project_id,
@@ -1720,13 +1961,34 @@ async def question_readiness_endpoint(request: QuestionReadinessRequest):
         
         agent = QuestioningAgent()
         readiness = agent.suggest_execution(request.project_id, [])
+        is_ready = bool(readiness.get("is_ready", False))
+        completeness = int(readiness.get("completeness", 0) or 0)
+        message = readiness.get("message", "Readiness check completed.")
+        missing_areas = readiness.get("missing_areas", []) or []
+        full_spec_path = readiness.get("full_spec_path")
+        required_services: List[str] = []
+
+        try:
+            workspace_dir = REPO_ROOT / "workspace"
+            ledger_file = workspace_dir / f"ledger_{request.project_id}.json"
+            if ledger_file.exists():
+                ledger_data = json.loads(ledger_file.read_text(encoding="utf-8"))
+                required_services = _normalize_required_api_key_services(ledger_data)
+                if not required_services:
+                    required_services = _infer_required_api_key_services(ledger_data)
+            elif full_spec_path and os.path.exists(full_spec_path):
+                spec_text = Path(full_spec_path).read_text(encoding="utf-8")
+                required_services = _infer_required_api_key_services_from_text(spec_text)
+        except Exception:
+            required_services = []
         
         return {
-            "is_ready": readiness["is_ready"],
-            "completeness": readiness["completeness"],
-            "message": readiness["message"],
-            "missing_areas": readiness["missing_areas"],
-            "full_spec_path": readiness["full_spec_path"],
+            "is_ready": is_ready,
+            "completeness": completeness,
+            "message": message,
+            "missing_areas": missing_areas,
+            "full_spec_path": full_spec_path,
+            "required_api_key_services": required_services,
             "project_id": request.project_id
         }
     except Exception as exc:
@@ -1767,12 +2029,67 @@ async def execute_from_specs(request: ExecuteRequest, background_tasks: Backgrou
                 "project_id": request.project_id,
                 "status": "failed"
             }
-        
+
+        # Validate required API keys based on finalized task ledger.
+        workspace_dir = REPO_ROOT / "workspace"
+        ledger_file = workspace_dir / f"ledger_{active_project_id}.json"
+        required_services: List[str] = []
+        if ledger_file.exists():
+            try:
+                ledger_data = json.loads(ledger_file.read_text(encoding="utf-8"))
+                required_services = _normalize_required_api_key_services(ledger_data)
+                if not required_services:
+                    required_services = _infer_required_api_key_services(ledger_data)
+            except Exception:
+                required_services = []
+
         with open(spec_path, 'r', encoding='utf-8') as f:
             project_specs = f.read()
+
+        if not required_services:
+            required_services = _infer_required_api_key_services_from_text(project_specs)
+
+        provided_keys = request.service_api_keys or {}
+        saved_keys = _load_service_api_keys(active_project_id)
+        submitted_non_empty_keys = {
+            str(service or "").strip(): str(key or "").strip()
+            for service, key in provided_keys.items()
+            if str(service or "").strip() and str(key or "").strip()
+        }
+        merged_keys = {**saved_keys, **submitted_non_empty_keys}
+
+        if submitted_non_empty_keys:
+            merged_keys = _save_service_api_keys(active_project_id, merged_keys)
+            _append_project_log(
+                active_project_id,
+                "service_api_keys_saved",
+                saved_services=sorted(merged_keys.keys()),
+            )
+
+        missing_services = [
+            service for service in required_services
+            if not str(merged_keys.get(service, "")).strip()
+        ]
+
+        if missing_services:
+            store.update(active_project_id, status=ProjectStatus.PAUSED, progress=5)
+            _append_project_log(
+                active_project_id,
+                "execution_paused_missing_api_keys",
+                missing_services=missing_services,
+            )
+            return {
+                "message": "Missing API keys for required services. Save the keys and retry execution.",
+                "project_id": request.project_id,
+                "status": ProjectStatus.PAUSED.value,
+                "orchestration_started": False,
+                "missing_services": missing_services,
+            }
         
         # Update project with specifications as the intent
         project["user_intent"] = f"Based on these specifications:\n\n{project_specs}"
+        project["provided_api_key_services"] = sorted(merged_keys.keys())
+        project["service_api_keys_last_saved_at"] = datetime.utcnow().isoformat()
         project["updated_at"] = datetime.utcnow().isoformat()
         store._save()
         
@@ -2039,16 +2356,6 @@ async def general_exception_handler(_request, _exc: Exception):
         status_code=500,
         content={"error": "Internal server error", "timestamp": datetime.utcnow().isoformat()},
     )
-
-
-@app.on_event("startup")
-async def startup_event():
-    logger.info("🚀 Nexus platform-compatible backend starting")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("🛑 Nexus platform-compatible backend shutting down")
 
 
 if __name__ == "__main__":
