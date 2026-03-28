@@ -908,8 +908,28 @@ async def _simulate_generation(project_id: str) -> None:
             return
 
         result = await _invoke_real_orchestrator(project_id, project)
-        if isinstance(result, dict):
+
+        def _looks_like_aeg_payload(payload: Any) -> bool:
+            if not isinstance(payload, dict):
+                return False
+            has_legacy = isinstance(payload.get("nodes"), list) and isinstance(payload.get("edges"), list)
+            has_specs = isinstance(payload.get("agent_specifications"), dict)
+            return has_legacy or has_specs
+
+        persisted_ledger = None
+        ledger_file = REPO_ROOT / "workspace" / f"ledger_{project_id}.json"
+        if ledger_file.exists() and ledger_file.is_file():
+            try:
+                persisted_ledger = json.loads(ledger_file.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning("Could not parse persisted ledger for %s: %s", project_id, exc)
+
+        if _looks_like_aeg_payload(persisted_ledger):
+            project["ledger_data"] = persisted_ledger
+        elif _looks_like_aeg_payload(result):
             project["ledger_data"] = result
+        project["updated_at"] = datetime.utcnow().isoformat()
+        store._save()
 
         manifest = {
             "project_id": project_id,
@@ -1904,12 +1924,44 @@ async def get_aeg(project_id: str = "default"):
     try:
         project = store.get(project_id)
 
-        if project and project.get("ledger_data"):
-            return project["ledger_data"]
+        def _looks_like_aeg_payload(payload: Any) -> bool:
+            if not isinstance(payload, dict):
+                return False
+            has_legacy = isinstance(payload.get("nodes"), list) and isinstance(payload.get("edges"), list)
+            has_specs = isinstance(payload.get("agent_specifications"), dict)
+            return has_legacy or has_specs
+
+        def _with_project_meta(payload: Dict[str, Any]) -> Dict[str, Any]:
+            enriched = dict(payload)
+            enriched.setdefault("project_id", project_id)
+            if project and project.get("project_name"):
+                enriched.setdefault("project_name", project.get("project_name"))
+            return enriched
+
+        ledger_file = REPO_ROOT / "workspace" / f"ledger_{project_id}.json"
+        if ledger_file.exists() and ledger_file.is_file():
+            try:
+                ledger_payload = json.loads(ledger_file.read_text(encoding="utf-8"))
+                if _looks_like_aeg_payload(ledger_payload):
+                    if project:
+                        project["ledger_data"] = ledger_payload
+                        project["updated_at"] = datetime.utcnow().isoformat()
+                        store._save()
+                    return _with_project_meta(ledger_payload)
+            except Exception as exc:
+                logger.warning("Failed loading ledger file for AEG (%s): %s", project_id, exc)
+
+        if project and _looks_like_aeg_payload(project.get("ledger_data")):
+            return _with_project_meta(project["ledger_data"])
+
+        if project and isinstance(project.get("ledger_data"), dict):
+            nested_ledger = project["ledger_data"].get("ledger_data") or project["ledger_data"].get("result")
+            if _looks_like_aeg_payload(nested_ledger):
+                return _with_project_meta(nested_ledger)
 
         return {
             "project_id": project_id,
-            "project_name": "Demo Project",
+            "project_name": (project or {}).get("project_name", "Demo Project"),
             "status": "DRAFT",
             "agent_specifications": {
                 "required_agents": [

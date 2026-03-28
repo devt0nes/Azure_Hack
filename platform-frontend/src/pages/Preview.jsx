@@ -7,7 +7,7 @@ import {
   listProjectArtifacts,
 } from '../services/api.js'
 
-export default function Preview({ currentProjectId, projectData }) {
+export default function Preview({ currentProjectId, projectData, compactInfo = false }) {
   const [tunnelInfo, setTunnelInfo] = useState(null)
   const [currentProject, setCurrentProject] = useState(projectData)
   const [loading, setLoading] = useState(true)
@@ -23,6 +23,18 @@ export default function Preview({ currentProjectId, projectData }) {
   useEffect(() => {
     loadTunnelInfo()
   }, [currentProjectId, refreshKey])
+
+  useEffect(() => {
+    if (!currentProjectId) return undefined
+
+    const timer = window.setInterval(() => {
+      loadTunnelInfo({ silent: true })
+    }, 5000)
+
+    return () => {
+      window.clearInterval(timer)
+    }
+  }, [currentProjectId])
 
   useEffect(() => {
     if (!currentProjectId) {
@@ -72,11 +84,15 @@ export default function Preview({ currentProjectId, projectData }) {
     return () => document.removeEventListener('mousedown', handleDocumentClick)
   }, [])
 
-  async function loadTunnelInfo() {
-    setLoading(true)
-    setError(null)
-    setIframeError(false)
-    setTunnelInfo(null)  // Clear tunnel info to prevent old iframe from loading
+  async function loadTunnelInfo(options = {}) {
+    const { silent = false } = options
+
+    if (!silent) {
+      setLoading(true)
+      setError(null)
+      setIframeError(false)
+      setTunnelInfo(null)
+    }
 
     try {
       if (!currentProjectId) {
@@ -102,7 +118,9 @@ export default function Preview({ currentProjectId, projectData }) {
       console.error('Preview load error:', err)
       // Don't set error state, just clear tunnel info
     } finally {
-      setLoading(false)
+      if (!silent) {
+        setLoading(false)
+      }
     }
   }
 
@@ -197,13 +215,28 @@ export default function Preview({ currentProjectId, projectData }) {
   }
 
   const hasProjectSelected = !!currentProjectId
+  const infoMessage = 'The preview shows the generated frontend code in real-time'
 
   return (
     <div className="h-full min-h-0 min-w-0 flex flex-col overflow-hidden">
       {/* Header */}
       <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <p className="text-sm font-semibold text-foreground/80">Generated Code Preview</p>
+          <div className="flex items-center gap-2">
+            <p className="text-sm font-semibold text-foreground/80">Generated Code Preview</p>
+            <div className="group relative">
+              <button
+                type="button"
+                aria-label="Preview info"
+                className="flex h-4 w-4 items-center justify-center rounded-full border border-border text-[10px] font-semibold leading-none text-foreground/70 transition hover:bg-accent"
+              >
+                i
+              </button>
+              <div className="pointer-events-none absolute left-1/2 top-full z-30 mt-2 hidden w-64 -translate-x-1/2 rounded-md border border-border bg-card px-2.5 py-2 text-[11px] text-foreground/70 shadow-lg group-hover:block">
+                {infoMessage}
+              </div>
+            </div>
+          </div>
           <p className="mt-1 text-xs text-foreground/50">
             {loading
               ? 'Loading preview...'
@@ -270,32 +303,31 @@ export default function Preview({ currentProjectId, projectData }) {
           </div>
           <button
             onClick={handleRefresh}
-            className="rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-medium text-foreground/70 transition hover:bg-accent"
+            title="Refresh preview"
+            aria-label="Refresh preview"
+            className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-border bg-secondary text-foreground/70 transition hover:bg-accent"
             disabled={loading}
           >
-            Refresh
+            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+              <path d="M21 3v6h-6" />
+            </svg>
           </button>
           <button
             onClick={handleOpenExternal}
-            className="rounded-md border border-primary/40 bg-primary/10 px-3 py-1.5 text-xs font-medium text-primary transition hover:bg-primary/20"
+            title="Open preview in a new tab"
+            aria-label="Open preview in a new tab"
+            className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-primary/40 bg-primary/10 text-primary transition hover:bg-primary/20"
             disabled={!tunnelInfo?.url || loading || !currentProjectId}
           >
-            Open External
+            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M14 3h7v7" />
+              <path d="M10 14L21 3" />
+              <path d="M21 14v7H3V3h7" />
+            </svg>
           </button>
         </div>
       </div>
-
-      {/* Project Info Display */}
-      {currentProject && currentProjectId && (
-        <div className="mb-3 rounded-lg border border-border bg-secondary/40 px-3 py-2">
-          <p className="text-xs font-mono text-foreground/60">
-            <span className="font-semibold">Project:</span> {currentProject.project_name || 'Untitled'} ({currentProjectId?.slice(0, 8)})
-          </p>
-          <p className="mt-1 text-xs text-foreground/50">
-            Status: <span className="font-semibold">{currentProject.status || 'unknown'}</span> • Progress: {currentProject.progress || 0}%
-          </p>
-        </div>
-      )}
 
       {/* Tunnel URL Display */}
       {tunnelInfo?.url && (
@@ -303,22 +335,6 @@ export default function Preview({ currentProjectId, projectData }) {
           <p className="break-all text-xs font-mono text-foreground/60">
             <span className="font-semibold">URL:</span> {tunnelInfo.url}
           </p>
-        </div>
-      )}
-
-      {(deploymentInfo || deploymentError) && (
-        <div className="mb-3 rounded-lg border border-border bg-secondary/40 px-3 py-2">
-          <p className="text-xs text-foreground/60">
-            <span className="font-semibold">Deployment:</span>{' '}
-            {deploymentError
-              ? deploymentError
-              : deploymentInfo?.deployment_result?.message || deploymentInfo?.deployment_status || 'idle'}
-          </p>
-          {deploymentInfo?.deployment_result?.details?.frontend_url && (
-            <p className="mt-1 break-all text-xs text-foreground/50">
-              Frontend URL: {deploymentInfo.deployment_result.details.frontend_url}
-            </p>
-          )}
         </div>
       )}
 
@@ -385,12 +401,34 @@ export default function Preview({ currentProjectId, projectData }) {
         )}
       </div>
 
-      {/* Info */}
-      <div className="mt-3 rounded-lg border border-border bg-secondary/40 px-3 py-2">
-        <p className="text-xs text-foreground/60">
-          <span className="font-semibold">Info:</span> The preview shows the generated frontend code in real-time
-        </p>
-      </div>
+      {/* Combined project + deployment summary */}
+      {currentProject && currentProjectId && (
+        <div className="mt-3 rounded-lg border border-border bg-secondary/40 px-3 py-2">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-xs font-mono text-foreground/60">
+                <span className="font-semibold">Project:</span> {currentProject.project_name || 'Untitled'} ({currentProjectId?.slice(0, 8)})
+              </p>
+              <p className="mt-1 text-xs text-foreground/50">
+                Status: <span className="font-semibold">{currentProject.status || 'unknown'}</span> • Progress: {currentProject.progress || 0}%
+              </p>
+            </div>
+            <div className="text-right">
+              <p className="text-xs text-foreground/60">
+                <span className="font-semibold">Deployment:</span>{' '}
+                {deploymentError
+                  ? deploymentError
+                  : deploymentInfo?.deployment_result?.message || deploymentInfo?.deployment_status || 'created'}
+              </p>
+              {deploymentInfo?.deployment_result?.details?.frontend_url && (
+                <p className="mt-1 max-w-[220px] break-all text-xs text-foreground/50">
+                  {deploymentInfo.deployment_result.details.frontend_url}
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

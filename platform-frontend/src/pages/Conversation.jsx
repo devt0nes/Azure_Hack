@@ -64,7 +64,7 @@ function tokenOverlapRatio(textA, textB) {
   return intersection / Math.min(tokensA.size, tokensB.size)
 }
 
-export default function Conversation({ projectId, onProjectChange, onOpenIdeaCanvas }) {
+export default function Conversation({ projectId, onProjectChange, onOpenIdeaCanvas, onExecuteProject }) {
   const [messages, setMessages] = useState(initialMessages)
   const [input, setInput] = useState('')
   const [isSending, setIsSending] = useState(false)
@@ -363,6 +363,10 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
       return
     }
 
+    if (onExecuteProject) {
+      onExecuteProject()
+    }
+
     setError('')
     setIsExecuting(true)
     try {
@@ -385,108 +389,97 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
     }
   }
 
-  const showExecuteButton = !isExecuting
   const effectiveCompleteness = Math.max(completeness, Math.min(questionCount * 10, 100))
 
   return (
     <div className="h-full min-h-0 flex flex-col">
-      <div className="flex items-center justify-between border-b border-border pb-3">
-        <div>
-          <h2 className="text-xl font-semibold text-foreground">Specification Builder</h2>
-          <p className="text-xs text-foreground/60 mt-1">
-            Questions: {Math.min(questionCount, 10)}/10 • {specReady ? '✓ Ready to execute' : 'Gathering specifications'}
-            {isCheckingReadiness ? ' • checking...' : ''}
-          </p>
-        </div>
-        <span className="mono text-xs uppercase tracking-[0.2em] text-foreground/50">/questions</span>
-      </div>
-
-      <div
-        ref={messagesContainerRef}
-        className="mt-4 flex-1 min-h-0 overflow-y-auto pr-2"
-      >
-        <div className="flex min-h-full flex-col gap-4">
-          {sortedMessages.map((message) => (
-            <div key={message.id}>
-              {message.role === 'agent-thinking' ? (
-                <div className="flex justify-start">
-                  <div className="max-w-[80%] rounded-xl bg-blue-50 border border-blue-200 px-4 py-3 text-sm dark:bg-blue-950 dark:border-blue-800">
-                    <p className="font-semibold text-blue-900 dark:text-blue-200 mb-2">💭 My Thinking:</p>
-                    <div
-                      className="whitespace-pre-wrap break-words text-blue-800 dark:text-blue-100 text-xs"
-                      dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }}
-                    />
+      <div className="flex-1 min-h-0 flex flex-col gap-3">
+        <div
+          ref={messagesContainerRef}
+          className="flex-1 min-h-0 overflow-y-auto pr-2"
+        >
+          <div className="flex min-h-full flex-col gap-4 pb-2">
+            {sortedMessages.map((message) => (
+              <div key={message.id}>
+                {message.role === 'agent-thinking' ? (
+                  <div className="flex justify-start">
+                    <div className="max-w-[80%] rounded-xl bg-blue-50 border border-blue-200 px-4 py-3 text-sm dark:bg-blue-950 dark:border-blue-800">
+                      <p className="font-semibold text-blue-900 dark:text-blue-200 mb-2">💭 My Thinking:</p>
+                      <div
+                        className="whitespace-pre-wrap break-words text-blue-800 dark:text-blue-100 text-xs"
+                        dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }}
+                      />
+                    </div>
                   </div>
-                </div>
-              ) : (
-                <div className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <div
-                    className={`max-w-[80%] rounded-xl px-4 py-3 text-sm leading-relaxed ${message.role === 'user'
+                ) : (
+                  <div className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                    <div
+                      className={`max-w-[80%] rounded-xl px-4 py-3 text-sm leading-relaxed ${message.role === 'user'
                         ? 'bg-primary text-primary-foreground'
                         : message.role === 'system'
                           ? 'border border-green-500/30 bg-green-500/10 text-foreground'
                           : 'border border-border bg-card text-foreground'
-                      }`}
-                  >
-                    <div
-                      className="whitespace-pre-wrap break-words"
-                      dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }}
-                    />
+                        }`}
+                    >
+                      <div
+                        className="whitespace-pre-wrap break-words"
+                        dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }}
+                      />
+                    </div>
                   </div>
-                </div>
-              )}
-            </div>
-          ))}
+                )}
+              </div>
+            ))}
 
-          {pendingQuestions.length > 0 ? (
-            <div className="flex justify-start">
-              <form
-                onSubmit={handleSubmitAnswers}
-                className="max-w-[80%] space-y-3 rounded-xl border border-border bg-card p-4"
-              >
-                <p className="mono text-xs uppercase tracking-[0.22em] text-foreground/60">
-                  Director clarification questions
-                </p>
-                <div className="max-h-64 space-y-3 overflow-y-auto pr-1">
-                  {pendingQuestions.map((q, idx) => {
-                    const key = String(idx + 1)
-                    return (
-                      <div key={key} className="space-y-2">
-                        <p className="text-sm text-foreground">{idx + 1}. {q}</p>
-                        <input
-                          value={answerDrafts[key] || ''}
-                          onChange={(event) =>
-                            setAnswerDrafts((prev) => ({ ...prev, [key]: event.target.value }))
-                          }
-                          placeholder="Type your answer..."
-                          className="w-full rounded-xl border border-border bg-secondary/60 px-3 py-2 text-sm text-foreground outline-none focus:border-primary"
-                        />
-                      </div>
-                    )
-                  })}
-                </div>
-                <button
-                  type="submit"
-                  disabled={isSending}
-                  className="rounded-full border border-border bg-card px-5 py-2 text-sm font-semibold text-foreground transition hover:border-foreground/30 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-70"
+            {pendingQuestions.length > 0 ? (
+              <div className="flex justify-start">
+                <form
+                  onSubmit={handleSubmitAnswers}
+                  className="max-w-[80%] space-y-3 rounded-xl border border-border bg-card p-4"
                 >
-                  {isSending ? 'Submitting...' : 'Submit answers'}
-                </button>
-              </form>
-            </div>
-          ) : null}
-
-          <div ref={messagesEndRef} />
-          <div className="mt-auto space-y-3 pt-2">
-            {error ? (
-              <p className="text-sm text-destructive">{error}</p>
+                  <p className="mono text-xs uppercase tracking-[0.22em] text-foreground/60">
+                    Director clarification questions
+                  </p>
+                  <div className="max-h-64 space-y-3 overflow-y-auto pr-1">
+                    {pendingQuestions.map((q, idx) => {
+                      const key = String(idx + 1)
+                      return (
+                        <div key={key} className="space-y-2">
+                          <p className="text-sm text-foreground">{idx + 1}. {q}</p>
+                          <input
+                            value={answerDrafts[key] || ''}
+                            onChange={(event) =>
+                              setAnswerDrafts((prev) => ({ ...prev, [key]: event.target.value }))
+                            }
+                            placeholder="Type your answer..."
+                            className="w-full rounded-xl border border-border bg-secondary/60 px-3 py-2 text-sm text-foreground outline-none focus:border-primary"
+                          />
+                        </div>
+                      )
+                    })}
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={isSending}
+                    className="rounded-full border border-border bg-card px-5 py-2 text-sm font-semibold text-foreground transition hover:border-foreground/30 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-70"
+                  >
+                    {isSending ? 'Submitting...' : 'Submit answers'}
+                  </button>
+                </form>
+              </div>
             ) : null}
 
-            <form onSubmit={handleSubmit}>
-              <label className="mono text-xs uppercase tracking-[0.25em] text-foreground/50">
-                {questionCount >= 10 ? 'Additional context (optional)' : 'Tell me more about your project'}
-              </label>
-              <div className="mt-2 flex items-center gap-2">
+            <div ref={messagesEndRef} />
+          </div>
+        </div>
+        <div className="space-y-3 pt-1">
+          {error ? (
+            <p className="text-sm text-destructive">{error}</p>
+          ) : null}
+
+          <form onSubmit={handleSubmit}>
+            <div className="rounded-2xl border border-border bg-secondary/45 px-3 py-2">
+              <div className="flex items-center gap-2">
                 <input
                   value={input}
                   onChange={(event) => setInput(event.target.value)}
@@ -495,12 +488,12 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
                       ? 'Add any additional details or proceed to execution...'
                       : 'Describe your project or dive into suggested topics...'
                   }
-                  className="min-w-0 flex-1 rounded-full border border-border bg-secondary/60 px-4 py-3 text-sm text-foreground outline-none focus:border-primary"
+                  className="min-w-0 flex-1 rounded-full border border-border bg-background/95 px-4 py-2.5 text-sm text-foreground outline-none transition-colors focus:border-primary dark:bg-card/65"
                 />
                 <button
                   type="submit"
                   disabled={isSending}
-                  className="relative inline-flex items-center gap-2 whitespace-nowrap rounded-full border border-border bg-card px-5 py-3 text-sm font-semibold text-foreground transition hover:border-foreground/30 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-70"
+                  className="relative inline-flex items-center gap-2 whitespace-nowrap rounded-full border border-border bg-card px-4 py-2.5 text-sm font-semibold text-foreground transition hover:border-foreground/30 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-70"
                 >
                   {isSending ? (
                     <>
@@ -516,112 +509,123 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
                 </button>
                 <button
                   type="button"
-                  onClick={() => referenceInputRef.current?.click()}
-                  className="group relative inline-flex h-10 w-10 items-center justify-center rounded-full border border-border bg-card text-foreground transition hover:border-[#F26A2E]/40 hover:text-[#F26A2E]"
-                  title="Upload Files"
-                  aria-label="Upload Files"
+                  onClick={handleExecuteFromSpecs}
+                  disabled={isExecuting || isSending || !activeProjectId}
+                  className="group inline-flex h-10 items-center gap-2 overflow-hidden rounded-full border border-green-500/55 bg-green-500/10 px-3 text-sm font-semibold text-green-700 transition-all duration-300 hover:bg-green-500/20 disabled:cursor-not-allowed disabled:opacity-70"
+                  title="Execute and generate project"
+                  aria-label="Execute and generate project"
                 >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-4 w-4">
-                    <path d="M12 16V4" />
-                    <path d="M8 8l4-4 4 4" />
-                    <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+                  <span className="mono whitespace-nowrap">Q {Math.min(questionCount, 10)}/10</span>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="h-4 w-4 shrink-0">
+                    <path d="M5 12h9" />
+                    <path d="M11 6l6 6-6 6" />
                   </svg>
-                  <span className="pointer-events-none absolute bottom-full mb-2 whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium text-foreground opacity-0 shadow-md transition-opacity group-hover:opacity-100">
-                    Upload Files
+                  <span className="max-w-0 whitespace-nowrap text-sm opacity-0 transition-all duration-300 group-hover:max-w-[360px] group-hover:opacity-100">
+                    {isExecuting
+                      ? 'Starting execution...'
+                      : `Execute & Generate Project${questionCount >= 10 ? '' : ` (${questionCount}/10 questions)`}`}
                   </span>
                 </button>
-                <input
-                  ref={referenceInputRef}
-                  type="file"
-                  className="hidden"
-                  onChange={handleUploadReferenceFile}
-                />
-                <div className="inline-flex items-center gap-2 whitespace-nowrap rounded-full border border-primary/40 bg-primary/12 px-3 py-2 shadow-[0_0_18px_rgba(242,106,46,0.2)]">
-                  <input
-                    type="checkbox"
-                    checked={includeCanvasContext}
-                    onChange={(event) => setIncludeCanvasContext(event.target.checked)}
-                    className="h-3.5 w-3.5 accent-primary"
-                    title="Include canvas context"
-                    aria-label="Include canvas context"
-                  />
+              </div>
+
+              <div className="mt-1.5 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => onOpenIdeaCanvas?.()}
-                    className="inline-flex items-center gap-1 text-xs font-bold text-primary transition hover:text-[#F26A2E]"
+                    onClick={() => referenceInputRef.current?.click()}
+                    className="group relative inline-flex h-8 items-center gap-1.5 rounded-full border border-border bg-card px-3 text-xs font-medium text-foreground transition hover:border-[#F26A2E]/40 hover:text-[#F26A2E]"
+                    title="Upload Files"
+                    aria-label="Upload Files"
                   >
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-4 w-4">
-                      <rect x="3" y="3" width="18" height="18" rx="2" />
-                      <path d="M8 8h8" />
-                      <path d="M8 12h8" />
-                      <path d="M8 16h5" />
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-3.5 w-3.5">
+                      <path d="M12 16V4" />
+                      <path d="M8 8l4-4 4 4" />
+                      <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
                     </svg>
-                    Idea Canvas
+                    <span className="mono uppercase tracking-[0.12em]">Upload Files</span>
                   </button>
-                </div>
-              </div>
-              {referenceFiles.length > 0 ? (
-                <div className="mt-2 flex flex-wrap items-center gap-2">
-                  {referenceFiles.map((file, index) => (
-                    <span
-                      key={`${file.filename}-${index}`}
-                      className="inline-flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1 text-[11px] text-foreground/70"
+                  <input
+                    ref={referenceInputRef}
+                    type="file"
+                    className="hidden"
+                    onChange={handleUploadReferenceFile}
+                  />
+                  <div className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border border-primary/40 bg-primary/12 px-2.5 py-1.5 shadow-[0_0_18px_rgba(242,106,46,0.2)]">
+                    <input
+                      type="checkbox"
+                      checked={includeCanvasContext}
+                      onChange={(event) => setIncludeCanvasContext(event.target.checked)}
+                      className="h-3.5 w-3.5 accent-primary"
+                      title="Include canvas context"
+                      aria-label="Include canvas context"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => onOpenIdeaCanvas?.()}
+                      className="inline-flex items-center gap-1 text-xs font-bold text-primary transition hover:text-[#F26A2E]"
                     >
-                      {file.filename}
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setReferenceFiles((prev) => prev.filter((_, itemIndex) => itemIndex !== index))
-                        }
-                        className="rounded-full text-foreground/50 transition hover:text-destructive"
-                        aria-label={`Remove ${file.filename}`}
-                      >
-                        ×
-                      </button>
-                    </span>
-                  ))}
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-3.5 w-3.5">
+                        <rect x="3" y="3" width="18" height="18" rx="2" />
+                        <path d="M8 8h8" />
+                        <path d="M8 12h8" />
+                        <path d="M8 16h5" />
+                      </svg>
+                      <span className="mono uppercase tracking-[0.12em]">Idea Canvas</span>
+                    </button>
+                  </div>
                 </div>
-              ) : null}
-
-              {ingestionHint ? (
-                <p className="mt-2 text-[11px] text-primary/80">✓ {ingestionHint}</p>
-              ) : null}
-            </form>
-
-            {nextTopics.length > 0 ? (
-              <div className="rounded-lg border border-border bg-card px-4 py-3 text-xs text-foreground/70">
-                Suggested next topics: {nextTopics.join(' • ')}
+              </div>
+            </div>
+            {referenceFiles.length > 0 ? (
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                {referenceFiles.map((file, index) => (
+                  <span
+                    key={`${file.filename}-${index}`}
+                    className="inline-flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1 text-[11px] text-foreground/70"
+                  >
+                    {file.filename}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setReferenceFiles((prev) => prev.filter((_, itemIndex) => itemIndex !== index))
+                      }
+                      className="rounded-full text-foreground/50 transition hover:text-destructive"
+                      aria-label={`Remove ${file.filename}`}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
               </div>
             ) : null}
 
-            {specPreview ? (
-              <details className="rounded-lg border border-border bg-card px-4 py-3 text-xs text-foreground/70">
-                <summary className="cursor-pointer select-none">Specification preview ({effectiveCompleteness}%)</summary>
-                <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap text-[11px] leading-relaxed">{specPreview}</pre>
-              </details>
+            {ingestionHint ? (
+              <p className="mt-2 text-[11px] text-primary/80">✓ {ingestionHint}</p>
             ) : null}
+          </form>
 
-            {questionCount >= 10 ? (
-              <div className="rounded-lg border border-blue-500/50 bg-blue-500/10 px-4 py-3 text-sm dark:border-blue-600/50 dark:bg-blue-950/20">
-                <p className="font-semibold text-blue-900 dark:text-blue-200 mb-1">✓ Questions Target Reached</p>
-                <p className="text-blue-800 dark:text-blue-300">
-                  You've gathered {questionCount} questions. You can continue gathering more details or proceed to execution.
-                </p>
-              </div>
-            ) : null}
+          {nextTopics.length > 0 ? (
+            <div className="rounded-lg border border-border bg-card px-4 py-3 text-xs text-foreground/70">
+              Suggested next topics: {nextTopics.join(' • ')}
+            </div>
+          ) : null}
 
-            {showExecuteButton ? (
-              <button
-                onClick={handleExecuteFromSpecs}
-                disabled={isExecuting || isSending || !activeProjectId}
-                className="w-full rounded-full border border-green-500/50 bg-green-500/10 px-5 py-3 text-sm font-semibold text-green-600 transition hover:border-green-500/80 hover:bg-green-500/20 disabled:cursor-not-allowed disabled:opacity-70"
-              >
-                {isExecuting
-                  ? 'Starting execution...'
-                  : `🚀 Execute & Generate Project${questionCount >= 10 ? '' : ` (${questionCount}/10 questions)`}`}
-              </button>
-            ) : null}
-          </div>
+          {specPreview ? (
+            <details className="rounded-lg border border-border bg-card px-4 py-3 text-xs text-foreground/70">
+              <summary className="cursor-pointer select-none">Specification preview ({effectiveCompleteness}%)</summary>
+              <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap text-[11px] leading-relaxed">{specPreview}</pre>
+            </details>
+          ) : null}
+
+          {questionCount >= 10 ? (
+            <div className="rounded-lg border border-blue-500/50 bg-blue-500/10 px-4 py-3 text-sm dark:border-blue-600/50 dark:bg-blue-950/20">
+              <p className="font-semibold text-blue-900 dark:text-blue-200 mb-1">✓ Questions Target Reached</p>
+              <p className="text-blue-800 dark:text-blue-300">
+                You've gathered {questionCount} questions. You can continue gathering more details or proceed to execution.
+              </p>
+            </div>
+          ) : null}
+
         </div>
       </div>
     </div>

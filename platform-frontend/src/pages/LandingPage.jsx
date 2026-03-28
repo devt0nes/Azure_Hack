@@ -263,26 +263,27 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
               const currentStyle = accentStyles[item.accent] || accentStyles.primary
 
               return (
-              <div key={item.step} className="relative">
-                <div className={`${currentStyle.card} p-6`}>
-                  <div className="flex items-start gap-4">
-                    <div className={`flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-md border mono text-lg font-bold ${currentStyle.icon}`}>
-                      {item.icon}
-                    </div>
-                    <div className="flex-1">
-                      <span className="mono text-[10px] uppercase tracking-[0.2em] text-foreground/50">Step {item.step}</span>
-                      <h3 className="mono mt-1 text-lg font-bold text-foreground">{item.title}</h3>
-                      <p className="mt-2 text-sm leading-relaxed text-foreground/80">{item.text}</p>
+                <div key={item.step} className="relative">
+                  <div className={`${currentStyle.card} p-6`}>
+                    <div className="flex items-start gap-4">
+                      <div className={`flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-md border mono text-lg font-bold ${currentStyle.icon}`}>
+                        {item.icon}
+                      </div>
+                      <div className="flex-1">
+                        <span className="mono text-[10px] uppercase tracking-[0.2em] text-foreground/50">Step {item.step}</span>
+                        <h3 className="mono mt-1 text-lg font-bold text-foreground">{item.title}</h3>
+                        <p className="mt-2 text-sm leading-relaxed text-foreground/80">{item.text}</p>
+                      </div>
                     </div>
                   </div>
+                  {index < SIMPLE_WORKFLOW.length - 1 && (
+                    <div className="flex justify-center py-2">
+                      <span className="mono text-2xl text-primary/70">↓</span>
+                    </div>
+                  )}
                 </div>
-                {index < SIMPLE_WORKFLOW.length - 1 && (
-                  <div className="flex justify-center py-2">
-                    <span className="mono text-2xl text-primary/70">↓</span>
-                  </div>
-                )}
-              </div>
-            )})}
+              )
+            })}
           </div>
         </div>
       </section>
@@ -301,19 +302,19 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
                 <span className="text-primary/70">▸</span> <span className="text-foreground/60">Initializing project deployment...</span>
               </p>
               <p className="text-terminal/80">
-                  ├─ Director Agent <span className="text-terminal">........................... ready</span>
+                ├─ Director Agent <span className="text-terminal">........................... ready</span>
               </p>
               <p className="text-terminal/80">
-                  ├─ Frontend Engineer <span className="text-terminal">..................... active</span>
+                ├─ Frontend Engineer <span className="text-terminal">..................... active</span>
               </p>
               <p className="text-terminal/80">
-                  ├─ Backend Engineer <span className="text-terminal">..................... active</span>
+                ├─ Backend Engineer <span className="text-terminal">..................... active</span>
               </p>
               <p className="text-terminal/80">
-                  ├─ DevOps & Cloud <span className="text-terminal">........................ active</span>
+                ├─ DevOps & Cloud <span className="text-terminal">........................ active</span>
               </p>
               <p className="text-terminal/80">
-                  └─ Quality Assurance <span className="text-terminal">..................... queued</span>
+                └─ Quality Assurance <span className="text-terminal">..................... queued</span>
               </p>
               <p className="mt-2">
                 <span className="text-primary/70">▸</span>{' '}
