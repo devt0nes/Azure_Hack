@@ -87,8 +87,16 @@ export default function App() {
 
     initAuth()
 
+    // Safety timeout: if Firebase never fires onAuthStateChanged (e.g. missing
+    // env vars), stop showing a blank screen after 3 s and fall through to the
+    // landing page.
+    const authTimeout = setTimeout(() => {
+      if (!cancelled) setAuthLoading(false)
+    }, 3000)
+
     return () => {
       cancelled = true
+      clearTimeout(authTimeout)
       unsubscribe()
     }
   }, [])

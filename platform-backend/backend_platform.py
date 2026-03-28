@@ -158,6 +158,13 @@ class AgentSelectionRequest(BaseModel):
     agent_id: str
     project_id: Optional[str] = None
 
+class CreateAgentRequest(BaseModel):
+    role: str                          # human name, will be slugified to id
+    description: str
+    tier: int = 2                       # 1 = Core (GPT-4o), 2 = Specialist (GPT-4o-mini)
+    model_label: Optional[str] = None  # auto-derived from tier if omitted
+    tags: List[str] = []
+    system_prompt: Optional[str] = None  # full system prompt / instructions for the agent
 
 class BudgetRequest(BaseModel):
     budget_usd: float
@@ -166,6 +173,16 @@ class BudgetRequest(BaseModel):
 class ClarifyAnswersRequest(BaseModel):
     project_id: str
     answers: Dict[str, str]
+
+class QuestionRequest(BaseModel):
+    project_id: str
+    user_message: str
+    conversation_history: Optional[List[Dict[str, str]]] = None
+    question_count: Optional[int] = 0
+
+
+class QuestionReadinessRequest(BaseModel):
+    project_id: str
 
 
 # ------------------------------
@@ -215,6 +232,7 @@ class ProjectStore:
             "clarification_questions": [],
             "clarification_answers": {},
             "clarification_state": "none",
+            "question_count": 0
         }
         self.projects[project_id] = payload
         self._save()
@@ -250,43 +268,149 @@ _BLOB_SYNC_MIN_INTERVAL_SECONDS = int(os.getenv("BLOB_SYNC_MIN_INTERVAL_SECONDS"
 _BLOB_SYNC_VERBOSE_DOWNLOAD_LOGS = str(os.getenv("BLOB_SYNC_VERBOSE_DOWNLOAD_LOGS", "false")).strip().lower() in {"1", "true", "yes", "on"}
 
 AGENT_CATALOG: List[Dict[str, Any]] = [
+    # ── Tier 1 — Module Agents (GPT-4o, core execution) ──────────────────────
     {
         "id": "backend_engineer",
         "role": "backend_engineer",
         "tier": 1,
         "model_label": "GPT-4o",
-        "description": "Builds backend APIs and orchestration logic.",
+        "description": "Builds backend APIs, microservices, and orchestration logic on Azure.",
         "reputation_score": 0.93,
-        "tags": ["backend", "api", "python"],
+        "tags": ["backend", "api", "python", "azure"],
     },
     {
         "id": "frontend_engineer",
         "role": "frontend_engineer",
         "tier": 1,
         "model_label": "GPT-4o",
-        "description": "Builds React UI and frontend integrations.",
+        "description": "Builds React UIs and integrates frontend with backend APIs.",
         "reputation_score": 0.91,
-        "tags": ["frontend", "react", "ui"],
+        "tags": ["frontend", "react", "ui", "tailwind"],
     },
     {
         "id": "database_architect",
         "role": "database_architect",
+        "tier": 1,
+        "model_label": "GPT-4o",
+        "description": "Designs SQL/NoSQL schemas, indexing strategies, and data pipelines.",
+        "reputation_score": 0.88,
+        "tags": ["database", "sql", "cosmos", "schema"],
+    },
+    # ── Tier 2 — Specialist Agents (all others, GPT-4o-mini) ─────────────────
+    {
+        "id": "solution_architect",
+        "role": "solution_architect",
         "tier": 2,
         "model_label": "GPT-4o-mini",
-        "description": "Designs schema and data layer conventions.",
-        "reputation_score": 0.88,
-        "tags": ["database", "sql", "schema"],
+        "description": "Designs overall system architecture, selects tech stack, and coordinates agents.",
+        "reputation_score": 0.95,
+        "tags": ["architecture", "azure", "design", "microservices"],
+    },
+    {
+        "id": "api_designer",
+        "role": "api_designer",
+        "tier": 2,
+        "model_label": "GPT-4o-mini",
+        "description": "Designs OpenAPI contracts, versioning strategy, and SDK interfaces.",
+        "reputation_score": 0.86,
+        "tags": ["api", "openapi", "design", "rest"],
+    },
+    {
+        "id": "security_engineer",
+        "role": "security_engineer",
+        "tier": 2,
+        "model_label": "GPT-4o-mini",
+        "description": "Hardens systems against OWASP Top-10, manages secrets, and enforces compliance.",
+        "reputation_score": 0.90,
+        "tags": ["security", "compliance", "azure", "owasp"],
+    },
+    {
+        "id": "devops_engineer",
+        "role": "devops_engineer",
+        "tier": 2,
+        "model_label": "GPT-4o-mini",
+        "description": "Builds CI/CD pipelines, IaC templates, and Azure deployment automation.",
+        "reputation_score": 0.87,
+        "tags": ["devops", "cicd", "azure", "iac"],
     },
     {
         "id": "qa_engineer",
         "role": "qa_engineer",
         "tier": 2,
         "model_label": "GPT-4o-mini",
-        "description": "Creates tests and quality checks.",
+        "description": "Writes test suites, runs load tests, and enforces coverage targets.",
         "reputation_score": 0.89,
-        "tags": ["qa", "testing"],
+        "tags": ["qa", "testing", "automation"],
     },
 ]
+
+# ─── Cosmos DB – AgentLibrary ────────────────────────────────────────────────
+# Reads agents from the AgentRegistry container in the agentic-nexus-db database.
+# Falls back to AGENT_CATALOG above if the DB is unreachable or the container is empty.
+_COSMOS_DB_NAME          = os.getenv("COSMOS_DB_NAME",           "agentic-nexus-db")
+_AGENT_REGISTRY_CONTAINER = os.getenv("AGENT_CONTAINER",         "AgentRegistry")
+_COSMOS_CONN_STR         = os.getenv("COSMOS_CONNECTION_STR",    "")
+_AGENT_CACHE_TTL         = int(os.getenv("AGENT_CACHE_TTL_SECONDS", "300"))
+
+_agent_catalog_cache: Optional[List[Dict[str, Any]]] = None
+_agent_cache_ts: float = 0.0
+_agent_cache_source: str = "local"
+
+
+def _get_agent_library_cosmos_container():
+    """Return a Cosmos DB ContainerClient for AgentRegistry, or raise."""
+    from azure.cosmos import CosmosClient  # lazy import – already in requirements
+    if not _COSMOS_CONN_STR:
+        raise RuntimeError("COSMOS_CONNECTION_STR is not set")
+    client = CosmosClient.from_connection_string(_COSMOS_CONN_STR)
+    db = client.get_database_client(_COSMOS_DB_NAME)
+    return db.get_container_client(_AGENT_REGISTRY_CONTAINER)
+
+
+def _query_cosmos_agents() -> List[Dict[str, Any]]:
+    """Blocking helper; call via run_in_executor.
+    Uses read_all_items() to enumerate documents without any SQL query,
+    bypassing the SDK's internal query rewriter that generates the
+    SC2001 'Identifier c could not be resolved' error.
+    """
+    container = _get_agent_library_cosmos_container()
+    items = list(container.read_all_items())
+    for item in items:
+        # Cosmos uses 'id' as partition key, so this should exist,
+        # but ensure the frontend field is consistent
+        if "id" not in item and "agent_id" in item:
+            item["id"] = item["agent_id"]
+        # Strip Cosmos system properties to keep payload clean
+        for key in ["_rid", "_self", "_etag", "_attachments", "_ts"]:
+            item.pop(key, None)
+    return items
+
+
+async def _get_agent_catalog() -> List[Dict[str, Any]]:
+    """Return agents from Cosmos DB AgentLibrary with a timed in-memory cache.
+
+    Falls back to the hardcoded AGENT_CATALOG if Cosmos DB is unreachable or
+    returns no documents.
+    """
+    global _agent_catalog_cache, _agent_cache_ts, _agent_cache_source
+    now = time.monotonic()
+    if _agent_catalog_cache is not None and (now - _agent_cache_ts) < _AGENT_CACHE_TTL:
+        return _agent_catalog_cache
+
+    try:
+        loop = asyncio.get_event_loop()
+        agents = await loop.run_in_executor(None, _query_cosmos_agents)
+        if agents:
+            _agent_catalog_cache = agents
+            _agent_cache_ts = now
+            _agent_cache_source = "cosmos"
+            return agents
+        logger.warning("AgentLibrary: Cosmos DB container returned 0 documents; using local fallback.")
+    except Exception as exc:
+        logger.warning("AgentLibrary: Cosmos DB unavailable (%s); using local fallback.", exc)
+
+    _agent_cache_source = "local"
+    return AGENT_CATALOG
 
 COSMOS_STARTUP_STATUS: Dict[str, Any] = {
     "enabled": False,
@@ -805,6 +929,14 @@ async def _invoke_real_orchestrator(project_id: str, project_data: Dict[str, Any
     )
 
     try:
+        # Step 0: Read project specifications file if it exists
+        project_specs = _read_project_specs_file(project_id)
+        if project_specs:
+            # Prepend specs to user input so director has full context
+            user_input = f"PROJECT SPECIFICATIONS:\n\n{project_specs}\n\nADDITIONAL CONTEXT:\n{user_input}"
+            logger.info("Director agent will use gathered specifications for project %s", project_id)
+            _append_project_log(project_id, "director_agent_using_specs", specs_length=len(project_specs))
+        
         # Step 1: Import director and orchestrator modules
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from director_agent import DirectorAI, TaskLedger, normalize_layers_common_sense, default_workspace_layout
@@ -1076,6 +1208,19 @@ async def _simulate_deployment(project_id: str, request: DeploymentRequest) -> N
         store.update(project_id, status=ProjectStatus.COMPLETED, error=str(exc))
         _append_project_log(project_id, "deployment_failed_exception", error=str(exc))
 
+def _read_project_specs_file(project_id: str) -> Optional[str]:
+    """Read the project specifications file if it exists."""
+    try:
+        workspace_dir = REPO_ROOT / "workspace"
+        spec_file = workspace_dir / f"project_specs_{project_id}.md"
+        if spec_file.exists() and spec_file.is_file():
+            content = spec_file.read_text(encoding="utf-8")
+            logger.info("Read project specifications from: %s", spec_file.resolve())
+            _append_project_log(project_id, "specs_file_read", spec_file=str(spec_file.resolve()))
+            return content
+    except Exception as exc:
+        logger.warning("Could not read project specs file for %s: %s", project_id, exc)
+    return None
 
 def _check_input_safety(text: str) -> Dict[str, Any]:
     lowered = (text or "").lower()
@@ -1602,7 +1747,7 @@ async def get_context(project_id: str):
 
 @app.get("/api/agents", tags=["Compatibility"])
 async def get_agents(tier: Optional[int] = Query(default=None), role: Optional[str] = Query(default=None), tag: Optional[str] = Query(default=None)):
-    agents = AGENT_CATALOG
+    agents = await _get_agent_catalog()
     if tier is not None:
         agents = [a for a in agents if int(a.get("tier", 0)) == int(tier)]
     if role:
@@ -1611,12 +1756,57 @@ async def get_agents(tier: Optional[int] = Query(default=None), role: Optional[s
     if tag:
         tag_l = tag.lower()
         agents = [a for a in agents if any(tag_l == str(t).lower() for t in a.get("tags", []))]
-    return {"agents": agents, "count": len(agents), "source": "local"}
+    return {"agents": agents, "count": len(agents), "source": _agent_cache_source}
+
+@app.post("/api/agents", tags=["Compatibility"])
+async def create_custom_agent(payload: CreateAgentRequest):
+    """Create a custom agent and persist it to CosmosDB."""
+    import re as _re
+
+    # Slugify role → id (lowercase, underscores, no special chars)
+    agent_id = _re.sub(r"[^a-z0-9]+", "_", payload.role.lower().strip()).strip("_")
+    if not agent_id:
+        raise HTTPException(status_code=422, detail="role must contain at least one alphanumeric character")
+    if len(payload.description.strip()) < 10:
+        raise HTTPException(status_code=422, detail="description must be at least 10 characters")
+    if payload.tier not in (1, 2):
+        raise HTTPException(status_code=422, detail="tier must be 1 or 2")
+
+    model_label = payload.model_label or ("GPT-4o" if payload.tier == 1 else "GPT-4o-mini")
+    doc = {
+        "id": agent_id,
+        "agent_id": agent_id,
+        "role": agent_id,
+        "display_name": payload.role.strip(),
+        "tier": payload.tier,
+        "model_label": model_label,
+        "description": payload.description.strip(),
+        "reputation_score": 0.0,
+        "tags": [t.strip().lower() for t in payload.tags if t.strip()],
+        "is_custom": True,
+        "system_prompt": payload.system_prompt.strip() if payload.system_prompt else "",
+    }
+
+    try:
+        container = _get_agent_library_cosmos_container()
+        await asyncio.get_event_loop().run_in_executor(None, lambda: container.upsert_item(doc))
+        logger.info("Custom agent '%s' upserted to CosmosDB.", agent_id)
+    except Exception as exc:
+        logger.warning("CosmosDB upsert failed for custom agent '%s': %s", agent_id, exc)
+        raise HTTPException(status_code=503, detail=f"Failed to persist agent: {exc}")
+
+    # Bust in-memory cache so next GET returns fresh data (includes new agent)
+    global _agent_catalog_cache, _agent_cache_ts
+    _agent_catalog_cache = None
+    _agent_cache_ts = 0.0
+
+    return {"ok": True, "agent": doc}
 
 
 @app.get("/api/agents/{agent_id}", tags=["Compatibility"])
 async def get_agent(agent_id: str):
-    for agent in AGENT_CATALOG:
+    agents = await _get_agent_catalog()
+    for agent in agents:
         if agent.get("id") == agent_id:
             return agent
     raise HTTPException(status_code=404, detail="Agent not found")
@@ -1626,7 +1816,8 @@ async def get_agent(agent_id: str):
 async def select_agent(payload: AgentSelectionRequest):
     project_id = payload.project_id or "default"
     project_map = SELECTED_AGENTS_BY_PROJECT.setdefault(project_id, {})
-    selected = next((a for a in AGENT_CATALOG if a["id"] == payload.agent_id), None)
+    agents = await _get_agent_catalog()
+    selected = next((a for a in agents if a["id"] == payload.agent_id), None)
     if not selected:
         raise HTTPException(status_code=404, detail="Agent not found")
     project_map[payload.agent_id] = {
@@ -1776,6 +1967,270 @@ async def clarify_intent(request: ClarifyRequest, background_tasks: BackgroundTa
             "project_id": request.project_id,
             "status": "processing",
         }
+
+@app.post("/question", tags=["QuestioningAgent"])
+async def question_endpoint(request: QuestionRequest):
+    """Interactive questioning agent endpoint.
+    
+    Conducts natural conversation to gather project specifications.
+    Updates project specification file iteratively.
+    """
+    try:
+        from questioning_agent import QuestioningAgent
+        
+        project = store.get(request.project_id)
+        current_question_count = request.question_count or 0
+        
+        if not project:
+            created = store.create_with_id(
+                request.project_id, 
+                f"Project {request.project_id[:8]}", 
+                request.user_message, 
+                None
+            )
+            project = created
+        else:
+            current_question_count = project.get("question_count", 0)
+        
+        agent = QuestioningAgent()
+        conversation_history = request.conversation_history or []
+        
+        response = agent.get_response(
+            request.project_id,
+            request.user_message,
+            conversation_history,
+            question_count=current_question_count
+        )
+        
+        # Update project with new question count
+        if not response.get("must_execute"):
+            project["question_count"] = response["question_count"]
+            project["updated_at"] = datetime.utcnow().isoformat()
+            store._save()
+        
+        _append_project_log(
+            request.project_id,
+            "questioning_agent_response",
+            user_message=request.user_message[:100],
+            question_count=response["question_count"]
+        )
+        
+        return {
+            "response": response["response"],
+            "agent_thinking": response["agent_thinking"],
+            "next_topics": response["next_topics"],
+            "project_id": request.project_id,
+            "spec_updated": response["spec_updated"],
+            "spec_preview": response["spec_preview"],
+            "full_spec_path": response["full_spec_path"],
+            "question_count": response["question_count"],
+            "questions_remaining": response["questions_remaining"],
+            "must_execute": response["must_execute"]
+        }
+    except Exception as exc:
+        logger.error("Question endpoint error: %s", exc)
+        return {
+            "response": "I encountered an issue processing your input. Please try again.",
+            "project_id": request.project_id,
+            "error": str(exc)
+        }
+
+
+@app.post("/question-readiness", tags=["QuestioningAgent"])
+async def question_readiness_endpoint(request: QuestionReadinessRequest):
+    """Check if project specifications are complete and ready for execution."""
+    try:
+        from questioning_agent import QuestioningAgent
+        
+        project = store.get(request.project_id)
+        if not project:
+            return {
+                "is_ready": False,
+                "completeness": 0,
+                "message": "No project found. Start a conversation first.",
+                "missing_areas": ["Project specifications"],
+                "project_id": request.project_id
+            }
+        
+        agent = QuestioningAgent()
+        readiness = agent.suggest_execution(request.project_id, [])
+        
+        return {
+            "is_ready": readiness["is_ready"],
+            "completeness": readiness["completeness"],
+            "message": readiness["message"],
+            "missing_areas": readiness["missing_areas"],
+            "full_spec_path": readiness["full_spec_path"],
+            "project_id": request.project_id
+        }
+    except Exception as exc:
+        logger.error("Question readiness error: %s", exc)
+        return {
+            "is_ready": False,
+            "completeness": 0,
+            "message": "Error assessing specification readiness.",
+            "project_id": request.project_id,
+            "error": str(exc)
+        }
+
+
+@app.post("/execute-from-specs", tags=["QuestioningAgent"])
+async def execute_from_specs(request: ExecuteRequest, background_tasks: BackgroundTasks):
+    """Execute project generation using specifications gathered by questioning agent."""
+    try:
+        from questioning_agent import QuestioningAgent
+        
+        project = store.get(request.project_id)
+        active_project_id = request.project_id
+        
+        if not project:
+            return {
+                "message": "Project not found",
+                "project_id": request.project_id,
+                "status": "failed",
+                "error": "No project with this ID"
+            }
+        
+        # Load the specification file
+        agent = QuestioningAgent()
+        spec_path = agent._get_spec_file_path(request.project_id)
+        
+        if not os.path.exists(spec_path):
+            return {
+                "message": "No specifications found. Please complete the questioning process first.",
+                "project_id": request.project_id,
+                "status": "failed"
+            }
+        
+        with open(spec_path, 'r', encoding='utf-8') as f:
+            project_specs = f.read()
+        
+        # Update project with specifications as the intent
+        project["user_intent"] = f"Based on these specifications:\n\n{project_specs}"
+        project["updated_at"] = datetime.utcnow().isoformat()
+        store._save()
+        
+        # Start execution
+        store.update(active_project_id, status=ProjectStatus.QUEUED, progress=5)
+        background_tasks.add_task(_simulate_generation, active_project_id)
+        
+        _append_project_log(
+            active_project_id,
+            "execute_from_specs_started",
+            local_output_dir=str(_project_generated_dir(active_project_id).resolve()),
+            blob_enabled=bool(BLOB_WORKSPACE),
+            spec_file=spec_path
+        )
+        
+        return {
+            "message": "Execution started using gathered specifications",
+            "project_id": active_project_id,
+            "status": "running",
+            "spec_file": spec_path
+        }
+    except Exception as exc:
+        logger.error("Execute from specs error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to start execution from specifications")
+
+
+@app.get("/api/workspace/files", tags=["Workspace"])
+async def get_workspace_files():
+    """List all files in the workspace directory (specs, ledgers, etc.)."""
+    try:
+        workspace_dir = REPO_ROOT / "workspace"
+        if not workspace_dir.exists():
+            return {"files": [], "workspace_path": str(workspace_dir.resolve())}
+        
+        files = []
+        for file_path in sorted(workspace_dir.glob("*")):
+            if file_path.is_file():
+                files.append({
+                    "name": file_path.name,
+                    "type": "spec" if "project_specs" in file_path.name else "ledger" if "ledger" in file_path.name else "other",
+                    "size": file_path.stat().st_size,
+                    "modified_at": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat(),
+                    "path": str(file_path.relative_to(REPO_ROOT))
+                })
+        
+        return {
+            "workspace_path": str(workspace_dir.resolve()),
+            "file_count": len(files),
+            "files": files
+        }
+    except Exception as exc:
+        logger.error("Workspace files error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to list workspace files")
+
+
+@app.get("/api/workspace/specs/{project_id}", tags=["Workspace"])
+async def get_project_specs_file(project_id: str):
+    """Retrieve the project specifications markdown file content."""
+    try:
+        workspace_dir = REPO_ROOT / "workspace"
+        spec_file = workspace_dir / f"project_specs_{project_id}.md"
+        
+        if not spec_file.exists():
+            raise HTTPException(status_code=404, detail=f"Specifications file not found for project {project_id}")
+        
+        content = spec_file.read_text(encoding="utf-8")
+        return {
+            "project_id": project_id,
+            "file_path": str(spec_file.resolve()),
+            "file_size": spec_file.stat().st_size,
+            "modified_at": datetime.fromtimestamp(spec_file.stat().st_mtime).isoformat(),
+            "content": content
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Get specs file error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to retrieve specifications file")
+
+
+@app.get("/api/workspace/ledger/{project_id}", tags=["Workspace"])
+async def get_project_ledger(project_id: str):
+    """Retrieve the task ledger JSON file for a project."""
+    try:
+        workspace_dir = REPO_ROOT / "workspace"
+        ledger_file = workspace_dir / f"ledger_{project_id}.json"
+        
+        # Also get project status and logs
+        project = store.get(project_id)
+        project_status = "unknown"
+        project_progress = 0
+        if project:
+            project_status = project.get("status", "unknown")
+            project_progress = project.get("progress", 0)
+        
+        if not ledger_file.exists():
+            return {
+                "project_id": project_id,
+                "file_path": str(ledger_file.resolve()),
+                "exists": False,
+                "project_status": project_status,
+                "project_progress": project_progress,
+                "message": f"Ledger file not found. Project status: {project_status} (progress: {project_progress}%). The director agent may still be running. Check logs for details.",
+                "ledger_data": None
+            }
+        
+        content = ledger_file.read_text(encoding="utf-8")
+        ledger_data = json.loads(content)
+        
+        return {
+            "project_id": project_id,
+            "file_path": str(ledger_file.resolve()),
+            "exists": True,
+            "project_status": project_status,
+            "project_progress": project_progress,
+            "file_size": ledger_file.stat().st_size,
+            "modified_at": datetime.fromtimestamp(ledger_file.stat().st_mtime).isoformat(),
+            "ledger_data": ledger_data
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Get ledger error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to retrieve ledger file")
 
 
 @app.get("/aeg", tags=["Compatibility"])

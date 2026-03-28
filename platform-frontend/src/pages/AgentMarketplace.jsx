@@ -11,7 +11,8 @@
  */
 
 import { useState, useEffect, useCallback } from 'react'
-import { getAgentCatalog, selectAgentForNode, deselectAgentForProject, getSelectedAgents } from '../services/agents.js'
+import { getAgentCatalog, selectAgentForNode, deselectAgentForProject, getSelectedAgents, createCustomAgent } from '../services/agents.js'
+
 
 // ─── Icons (reused from AgentLibraryPanel) ─────────────────────────────────
 const BackendIcon = () => <svg className="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><rect x="2" y="3" width="20" height="4" rx="1" /><rect x="2" y="10" width="20" height="4" rx="1" /><rect x="2" y="17" width="20" height="4" rx="1" /><circle cx="6" cy="5" r="1" fill="currentColor" /><circle cx="6" cy="12" r="1" fill="currentColor" /><circle cx="6" cy="19" r="1" fill="currentColor" /></svg>
@@ -222,34 +223,258 @@ function MarketplaceCard({ agent, onToggle, isAdded, canRemove }) {
   )
 }
 
+// ─── Custom Agent Modal ──────────────────────────────────────────────────────
+function CustomAgentModal({ onClose, onCreated }) {
+  const MODELS = ['GPT-4o', 'GPT-4o-mini', 'GPT-4 Turbo', 'GPT-3.5 Turbo']
+  const [form, setForm] = useState({
+    role: '',
+    description: '',
+    tier: 2,
+    model_label: 'GPT-4o-mini',
+    tagsRaw: '',
+    system_prompt: '',
+  })
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState(null)
+
+  const set = (key, val) => setForm(f => ({ ...f, [key]: val }))
+
+  // Auto-pick model when tier changes unless user has overridden it
+  const handleTierChange = (tier) => {
+    set('tier', tier)
+    set('model_label', tier === 1 ? 'GPT-4o' : 'GPT-4o-mini')
+  }
+
+  const slugPreview = form.role.trim()
+    ? form.role.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')
+    : ''
+
+  const handleSubmit = async (e) => {
+    e.preventDefault()
+    setError(null)
+    if (!form.role.trim()) return setError('Agent name is required.')
+    if (form.description.trim().length < 10) return setError('Description must be at least 10 characters.')
+    if (form.system_prompt.trim().length < 20) return setError('System prompt must be at least 20 characters.')
+    setSubmitting(true)
+    try {
+      const tags = form.tagsRaw
+        .split(',')
+        .map(t => t.trim().toLowerCase())
+        .filter(Boolean)
+      const res = await createCustomAgent({
+        role: form.role.trim(),
+        description: form.description.trim(),
+        tier: form.tier,
+        model_label: form.model_label,
+        tags,
+        system_prompt: form.system_prompt.trim(),
+      })
+      onCreated(res.agent)
+    } catch (err) {
+      setError(err.message || 'Failed to create agent. Is the backend running?')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      {/* Backdrop */}
+      <div
+        className="absolute inset-0 bg-midnight/70 backdrop-blur-sm"
+        onClick={onClose}
+      />
+
+      {/* Modal card — scrollable so the prompt field has room */}
+      <div className="relative w-full max-w-xl max-h-[92vh] flex flex-col rounded-3xl border border-border bg-gradient-to-br from-card/98 via-card/95 to-surface-raised/90 shadow-glass backdrop-blur-md overflow-hidden">
+
+        {/* Header */}
+        <div className="flex items-center justify-between border-b border-border/60 px-6 py-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-ember/20 to-orange-400/10 border border-ember/20 text-ember">
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><path d="M12 5v14M5 12h14" /></svg>
+            </div>
+            <div>
+              <h2 className="text-sm font-bold text-foreground">Create Custom Agent</h2>
+              <p className="text-[11px] text-foreground/50">Stored in Cosmos DB alongside built-in agents</p>
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="flex h-8 w-8 items-center justify-center rounded-xl border border-border bg-secondary/80 text-foreground/50 transition hover:bg-accent hover:text-foreground"
+          >
+            <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M18 6 6 18M6 6l12 12" /></svg>
+          </button>
+        </div>
+
+        {/* Form — scrollable body */}
+        <form onSubmit={handleSubmit} className="flex flex-col gap-5 overflow-y-auto px-6 py-5">
+
+          {/* Agent name */}
+          <div>
+            <label className="mb-1.5 block text-[11px] font-bold uppercase tracking-widest text-foreground/50">Agent Name <span className="text-red-400">*</span></label>
+            <input
+              type="text"
+              placeholder="e.g. ML Engineer"
+              value={form.role}
+              onChange={e => set('role', e.target.value)}
+              maxLength={60}
+              className="w-full rounded-xl border border-border bg-secondary/60 px-3 py-2.5 text-sm text-foreground placeholder-foreground/30 outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition"
+            />
+            {slugPreview && (
+              <p className="mt-1 text-[10px] text-foreground/40">
+                ID: <span className="mono font-semibold text-foreground/60">{slugPreview}</span>
+              </p>
+            )}
+          </div>
+
+          {/* Description */}
+          <div>
+            <label className="mb-1.5 block text-[11px] font-bold uppercase tracking-widest text-foreground/50">Description <span className="text-red-400">*</span></label>
+            <textarea
+              placeholder="What does this agent do? (min 10 chars)"
+              value={form.description}
+              onChange={e => set('description', e.target.value)}
+              rows={3}
+              maxLength={300}
+              className="w-full resize-none rounded-xl border border-border bg-secondary/60 px-3 py-2.5 text-sm text-foreground placeholder-foreground/30 outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition"
+            />
+            <p className="mt-1 text-right text-[10px] text-foreground/30">{form.description.length}/300</p>
+          </div>
+
+          {/* Tier */}
+          <div>
+            <label className="mb-2 block text-[11px] font-bold uppercase tracking-widest text-foreground/50">Tier</label>
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                { tier: 1, label: 'Tier 1 — Core', sub: 'GPT-4o · Primary execution', color: 'border-ember/40 bg-ember/8 text-ember' },
+                { tier: 2, label: 'Tier 2 — Specialist', sub: 'GPT-4o-mini · Support role', color: 'border-border bg-secondary/60 text-foreground/70' },
+              ].map(({ tier, label, sub, color }) => (
+                <button
+                  key={tier}
+                  type="button"
+                  onClick={() => handleTierChange(tier)}
+                  className={`rounded-xl border px-3 py-3 text-left transition ${form.tier === tier ? color : 'border-border bg-secondary/40 text-foreground/40 hover:bg-secondary/70'}`}
+                >
+                  <p className="text-xs font-bold">{label}</p>
+                  <p className="text-[10px] opacity-70">{sub}</p>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Model */}
+          <div>
+            <label className="mb-1.5 block text-[11px] font-bold uppercase tracking-widest text-foreground/50">Model</label>
+            <select
+              value={form.model_label}
+              onChange={e => set('model_label', e.target.value)}
+              className="w-full appearance-none rounded-xl border border-border bg-secondary/60 px-3 py-2.5 text-sm text-foreground outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition cursor-pointer"
+            >
+              {MODELS.map(m => <option key={m} value={m}>{m}</option>)}
+            </select>
+          </div>
+
+          {/* Tags */}
+          <div>
+            <label className="mb-1.5 block text-[11px] font-bold uppercase tracking-widest text-foreground/50">Tags <span className="font-normal normal-case text-foreground/30">(comma-separated)</span></label>
+            <input
+              type="text"
+              placeholder="e.g. ml, python, azure, training"
+              value={form.tagsRaw}
+              onChange={e => set('tagsRaw', e.target.value)}
+              className="w-full rounded-xl border border-border bg-secondary/60 px-3 py-2.5 text-sm text-foreground placeholder-foreground/30 outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition"
+            />
+          </div>
+
+          {/* System Prompt */}
+          <div>
+            <label className="mb-1.5 flex items-center justify-between text-[11px] font-bold uppercase tracking-widest text-foreground/50">
+              <span>System Prompt <span className="text-red-400">*</span></span>
+              <span className="font-normal normal-case text-foreground/30">{form.system_prompt.length} chars</span>
+            </label>
+            <textarea
+              placeholder={`Describe this agent's exact behaviour, responsibilities, and constraints. For example:\n\nYou are a Machine Learning Engineer agent...\n\n## Responsibilities\n- Design and implement ML pipelines\n- Select appropriate model architectures\n- Produce training scripts with clear comments\n\n## Rules\n- Always validate data before training\n- Prefer Azure ML services where applicable\n- Never hard-code credentials`}
+              value={form.system_prompt}
+              onChange={e => set('system_prompt', e.target.value)}
+              rows={10}
+              className="w-full resize-y rounded-xl border border-border bg-secondary/60 px-3 py-2.5 font-mono text-xs text-foreground placeholder-foreground/25 outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition leading-relaxed"
+            />
+            <p className="mt-1 text-[10px] text-foreground/35">Write in plain text or Markdown. This is stored as the agent&apos;s system instructions in Cosmos DB.</p>
+          </div>
+
+          {/* Error */}
+          {error && (
+            <div className="flex items-start gap-2.5 rounded-xl border border-red-200/50 bg-red-50/80 px-3 py-2.5">
+              <svg className="mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-red-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" /></svg>
+              <p className="text-xs text-red-700">{error}</p>
+            </div>
+          )}
+
+          {/* Actions */}
+          <div className="flex items-center justify-end gap-3 border-t border-border/60 pt-4">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-xl border border-border bg-secondary/80 px-4 py-2.5 text-xs font-semibold text-foreground/70 transition hover:bg-accent hover:text-foreground"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={submitting}
+              className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-ember to-orange-400 px-5 py-2.5 text-xs font-bold text-white shadow-sm transition hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {submitting ? (
+                <><svg className="h-3.5 w-3.5 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M21 12a9 9 0 1 1-6.219-8.56" /></svg>Creating…</>
+              ) : (
+                <><svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M12 5v14M5 12h14" /></svg>Create Agent</>
+              )}
+            </button>
+          </div>
+
+        </form>
+      </div>
+    </div>
+  )
+}
+
 // ─── Main Marketplace Page ───────────────────────────────────────────────────
 export default function AgentMarketplace({ onBack, selectedAegNodeId, onAgentSelected, currentProjectId }) {
   const [agents, setAgents] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [catalogSource, setCatalogSource] = useState(null)
+  const [retryKey, setRetryKey] = useState(0)
   const [search, setSearch] = useState('')
   const [tierFilter, setTierFilter] = useState('all')
   const [activeTag, setActiveTag] = useState(null)
   const [addedIds, setAddedIds] = useState(new Set())
-  const [showCustomAgentNote, setShowCustomAgentNote] = useState(false)
+  const [showCustomAgentForm, setShowCustomAgentForm] = useState(false)
+  const [successBanner, setSuccessBanner] = useState(null)
 
-  // Load catalog
+  // Fetch live catalog from Cosmos DB (via backend)
   useEffect(() => {
     let cancelled = false
+    setLoading(true)
+    setError(null)
     const load = async () => {
-      setLoading(true); setError(null)
       try {
         const data = await getAgentCatalog()
-        if (!cancelled) setAgents(data.agents || [])
+        if (!cancelled) {
+          const live = Array.isArray(data?.agents) ? data.agents : []
+          setAgents(live)
+          setCatalogSource(data?.source || 'api')
+        }
       } catch (err) {
-        if (!cancelled) setError(err.message)
+        if (!cancelled) setError(err.message || 'Could not reach the agent catalog. Is the backend running?')
       } finally {
         if (!cancelled) setLoading(false)
       }
     }
     load()
     return () => { cancelled = true }
-  }, [])
+  }, [retryKey])
 
   // Pre-mark agents already selected for this project
   useEffect(() => {
@@ -363,7 +588,7 @@ export default function AgentMarketplace({ onBack, selectedAegNodeId, onAgentSel
             {/* Right: search */}
             <div className="animate-slide-in-right flex items-start gap-3 pt-1">
               <button
-                onClick={() => setShowCustomAgentNote(prev => !prev)}
+                onClick={() => setShowCustomAgentForm(true)}
                 className="inline-flex items-center gap-2 rounded-xl border border-primary/25 bg-primary/10 px-3 py-2 text-xs font-semibold text-primary shadow-sm transition hover:bg-primary/15"
               >
                 <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
@@ -389,25 +614,27 @@ export default function AgentMarketplace({ onBack, selectedAegNodeId, onAgentSel
         </div>
       </header>
 
-      {showCustomAgentNote && (
-        <div className="relative z-10 px-6 pt-2">
-          <div className="workshop-panel rounded-2xl border border-border bg-card/80 p-4 shadow-glass backdrop-blur-md">
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div className="max-w-3xl">
-                <p className="text-sm font-semibold text-foreground">Custom agent upload is the next step</p>
-                <p className="mt-1 text-xs leading-relaxed text-foreground/70">
-                  The UI now exposes the entry point, but submission is intentionally disabled while we finish the backend workflow.
-                  We have already prepared the catalog storage model so future user-created agents can live beside built-ins in Cosmos DB.
-                </p>
-              </div>
-              <button
-                onClick={() => setShowCustomAgentNote(false)}
-                className="rounded-lg border border-border bg-secondary/80 px-3 py-1.5 text-xs font-medium text-foreground/80 transition hover:bg-accent hover:text-foreground"
-              >
-                Close
-              </button>
-            </div>
-          </div>
+      {/* Custom Agent Modal */}
+      {showCustomAgentForm && (
+        <CustomAgentModal
+          onClose={() => setShowCustomAgentForm(false)}
+          onCreated={(agent) => {
+            setShowCustomAgentForm(false)
+            setSuccessBanner(`Agent "${agent.display_name || agent.role}" created and saved to Cosmos DB`)
+            setTimeout(() => setSuccessBanner(null), 5000)
+            setRetryKey(k => k + 1) // refresh catalog
+          }}
+        />
+      )}
+
+      {/* Success banner */}
+      {successBanner && (
+        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-3 rounded-2xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 shadow-glass backdrop-blur-md">
+          <svg className="h-4 w-4 text-emerald-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" /></svg>
+          <p className="text-xs font-semibold text-emerald-600">{successBanner}</p>
+          <button onClick={() => setSuccessBanner(null)} className="ml-1 text-emerald-500/60 hover:text-emerald-600">
+            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M18 6 6 18M6 6l12 12" /></svg>
+          </button>
         </div>
       )}
 
@@ -468,9 +695,16 @@ export default function AgentMarketplace({ onBack, selectedAegNodeId, onAgentSel
             </div>
           )}
 
-          {/* Count — pushed right */}
-          <span className="ml-auto text-[11px] font-medium uppercase tracking-widest text-foreground/40">
-            {filtered.length} agent{filtered.length !== 1 ? 's' : ''}
+          {/* Count + catalog source — pushed right */}
+          <span className="ml-auto flex items-center gap-2 text-[11px] font-medium uppercase tracking-widest text-foreground/40">
+            {agents.length > 0 && <>{filtered.length} agent{filtered.length !== 1 ? 's' : ''}</>}
+            {loading && <span className="h-3 w-3 rounded-full border border-foreground/20 border-t-foreground/60 animate-spin" />}
+            {!loading && catalogSource === 'cosmos_db' && (
+              <span className="rounded-full border border-emerald-500/25 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-bold text-emerald-500 tracking-widest normal-case">COSMOS LIVE</span>
+            )}
+            {!loading && catalogSource === 'local' && (
+              <span className="rounded-full border border-amber-500/25 bg-amber-500/10 px-2 py-0.5 text-[10px] font-bold text-amber-500 tracking-widest normal-case">LOCAL FALLBACK</span>
+            )}
           </span>
 
         </div>
@@ -482,22 +716,44 @@ export default function AgentMarketplace({ onBack, selectedAegNodeId, onAgentSel
 
           <div className="min-h-0 overflow-y-auto px-2 py-4">
 
+            {/* Loading skeleton */}
             {loading && (
+              <div>
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 mb-8">
+                  {Array.from({ length: 4 }).map((_, i) => (
+                    <div key={i} className="h-64 rounded-2xl border border-border bg-card/50 animate-pulse" />
+                  ))}
+                </div>
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                  {Array.from({ length: 4 }).map((_, i) => (
+                    <div key={i} className="h-64 rounded-2xl border border-border bg-card/50 animate-pulse" />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Error state */}
+            {!loading && error && (
               <div className="flex flex-col items-center justify-center gap-4 py-24">
-                <div className="h-10 w-10 rounded-full border-2 border-ember/30 border-t-ember animate-spin" />
-                <p className="text-sm font-medium text-ink/40">Loading agent catalog…</p>
+                <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-red-200/60 bg-red-50/80 text-red-400">
+                  <svg className="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" /></svg>
+                </div>
+                <div className="text-center max-w-sm">
+                  <p className="text-sm font-semibold text-foreground/80 mb-1">Failed to load agent catalog</p>
+                  <p className="text-xs text-foreground/50">{error}</p>
+                </div>
+                <button
+                  onClick={() => setRetryKey(k => k + 1)}
+                  className="flex items-center gap-2 rounded-xl border border-primary/25 bg-primary/10 px-4 py-2 text-xs font-semibold text-primary transition hover:bg-primary/20"
+                >
+                  <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" /><path d="M8 16H3v5" /></svg>
+                  Retry
+                </button>
               </div>
             )}
 
-            {error && (
-              <div className="mx-auto max-w-md rounded-2xl border border-destructive/40 bg-destructive/10 p-6 text-center">
-                <p className="text-sm font-semibold text-destructive">Could not load catalog</p>
-                <p className="mt-1 text-xs text-destructive/90">{error}</p>
-                <p className="mt-3 text-[11px] text-foreground/55">Make sure the backend is running and <code className="mono">/api/agents</code> is reachable.</p>
-              </div>
-            )}
-
-            {!loading && !error && filtered.length === 0 && (
+            {/* Empty filter state */}
+            {!loading && !error && filtered.length === 0 && agents.length > 0 && (
               <div className="flex flex-col items-center justify-center gap-3 py-24">
                 <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-border bg-card/70 text-foreground/30">
                   <svg className="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" /></svg>
