@@ -345,6 +345,8 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
         id: `assistant-${Date.now()}`,
         role: 'assistant',
         content: assistantText,
+        webContextUsed:
+          response?.web_context_used === undefined ? null : Boolean(response.web_context_used),
       }
       setMessages((prev) => [...prev, assistantMessage])
 
@@ -560,6 +562,18 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
                           : 'border border-border bg-card text-foreground'
                       }`}
                   >
+                    {message.role === 'assistant' && message.webContextUsed !== null ? (
+                      <div className="mb-2">
+                        <span
+                          className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${message.webContextUsed
+                              ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-700'
+                              : 'border-amber-500/50 bg-amber-500/10 text-amber-700'
+                            }`}
+                        >
+                          Web Context: {message.webContextUsed ? 'On for this answer' : 'Off for this answer'}
+                        </span>
+                      </div>
+                    ) : null}
                     <div
                       className="whitespace-pre-wrap break-words"
                       dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }}

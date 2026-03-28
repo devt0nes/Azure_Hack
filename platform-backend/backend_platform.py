@@ -1932,7 +1932,8 @@ async def question_endpoint(request: QuestionRequest):
             "full_spec_path": response["full_spec_path"],
             "question_count": response["question_count"],
             "questions_remaining": response["questions_remaining"],
-            "must_execute": response["must_execute"]
+            "must_execute": response["must_execute"],
+            "web_context_used": bool(response.get("web_context_used", False))
         }
     except Exception as exc:
         logger.error("Question endpoint error: %s", exc)
