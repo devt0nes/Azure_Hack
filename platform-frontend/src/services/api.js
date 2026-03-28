@@ -73,6 +73,7 @@ export const executeFromSpecs = ({
   projectId,
   specPath = null,
   clarificationContext = null,
+  serviceApiKeys = null,
 }) =>
   apiFetch('/execute-from-specs', {
     method: 'POST',
@@ -80,6 +81,7 @@ export const executeFromSpecs = ({
       project_id: projectId,
       spec_path: specPath,
       clarification_context: clarificationContext,
+      service_api_keys: serviceApiKeys,
     }),
   })
 
@@ -101,13 +103,15 @@ export const getDeploymentStatus = ({ projectId }) =>
 export const getHealth = () => apiFetch('/api/health')
 export const listProjects = () => apiFetch('/api/projects')
 export const getProject = ({ projectId }) => apiFetch(`/api/projects/${projectId}`)
+export const getProjectApiKeyStatus = ({ projectId }) =>
+  apiFetch(`/api/projects/${projectId}/service-api-keys/status`)
 export const getProjectPreviewStatus = ({ projectId }) => apiFetch(`/api/projects/${projectId}/preview-status`)
 export const getProjectLogs = ({ projectId }) => apiFetch(`/api/projects/${projectId}/logs`)
 export const getProjectAgentEvents = ({ projectId }) => apiFetch(`/api/projects/${projectId}/agent-events`)
 export const listProjectArtifacts = ({ projectId }) => apiFetch(`/api/projects/${projectId}/artifacts`)
 export const getWorkspaceFiles = ({ projectId }) => apiFetch(`/api/projects/${projectId}/workspace-files`)
 export const getProjectSpecs = ({ projectId }) => apiFetch(`/api/projects/${projectId}/specs`)
-export const getProjectLedger = ({ projectId }) => apiFetch(`/api/projects/${projectId}/ledger`)
+export const getProjectLedger = ({ projectId }) => apiFetch(`/api/workspace/ledger/${projectId}`)
 
 export const saveCanvas = ({ projectId, canvasData }) =>
   apiFetch(`/api/projects/${projectId}/canvas`, {

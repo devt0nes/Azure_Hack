@@ -9,9 +9,10 @@ Adds two tools to the agent tool surface:
         Returns lightweight metadata — no code — so the agent can pick
         the right template before committing.
 
-    use_template(template_id, destination_path)
-        Fetch a template by id and write its code AS-IS into the workspace
-        via FilesTools.write_file.  Agents must NOT rewrite the code.
+    use_template(template_id, target_path, line_number)
+        Fetch a template by id and paste its code AS-IS into the exact file path
+        at the requested line number. If the file does not exist, create it with
+        template code.
 
 --------------------------------------------------------------------
 HOW TO WIRE IN  (three options, pick one)
@@ -155,6 +156,66 @@ class TemplateTools:
             "Set COSMOS_CONNECTION_STR (or COSMOS_ENDPOINT + COSMOS_KEY) env vars."
         )
 
+    def _find_safe_insert_line(self, lines: List[str], anchor_line: int) -> int:
+        """
+        Return a 1-based line number where new code should be inserted safely.
+
+        Strategy:
+          - Treat anchor_line as a location hint, not an insertion point.
+          - If anchor is inside a brace-delimited block, insert after the block ends.
+          - Otherwise, insert after the current non-empty statement region.
+          - Never return a line that overwrites existing content.
+        """
+        total = len(lines)
+        if total == 0:
+            return 1
+
+        anchor_line = max(1, min(anchor_line, total))
+        anchor_idx = anchor_line - 1
+
+        # Move anchor to nearest non-empty line around the provided line.
+        if not lines[anchor_idx].strip():
+            down = anchor_idx
+            up = anchor_idx
+            found = None
+            while down < total or up >= 0:
+                if down < total and lines[down].strip():
+                    found = down
+                    break
+                if up >= 0 and lines[up].strip():
+                    found = up
+                    break
+                down += 1
+                up -= 1
+            if found is not None:
+                anchor_idx = found
+
+        # Find innermost brace block containing anchor_idx.
+        stack: List[int] = []
+        containing_start = None
+        containing_end = None
+
+        for idx, line in enumerate(lines):
+            for ch in line:
+                if ch == "{":
+                    stack.append(idx)
+                elif ch == "}" and stack:
+                    start = stack.pop()
+                    end = idx
+                    if start <= anchor_idx <= end:
+                        containing_start = start
+                        containing_end = end
+
+        if containing_start is not None and containing_end is not None:
+            # Insert after the closing brace line.
+            return containing_end + 2
+
+        # Fallback: insert after contiguous non-empty lines from anchor.
+        end_idx = anchor_idx
+        while end_idx + 1 < total and lines[end_idx + 1].strip():
+            end_idx += 1
+        return end_idx + 2
+
     # ------------------------------------------------------------------
     # search_template
     # ------------------------------------------------------------------
@@ -275,22 +336,31 @@ class TemplateTools:
     # use_template
     # ------------------------------------------------------------------
 
-    def use_template(self, template_id: str, destination_path: str) -> str:
+    def use_template(self, template_id: str, target_path: str, line_number: int) -> str:
         """
-        Copy a template's code AS-IS into the agent workspace.
+        Paste a template's code AS-IS into a target file at a specific line.
 
         Steps:
           1. Fetch the full Cosmos document for template_id.
           2. Extract the 'code' field.
-          3. Write it verbatim to destination_path via FilesTools.write_file.
+          3. If target_path exists, insert template code at line_number.
+             If it does not exist, create it with template code.
              *** DO NOT modify or rewrite the code. Use it exactly as stored. ***
           4. Increment usage_count on the Cosmos document (best-effort).
         """
         if not self._cosmos_ok():
             return self._not_configured_error()
 
-        if not template_id or not destination_path:
-            return "ERROR: Both template_id and destination_path are required."
+        if not template_id or not target_path:
+            return "ERROR: template_id and target_path are required."
+
+        try:
+            line_number = int(line_number)
+        except Exception:
+            return "ERROR: line_number must be an integer."
+
+        if line_number < 1:
+            return "ERROR: line_number must be >= 1."
 
         container = self._get_container()
         item = None
@@ -332,11 +402,42 @@ class TemplateTools:
 
         # Write code verbatim into the workspace
         if self.files_tool is not None:
-            write_result = self.files_tool.write_file(destination_path, code)
-            if isinstance(write_result, str) and write_result.startswith("ERROR"):
-                return json.dumps({
-                    "error": f"Failed to write template to workspace: {write_result}"
-                })
+            read_result = self.files_tool.read_file(target_path)
+            inserted_at_line = line_number
+
+            if isinstance(read_result, str) and read_result.startswith("ERROR"):
+                write_result = self.files_tool.write_file(target_path, code)
+                if isinstance(write_result, str) and write_result.startswith("ERROR"):
+                    return json.dumps({
+                        "error": f"Failed to create template file: {write_result}"
+                    })
+                action = "created"
+                inserted_at_line = 1
+            else:
+                existing_content = read_result if isinstance(read_result, str) else ""
+                lines = existing_content.splitlines(keepends=True)
+
+                if line_number > len(lines) + 1:
+                    return json.dumps({
+                        "error": (
+                            f"line_number {line_number} is out of range for file with "
+                            f"{len(lines)} lines. Use 1 to {len(lines) + 1}."
+                        )
+                    })
+
+                safe_line = self._find_safe_insert_line(lines, line_number)
+                insert_idx = min(max(safe_line - 1, 0), len(lines))
+                template_block = code if code.endswith("\n") else (code + "\n")
+                lines.insert(insert_idx, template_block)
+                updated_content = "".join(lines)
+                inserted_at_line = insert_idx + 1
+
+                write_result = self.files_tool.write_file(target_path, updated_content)
+                if isinstance(write_result, str) and write_result.startswith("ERROR"):
+                    return json.dumps({
+                        "error": f"Failed to update target file: {write_result}"
+                    })
+                action = "inserted"
         else:
             return json.dumps({
                 "warning": (
@@ -344,7 +445,8 @@ class TemplateTools:
                     "Returning code directly — write it to disk yourself."
                 ),
                 "template_id":      template_id,
-                "destination_path": destination_path,
+                "target_path":      target_path,
+                "line_number":      line_number,
                 "code":             code,
             })
 
@@ -359,12 +461,17 @@ class TemplateTools:
             "success":          True,
             "template_id":      template_id,
             "name":             item.get("name", template_id),
-            "destination_path": destination_path,
+            "target_path":      target_path,
+            "line_number":      line_number,
+            "inserted_at_line": inserted_at_line,
+            "action":           action,
             "category":         item.get("category"),
             "framework":        item.get("framework"),
             "message": (
-                f"✅ Template '{item.get('name', template_id)}' copied as-is to "
-                f"'{destination_path}'. Do NOT rewrite the code — use it exactly as placed."
+                f"✅ Template '{item.get('name', template_id)}' {action} in "
+                f"'{target_path}' (anchor line {line_number}, inserted at line {inserted_at_line}). "
+                "Do NOT rewrite the code — "
+                "use it exactly as placed."
             ),
         })
 
@@ -433,7 +540,8 @@ TEMPLATE_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "Copy a template's code AS-IS from the library into your workspace. "
                 "Use the template_id returned by search_template.\n"
                 "IMPORTANT: Do NOT modify or rewrite the code after calling this — "
-                "place it at destination_path exactly as stored. "
+                "place it at target_path exactly as stored. "
+                "Paste into target_path at the exact line_number. "
                 "You may import or call it from other files you write."
             ),
             "parameters": {
@@ -446,17 +554,24 @@ TEMPLATE_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                             "Example: 'navbar-responsive-v1'."
                         ),
                     },
-                    "destination_path": {
+                    "target_path": {
                         "type": "string",
                         "description": (
-                            "Workspace path where the template file should be written. "
-                            "Use the correct extension for the framework. "
+                            "Exact workspace file path where template code should be pasted. "
+                            "If the file does not exist, it will be created with the template code. "
                             "Examples: '/workspace/frontend/components/Navbar.jsx', "
                             "'/workspace/frontend/pages/Login.tsx'."
                         ),
                     },
+                    "line_number": {
+                        "type": "integer",
+                        "description": (
+                            "1-based line number where template code should be inserted in target_path. "
+                            "Use 1 to insert at file start, or existing_line_count + 1 to append."
+                        ),
+                    },
                 },
-                "required": ["template_id", "destination_path"],
+                "required": ["template_id", "target_path", "line_number"],
             },
         },
     },
@@ -514,7 +629,8 @@ def attach_template_tools(registry) -> None:
         if function_name == "use_template":
             return _t.use_template(
                 template_id=function_args.get("template_id", ""),
-                destination_path=function_args.get("destination_path", ""),
+                target_path=function_args.get("target_path", ""),
+                line_number=function_args.get("line_number", 1),
             )
         return _orig_exec(function_name, function_args)
 
@@ -553,7 +669,8 @@ class TemplateToolRegistry:
         if function_name == "use_template":
             return self.templates.use_template(
                 template_id=function_args.get("template_id", ""),
-                destination_path=function_args.get("destination_path", ""),
+                target_path=function_args.get("target_path", ""),
+                line_number=function_args.get("line_number", 1),
             )
         return (
             f"ERROR: Unknown tool '{function_name}'. "

@@ -39,7 +39,12 @@ __pycache__/
 .pytest_cache/
 venv/
 env/
+.venv/
+**/.venv/
 
 # Testing
 coverage/
 .coverage
+.venv/
+__pycache__/
+node_modules/

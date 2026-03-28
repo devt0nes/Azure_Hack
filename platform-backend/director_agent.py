@@ -163,6 +163,103 @@ def default_workspace_layout() -> Dict:
     }
 
 
+def _is_frontend_only_intent(user_intent: str) -> bool:
+    """
+    Returns True if the user intent is clearly a pure frontend project
+    that needs no database or backend server.
+    """
+    intent_lower = user_intent.lower()
+
+    # Strong signals that a backend/DB IS needed — if any match, not frontend-only
+    backend_signals = [
+        "login", "auth", "sign up", "register", "user account",
+        "database", "store data", "persist", "crud", "api",
+        "backend", "server", "endpoint", "rest", "graphql",
+        "e-commerce", "ecommerce", "inventory", "cart", "checkout",
+        "payment", "upload", "download", "real-time", "websocket",
+        "admin panel", "cms", "content management",
+    ]
+    if any(sig in intent_lower for sig in backend_signals):
+        return False
+
+    # Strong signals it IS frontend-only
+    frontend_signals = [
+        "react", "vue", "angular", "next.js", "nextjs",
+        "landing page", "portfolio", "static", "dashboard ui",
+        "sidebar navigation", "component", "ui only", "frontend only",
+        "single page", "spa",
+    ]
+    frontend_hit = any(sig in intent_lower for sig in frontend_signals)
+
+    # If frontend signal found AND no backend signal, treat as frontend-only
+    return frontend_hit
+
+
+def _sanitize_ledger_agents(ledger_data: Dict, user_intent: str) -> Dict:
+    """
+    Hard guardrail: remove database_architect and backend_engineer from the
+    ledger if the user intent is clearly a pure frontend project.
+    Also removes them from layers and layer_onboarding.
+    """
+    if not ledger_data or not isinstance(ledger_data, dict):
+        return ledger_data
+
+    if not _is_frontend_only_intent(user_intent):
+        return ledger_data  # Not frontend-only — leave ledger untouched
+
+    roles_to_remove = {"database_architect", "backend_engineer"}
+    spec = ledger_data.get("agent_specifications", {})
+
+    # 1. Remove from required_agents list
+    required = spec.get("required_agents", [])
+    if isinstance(required, list):
+        spec["required_agents"] = [
+            a for a in required
+            if _extract_role(a) not in roles_to_remove
+        ]
+
+    # 2. Remove from layers
+    layers = spec.get("layers", [])
+    if isinstance(layers, list):
+        cleaned_layers = []
+        for layer in layers:
+            if isinstance(layer, list):
+                filtered = [r for r in layer if r not in roles_to_remove]
+                if filtered:
+                    cleaned_layers.append(filtered)
+            elif isinstance(layer, dict):
+                agents = layer.get("agents", [])
+                if isinstance(agents, list):
+                    layer["agents"] = [
+                        a for a in agents
+                        if (a if isinstance(a, str) else a.get("role", "")) not in roles_to_remove
+                    ]
+                if layer.get("agents"):
+                    cleaned_layers.append(layer)
+        spec["layers"] = enforce_system_architect_first_layer(cleaned_layers)
+
+    # 3. Remove from layer_onboarding
+    onboarding = ledger_data.get("layer_onboarding", [])
+    if isinstance(onboarding, list):
+        for entry in onboarding:
+            if isinstance(entry, dict):
+                role_exp = entry.get("role_expectations", {})
+                if isinstance(role_exp, dict):
+                    for role in roles_to_remove:
+                        role_exp.pop(role, None)
+
+    # 4. Remove from workspace_layout role_output_roots
+    layout = ledger_data.get("workspace_layout", {})
+    if isinstance(layout, dict):
+        roots = layout.get("role_output_roots", {})
+        if isinstance(roots, dict):
+            for role in roles_to_remove:
+                roots.pop(role, None)
+
+    print(f"  🛡️  Guardrail: removed {roles_to_remove} — pure frontend intent detected.")
+    return ledger_data
+
+
 def normalize_layers_common_sense(ledger_data: Dict) -> None:
     """Normalize layers with minimal count while preserving practical execution order."""
     if not isinstance(ledger_data, dict):
@@ -310,6 +407,7 @@ class TaskLedger:
                 "cloud_services": [],
                 "development_tools": []
             },
+            "required_api_key_services": [],
             "feature_catalog": [],
             "layer_onboarding": [],
             "workspace_layout": {
@@ -817,6 +915,7 @@ CONSISTENCY RULES:
 - Minimize agent count (quality over quantity)
 - Match technology stack to requirements
 - Populate feature_catalog with ALL expected product features/capabilities.
+- Populate required_api_key_services with service names that require user-provided API keys before execution.
 - Populate layer_onboarding with one entry per layer. Each entry must include:
     • layer_index
     • stage_name
@@ -834,6 +933,29 @@ CONSISTENCY RULES:
 - Do NOT prescribe exact implementation internals (e.g., concrete API spec code/tasks) in the ledger.
 - The ledger should state WHAT needs to be done; agents decide HOW via detailed blackboard discussion.
 - Status flow: "DRAFT" (building) → "DONE" (ready for execution)
+- Technology selections must be singular in final outputs: one choice per category.
+- Do NOT include multi-option stack outputs such as "A or B", "A/B", or comma-separated alternatives.
+- For technology_stack fields, include at most one selected value per category list.
+
+AGENT SELECTION RULES — READ CAREFULLY:
+You must ONLY include agents that are genuinely required by the user intent.
+
+✅ ALWAYS include: system_architect, qa_engineer
+✅ ALWAYS include: frontend_engineer (if any UI is involved)
+
+⚠️  database_architect — ONLY include if the project explicitly needs a database:
+    INCLUDE for: user accounts/auth, CRUD operations, storing/retrieving data, APIs with persistence, e-commerce, inventory, etc.
+    EXCLUDE for: pure frontend apps, static sites, UI dashboards with no data storage, component libraries, landing pages, portfolio sites.
+
+⚠️  backend_engineer — ONLY include if the project needs a backend/API server:
+    INCLUDE for: REST/GraphQL APIs, server-side logic, authentication, database access layers.
+    EXCLUDE for: pure frontend apps, static sites, React-only dashboards with no real API.
+
+EXAMPLES:
+  "Build a React dashboard with sidebar navigation" → EXCLUDE database_architect, EXCLUDE backend_engineer
+  "Build a React app with user login and data storage" → INCLUDE database_architect, INCLUDE backend_engineer
+  "Build a landing page" → EXCLUDE database_architect, EXCLUDE backend_engineer
+  "Build a todo app with persistence" → INCLUDE database_architect, INCLUDE backend_engineer
 
 Return JSON with only the fields you update. The tool will validate before persisting."""
         
@@ -894,6 +1016,7 @@ Return JSON with only the fields you update. The tool will validate before persi
         
         try:
             updated_data = json.loads(final_content)
+            updated_data = _sanitize_ledger_agents(updated_data, ledger.data.get("user_intent", ""))
             return updated_data
         except json.JSONDecodeError:
             print(f"  ⚠️ Failed to parse final response as JSON")
@@ -943,12 +1066,36 @@ CRITICAL RULES:
 ✓ Put heavily blocked/waiting agents in later layers; keep decently coordinating agents together
 ✓ Ensure every required agent role appears exactly once in layers
 ✓ Populate feature_catalog with ALL expected project features/capabilities
+✓ Populate required_api_key_services with services needing user API keys (for example: OpenAI, Stripe, Twilio)
 ✓ Populate layer_onboarding with one detailed onboarding entry per execution layer
 ✓ In layer_onboarding, specify WHAT each layer must deliver, per-role expectations, and next-stage readiness outputs
 ✓ Populate workspace_layout with production-style directories and role_output_roots per role
 ✓ Do NOT prescribe exact implementation internals (e.g., concrete API spec code tasks) in ledger fields
 ✓ Return ONLY valid JSON - no explanations outside JSON
 ✓ Use null/empty arrays for fields with no data yet
+✓ Technology selections must be singular in final output (one choice per category)
+✓ Never return alternatives like "A or B", "A/B", or multi-option stack lists
+✓ For technology_stack categories, include at most one selected value per list
+
+AGENT SELECTION RULES — READ CAREFULLY:
+You must ONLY include agents that are genuinely required by the user intent.
+
+✅ ALWAYS include: system_architect, qa_engineer
+✅ ALWAYS include: frontend_engineer (if any UI is involved)
+
+⚠️  database_architect — ONLY include if the project explicitly needs a database:
+    INCLUDE for: user accounts/auth, CRUD operations, storing/retrieving data, APIs with persistence, e-commerce, inventory, etc.
+    EXCLUDE for: pure frontend apps, static sites, UI dashboards with no data storage, component libraries, landing pages, portfolio sites.
+
+⚠️  backend_engineer — ONLY include if the project needs a backend/API server:
+    INCLUDE for: REST/GraphQL APIs, server-side logic, authentication, database access layers.
+    EXCLUDE for: pure frontend apps, static sites, React-only dashboards with no real API.
+
+EXAMPLES:
+  "Build a React dashboard with sidebar navigation" → EXCLUDE database_architect, EXCLUDE backend_engineer
+  "Build a React app with user login and data storage" → INCLUDE database_architect, INCLUDE backend_engineer
+  "Build a landing page" → EXCLUDE database_architect, EXCLUDE backend_engineer
+  "Build a todo app with persistence" → INCLUDE database_architect, INCLUDE backend_engineer
 
 AVAILABLE AGENT ROLES: {', '.join([r.value for r in AgentRole])}
 
@@ -1043,6 +1190,7 @@ USER CONTEXT:
         try:
             if final_content:
                 updated_data = json.loads(final_content)
+                updated_data = _sanitize_ledger_agents(updated_data, ledger.data.get("user_intent", ""))
                 ledger_data = updated_data
                 
                 # Check for follow-up questions in the parsed JSON

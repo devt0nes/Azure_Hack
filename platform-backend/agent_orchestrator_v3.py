@@ -199,7 +199,7 @@ class LayerBlackboard:
     
     def _write_file(self):
         """Write messages to file"""
-        with open(self.path, 'w') as f:
+        with open(self.path, 'w', encoding='utf-8', newline='\n') as f:
             f.write(f"# Layer {self.layer_number} Coordination Blackboard\n\n")
             f.write(f"Last Updated: {datetime.now().isoformat()}\n\n")
             for msg in self.messages:
@@ -248,9 +248,9 @@ class LayerBlackboard:
             return len(self.messages)
 
     def peer_message_count(self, agent_name: str) -> int:
-      """Return number of messages written by peers (not this agent)."""
-      with self._lock:
-        return len([m for m in self.messages if m.get("agent") != agent_name])
+        """Return number of messages written by peers (not this agent)."""
+        with self._lock:
+            return len([m for m in self.messages if m.get("agent") != agent_name])
 
 
 class StructuredBlackboard:
@@ -271,7 +271,7 @@ class StructuredBlackboard:
     
     def _write_file(self):
         """Write sections to file"""
-        with open(self.path, 'w') as f:
+        with open(self.path, 'w', encoding='utf-8', newline='\n') as f:
             f.write("# Team Blackboard\n\n")
             f.write(f"Last Updated: {datetime.now().isoformat()}\n\n")
             f.write("---\n\n")
@@ -349,6 +349,15 @@ class DatabaseArchitectAgent(GeneralAgent):
 ═══════════════════════════════════════════════════════════════════════════════
 DATABASE ARCHITECT WORKFLOW - GENERIC SCHEMA DESIGN
 ═══════════════════════════════════════════════════════════════════════════════
+
+⚠️  MANDATORY FILES - YOU MUST WRITE ALL OF THESE OR VERIFICATION WILL FAIL:
+  • migrations/schema.sql    ← write_file("migrations/schema.sql", content=<full DDL>)
+  • migrations/seed_data.sql ← write_file("migrations/seed_data.sql", content=<INSERT rows>)
+  • config/db_config.js
+  • config/db_setup.js
+  • README.md
+
+DO NOT emit [READY_FOR_VERIFICATION] until ALL five files above have been written via write_file().
 
 SYSTEM ARCHITECT COMPLIANCE (MANDATORY):
   ✅ Read contracts/backend_api_contract.json and contracts/directory_structure.json first
@@ -1655,13 +1664,39 @@ Assigned issues JSON:
 
       return normalized
 
+    _SCAFFOLD_STUBS = {
+      ".sql":  "-- scaffold placeholder: replace with real SQL\n",
+      ".md":   "# Scaffold placeholder\n",
+      ".js":   "// scaffold placeholder\n",
+      ".ts":   "// scaffold placeholder\n",
+      ".py":   "# scaffold placeholder\n",
+      ".json": "{}\n",
+    }
+
     def _touch_file_if_missing(self, abs_path: str) -> None:
       os.makedirs(os.path.dirname(abs_path), exist_ok=True)
       if not os.path.exists(abs_path):
+        ext = os.path.splitext(abs_path)[1].lower()
+        stub = self._SCAFFOLD_STUBS.get(ext, "")
         with open(abs_path, "w", encoding="utf-8") as f:
-          f.write("")
+          f.write(stub)
 
-    def _materialize_structure_node(self, base_abs: str, node) -> int:
+    def _normalize_contract_rel_for_base(self, base_rel: str, rel_path: str) -> str:
+      """Normalize a declared contract path for a given section base.
+
+      Accepts both section-relative paths (e.g., migrations/schema.sql)
+      and section-prefixed paths (e.g., database/migrations/schema.sql)
+      when base_rel is "database".
+      """
+      base_norm = (base_rel or "").replace("\\", "/").strip("/")
+      rel_norm = (rel_path or "").replace("\\", "/").strip("/")
+      if not rel_norm:
+        return ""
+      if base_norm and (rel_norm == base_norm or rel_norm.startswith(base_norm + "/")):
+        return rel_norm[len(base_norm):].lstrip("/")
+      return rel_norm
+
+    def _materialize_structure_node(self, base_abs: str, node, base_rel: str = "") -> int:
       """Materialize a directory-structure node from System Architect contract."""
       created = 0
       if isinstance(node, dict):
@@ -1669,6 +1704,9 @@ Assigned issues JSON:
           if not isinstance(key, str) or not key.strip():
             continue
           key_norm = key.strip().replace("\\", "/").strip("/")
+          key_norm = self._normalize_contract_rel_for_base(base_rel, key_norm)
+          if not key_norm:
+            continue
           target_abs = os.path.join(base_abs, key_norm)
           basename = os.path.basename(key_norm)
           key_is_file = "." in basename and not key_norm.endswith("/")
@@ -1680,7 +1718,8 @@ Assigned issues JSON:
 
           child_base = target_abs
           os.makedirs(child_base, exist_ok=True)
-          created += self._materialize_structure_node(child_base, value)
+          child_rel = f"{base_rel}/{key_norm}".strip("/") if base_rel else key_norm
+          created += self._materialize_structure_node(child_base, value, child_rel)
         return created
 
       if isinstance(node, list):
@@ -1688,6 +1727,9 @@ Assigned issues JSON:
           if not isinstance(item, str) or not item.strip():
             continue
           rel = item.strip().replace("\\", "/").strip("/")
+          rel = self._normalize_contract_rel_for_base(base_rel, rel)
+          if not rel:
+            continue
           target_abs = os.path.join(base_abs, rel)
           basename = os.path.basename(rel)
           is_file = "." in basename and not rel.endswith("/")
@@ -1714,7 +1756,7 @@ Assigned issues JSON:
           continue
         top_abs = os.path.join(WORKSPACE_DIR, top_key.strip())
         os.makedirs(top_abs, exist_ok=True)
-        total_created += self._materialize_structure_node(top_abs, node)
+        total_created += self._materialize_structure_node(top_abs, node, top_key.strip())
 
       return {"ok": True, "created_files": total_created}
 
@@ -1740,7 +1782,7 @@ Assigned issues JSON:
       node = structure.get(section, {})
       root_abs = os.path.join(WORKSPACE_DIR, section)
       os.makedirs(root_abs, exist_ok=True)
-      self._materialize_structure_node(root_abs, node)
+      self._materialize_structure_node(root_abs, node, section)
 
     def _flatten_structure_files(self, node, base_rel: str = "") -> set:
       """Return declared file paths from directory_structure contract node."""
@@ -1750,6 +1792,9 @@ Assigned issues JSON:
           if not isinstance(key, str) or not key.strip():
             continue
           key_norm = key.strip().replace("\\", "/").strip("/")
+          key_norm = self._normalize_contract_rel_for_base(base_rel, key_norm)
+          if not key_norm:
+            continue
           child_rel = f"{base_rel}/{key_norm}".strip("/") if base_rel else key_norm
           basename = os.path.basename(key_norm)
           key_is_file = "." in basename and not key_norm.endswith("/")
@@ -1762,6 +1807,9 @@ Assigned issues JSON:
           if not isinstance(item, str) or not item.strip():
             continue
           rel = item.strip().replace("\\", "/").strip("/")
+          rel = self._normalize_contract_rel_for_base(base_rel, rel)
+          if not rel:
+            continue
           basename = os.path.basename(rel)
           is_file = "." in basename and not rel.endswith("/")
           if is_file:
@@ -1798,6 +1846,24 @@ Assigned issues JSON:
       findings = []
       if missing_files:
         findings.append("missing directory-contract files: " + ", ".join(missing_files[:25]))
+
+      # Extra guard: required database migration files must have real content, not just scaffold stubs.
+      CONTENT_REQUIRED = {
+        "database/migrations/schema.sql",
+        "database/migrations/seed_data.sql",
+      }
+      for req_path in CONTENT_REQUIRED & declared:
+        abs_req = os.path.join(WORKSPACE_DIR, req_path)
+        if os.path.exists(abs_req):
+          try:
+            with open(abs_req, "r", encoding="utf-8", errors="ignore") as _f:
+              _content = _f.read().strip()
+            if not _content or _content.startswith("-- scaffold placeholder"):
+              findings.append(
+                f"file exists but contains only scaffold stub (database_architect must write real SQL): {req_path}"
+              )
+          except Exception:
+            pass
 
       return {"ok": len(findings) == 0, "missing": findings}
 
@@ -2046,13 +2112,32 @@ Assigned issues JSON:
       """Hard gate for contract-first orchestration and upstream dependencies."""
       role_norm = (role or "").strip().lower().replace(" ", "_")
       required = self._required_upstream_roles(role_norm)
+
+      # Only enforce prerequisites for roles that are actually in the plan.
+      # If backend_engineer was intentionally excluded (e.g. pure frontend project),
+      # it should not block frontend_engineer from starting.
+      planned_roles = set()
+      try:
+        spec = (self.ledger or {}).get("agent_specifications", {}) if isinstance(self.ledger, dict) else {}
+        raw_agents = spec.get("required_agents", []) or []
+        for a in raw_agents:
+          if isinstance(a, str):
+            planned_roles.add(a.strip().lower().replace(" ", "_"))
+          elif isinstance(a, dict):
+            r = a.get("role") or a.get("agent_name") or ""
+            planned_roles.add(r.strip().lower().replace(" ", "_"))
+      except Exception:
+        pass  # If we can't read the ledger, fall through to normal enforcement
+
       coexecuting_roles = {
         str(r or "").strip().lower().replace(" ", "_")
         for r in (current_layer_roles or [])
       }
       missing_upstream = [
         r for r in required
-        if r not in self.completed_workspaces and r not in coexecuting_roles
+        if r not in self.completed_workspaces
+        and r not in coexecuting_roles
+        and (not planned_roles or r in planned_roles)  # skip if not in plan
       ]
       if missing_upstream:
         raise RuntimeError(
@@ -2125,7 +2210,7 @@ Assigned issues JSON:
                     if filename.endswith(".pyc"):
                         continue
                     filepath = os.path.join(root, filename)
-                    relpath = os.path.relpath(filepath, workspace)
+                    relpath = os.path.relpath(filepath, workspace).replace("\\", "/")
                     files.append(relpath)
         return files
 
@@ -3431,6 +3516,12 @@ Assigned issues JSON:
           f"{base}/requirements.txt",
           f"{base}/pyproject.toml",
         })
+        # Always permit the required database migration files so retries can write real content.
+        if base == "database":
+          allowed_new.update({
+            f"{base}/migrations/schema.sql",
+            f"{base}/migrations/seed_data.sql",
+          })
 
       tr.retry_allowed_new_paths = allowed_new
       tr.max_writes_per_file = min(int(getattr(tr, "max_writes_per_file", 6) or 6), 2)

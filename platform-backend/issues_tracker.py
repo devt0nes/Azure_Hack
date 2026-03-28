@@ -58,8 +58,8 @@ class IssuesTracker:
         """Create issues file if it doesn't exist"""
         os.makedirs(os.path.dirname(self.file_path) or ".", exist_ok=True)
         if not os.path.exists(self.file_path):
-            with open(self.file_path, "w") as f:
-                json.dump({"issues": [], "resolved": []}, f, indent=2)
+            with open(self.file_path, "w", encoding="utf-8") as f:
+                json.dump({"issues": [], "resolved": []}, f, indent=2, ensure_ascii=False)
     
     def report_issue(self, 
                      component: str, 
@@ -85,7 +85,7 @@ class IssuesTracker:
             Issue object with ID and timestamp
         """
         with self.lock:
-            with open(self.file_path, "r") as f:
+            with open(self.file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             
             issue_id = len(data["issues"]) + len(data["resolved"]) + 1
@@ -107,8 +107,8 @@ class IssuesTracker:
             
             data["issues"].append(issue)
             
-            with open(self.file_path, "w") as f:
-                json.dump(data, f, indent=2)
+            with open(self.file_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
             
             return issue
     
@@ -126,7 +126,7 @@ class IssuesTracker:
             List of open issues
         """
         with self.lock:
-            with open(self.file_path, "r") as f:
+            with open(self.file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         
         issues = data.get("issues", [])
@@ -143,7 +143,7 @@ class IssuesTracker:
     def get_blocking_issues(self, agent_role: str) -> List[Dict]:
         """Get issues that are blocking a specific agent"""
         with self.lock:
-            with open(self.file_path, "r") as f:
+            with open(self.file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         
         # Issues reported BY this agent are blocking them until resolved
@@ -162,7 +162,7 @@ class IssuesTracker:
             Resolved issue object
         """
         with self.lock:
-            with open(self.file_path, "r") as f:
+            with open(self.file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             
             # Find and mark as resolved
@@ -177,16 +177,16 @@ class IssuesTracker:
                     data["issues"].remove(i)
                     break
             
-            with open(self.file_path, "w") as f:
-                json.dump(data, f, indent=2)
+            with open(self.file_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
             
             return issue
     
     def clear(self):
         """Clear all issues"""
         with self.lock:
-            with open(self.file_path, "w") as f:
-                json.dump({"issues": [], "resolved": []}, f, indent=2)
+            with open(self.file_path, "w", encoding="utf-8") as f:
+                json.dump({"issues": [], "resolved": []}, f, indent=2, ensure_ascii=False)
     
     def print_issues(self):
         """Print all open issues"""
