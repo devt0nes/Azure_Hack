@@ -1012,6 +1012,51 @@ async def _invoke_real_orchestrator(project_id: str, project_data: Dict[str, Any
 
         normalize_layers_common_sense(ledger.data)
         _remove_disabled_roles_from_ledger(ledger.data)
+
+        # Auto-inject chatbot_engineer when project intent/description mentions LLM/chat features
+        _chatbot_keywords = [
+            "chatbot", "llm", "ai assistant", "ai chat", "conversational",
+            "openai", "chat feature", "chat api", "language model", "gpt",
+        ]
+        _intent_text = " ".join([
+            str(ledger.data.get("user_intent", "")),
+            str(ledger.data.get("project_description", "")),
+            str(ledger.data.get("project_name", "")),
+        ]).lower()
+        _cb_spec = ledger.data.get("agent_specifications") or {}
+        _cb_roles = {
+            (a.get("role") if isinstance(a, dict) else a)
+            for a in (_cb_spec.get("required_agents") or [])
+        }
+        if any(kw in _intent_text for kw in _chatbot_keywords) and "chatbot_engineer" not in _cb_roles:
+            _cb_agent = {
+                "role": "chatbot_engineer",
+                "description": (
+                    "Integrate an LLM-powered chatbot API into the backend. "
+                    "Retrieve the FastAPI chatbot template, write backend/chatbot_api.py, "
+                    "and wire the router into the app entry-point."
+                ),
+                "instructions": "",
+            }
+            if not isinstance(_cb_spec.get("required_agents"), list):
+                _cb_spec["required_agents"] = []
+            _cb_spec["required_agents"].append(_cb_agent)
+            _cb_layers = _cb_spec.get("layers") or []
+            _cb_inserted = False
+            for _ci, _cl in enumerate(_cb_layers):
+                if isinstance(_cl, list) and any(
+                    (r.get("role") if isinstance(r, dict) else r) == "backend_engineer"
+                    for r in _cl
+                ):
+                    _cb_layers.insert(_ci + 1, ["chatbot_engineer"])
+                    _cb_inserted = True
+                    break
+            if not _cb_inserted:
+                _cb_layers.append(["chatbot_engineer"])
+            _cb_spec["layers"] = _cb_layers
+            ledger.data["agent_specifications"] = _cb_spec
+            logger.info("Auto-injected chatbot_engineer (LLM/chat intent detected) for %s", project_id)
+
         if not isinstance(ledger.data.get("workspace_layout"), dict):
             ledger.data["workspace_layout"] = default_workspace_layout()
         _ensure_minimum_agent_spec(ledger.data)

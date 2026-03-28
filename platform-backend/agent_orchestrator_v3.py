@@ -770,6 +770,75 @@ INSTEAD: "Audit completed with findings; issues dispatched to owners"
         self.workspace = allowed_root
 
 
+class ChatbotEngineerAgent(GeneralAgent):
+    """Specialist agent that implements the chatbot/LLM backend feature.
+
+    Responsibilities:
+    - Retrieve the FastAPI chatbot router template from ChatbotTemplates container
+    - Write it to backend/chatbot_api.py
+    - Wire the router into the existing backend entry-point (app.py / main.py)
+    - Create a minimal README for the chatbot endpoint
+    """
+
+    def __init__(self, allowed_root: str):
+        super().__init__(
+            role="chatbot_engineer",
+            instructions="""
+You are the Chatbot Engineer.  Your single job is to integrate an LLM-powered
+chat API into the project's backend.
+
+═══════════════════════════════════════════════════════════════════════════════
+MANDATORY EXECUTION ORDER
+═══════════════════════════════════════════════════════════════════════════════
+
+STEP 1 – DISCOVER AVAILABLE TEMPLATE
+  Call: search_chatbot_template(query="chatbot fastapi llm")
+  → Identify the template ID (expect "chatbot-backend-v1")
+
+STEP 2 – APPLY TEMPLATE
+  Call: use_chatbot_template(template_id="chatbot-backend-v1",
+                             target_path="backend/chatbot_api.py",
+                             line_number=1)
+  → This writes the FastAPI router to backend/chatbot_api.py
+
+STEP 3 – WIRE INTO APP ENTRY POINT
+  Read backend/app.py (or backend/main.py or backend/server.js if Node).
+  Add:
+      from chatbot_api import router as chatbot_router
+      app.include_router(chatbot_router, prefix="/api")
+  If the entry-point does not exist yet, create a minimal FastAPI app.py that
+  imports and mounts the chatbot router.
+
+STEP 4 – DOCUMENT
+  Write backend/README_chatbot.md with:
+  - POST /api/chat           → single-turn chat
+  - GET  /api/chat/stream    → streaming SSE response
+  - Required env var: AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY
+
+═══════════════════════════════════════════════════════════════════════════════
+OUTPUT CONTRACT
+═══════════════════════════════════════════════════════════════════════════════
+
+backend/
+  ├─ chatbot_api.py          (FastAPI router, from template)
+  ├─ app.py                  (updated/created entry-point with router mounted)
+  └─ README_chatbot.md       (endpoint documentation)
+
+═══════════════════════════════════════════════════════════════════════════════
+CONSTRAINTS
+═══════════════════════════════════════════════════════════════════════════════
+
+- Write ONLY inside backend/
+- Do NOT touch frontend/, database/, or contracts/ files
+- All code must be production-quality Python (no placeholder comments)
+- Use environment variables for all secrets (never hardcode keys)
+""",
+            allowed_root=allowed_root,
+            timeout=180,
+        )
+        self.workspace = allowed_root
+
+
 class EnhancedAgentOrchestrator:
     """Orchestrates agents using GeneralAgent framework with cross-layer visibility"""
     
@@ -818,6 +887,13 @@ class EnhancedAgentOrchestrator:
             "min_files": 1,
             "required_any": [
               ["backend"]
+            ],
+            "manifest_any": []
+          },
+          "chatbot_engineer": {
+            "min_files": 1,
+            "required_any": [
+              ["backend/chatbot_api.py"]
             ],
             "manifest_any": []
           },
@@ -1898,6 +1974,7 @@ class EnhancedAgentOrchestrator:
         ["system_architect"],
         ["database_architect"],
         ["backend_engineer", "frontend_engineer"],
+        ["chatbot_engineer"],
         ["qa_engineer"],
       ]
 
@@ -1972,6 +2049,7 @@ class EnhancedAgentOrchestrator:
       role_key = (role or "").strip().lower().replace(" ", "_")
       canonical_root_by_role = {
         "backend_engineer": "backend",
+        "chatbot_engineer": "backend",
         "frontend_engineer": "frontend",
         "database_architect": "database",
         "qa_engineer": "qa",
@@ -2060,6 +2138,7 @@ class EnhancedAgentOrchestrator:
         mapping = {
       "database_architect": ["system_architect"],
         "backend_engineer": ["database_architect", "system_architect"],
+        "chatbot_engineer": ["backend_engineer", "system_architect"],
         "frontend_engineer": ["system_architect", "backend_engineer"],
             "qa_engineer": ["database_architect", "backend_engineer", "frontend_engineer"],
         }
@@ -3818,6 +3897,8 @@ class EnhancedAgentOrchestrator:
         # NOTE: Pass WORKSPACE_DIR only - agents create their own role-specific subdirs
         if "backend" in role.lower():
           agent = NodeExpressBackendEngineerAgent(allowed_root=workspace)
+        elif role.lower() == "chatbot_engineer":
+          agent = ChatbotEngineerAgent(allowed_root=workspace)
         elif "frontend" in role.lower():
           agent = ReactFrontendEngineerAgent(allowed_root=workspace)
         elif "database" in role.lower():
@@ -3844,13 +3925,13 @@ class EnhancedAgentOrchestrator:
           agent.tools_registry.parallel_peers = list(parallel_agents)
           agent.tools_registry.service_bus = self.service_bus
           agent.tools_registry.write_scope = "workspace"
-          if role_key in {"backend_engineer", "frontend_engineer", "database_architect"}:
+          if role_key in {"backend_engineer", "chatbot_engineer", "frontend_engineer", "database_architect"}:
             owned_root = output_roots[0] if output_roots else role_key
             agent.tools_registry.preferred_output_roots = [owned_root]
             agent.tools_registry.primary_output_root = owned_root
             agent.tools_registry.shared_write_roots = []
             agent.tools_registry.edit_only_mode = False
-            agent.tools_registry.allow_delete_operations = role_key in {"backend_engineer", "frontend_engineer"}
+            agent.tools_registry.allow_delete_operations = role_key in {"backend_engineer", "chatbot_engineer", "frontend_engineer"}
           else:
             agent.tools_registry.preferred_output_roots = list(output_roots)
             agent.tools_registry.primary_output_root = output_roots[0] if output_roots else ""
