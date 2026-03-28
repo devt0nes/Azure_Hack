@@ -27,14 +27,6 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from blob_workspace import build_blob_workspace_from_env
-from cosmos_client import (
-    get_cosmos_client,
-    get_starter_template,
-    init_cosmos_db,
-    resolve_starter_template_for_stack,
-    seed_default_templates,
-    seed_starter_templates,
-)
 
 
 load_dotenv()
@@ -133,7 +125,6 @@ class HealthResponse(BaseModel):
     status: str
     timestamp: str
     version: str
-    cosmos: Optional[Dict[str, Any]] = None
 
 
 class ClarifyRequest(BaseModel):
@@ -158,13 +149,6 @@ class AgentSelectionRequest(BaseModel):
     agent_id: str
     project_id: Optional[str] = None
 
-class CreateAgentRequest(BaseModel):
-    role: str                          # human name, will be slugified to id
-    description: str
-    tier: int = 2                       # 1 = Core (GPT-4o), 2 = Specialist (GPT-4o-mini)
-    model_label: Optional[str] = None  # auto-derived from tier if omitted
-    tags: List[str] = []
-    system_prompt: Optional[str] = None  # full system prompt / instructions for the agent
 
 class BudgetRequest(BaseModel):
     budget_usd: float
@@ -173,6 +157,7 @@ class BudgetRequest(BaseModel):
 class ClarifyAnswersRequest(BaseModel):
     project_id: str
     answers: Dict[str, str]
+
 
 class QuestionRequest(BaseModel):
     project_id: str
@@ -232,7 +217,7 @@ class ProjectStore:
             "clarification_questions": [],
             "clarification_answers": {},
             "clarification_state": "none",
-            "question_count": 0
+            "question_count": 0,
         }
         self.projects[project_id] = payload
         self._save()
@@ -262,286 +247,49 @@ try:
 except Exception as exc:
     logger.warning("Blob workspace disabled: %s", exc)
 
-# ─── Azure Storage Configuration ─────────────────────────────────────────────
-_ENABLE_LOCAL_FILE_GENERATION = str(os.getenv("ENABLE_LOCAL_FILE_GENERATION", "false")).strip().lower() in {"1", "true", "yes", "on"}
-_AZURE_STORAGE_CONN_STR = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
-_AZURE_STORAGE_CONTAINER = os.getenv("AZURE_STORAGE_CONTAINER", "project-workspace")
+SELECTED_AGENTS_BY_PROJECT: Dict[str, Dict[str, Dict[str, Any]]] = {}
+_BLOB_SYNC_LAST_DOWNLOAD_TS: Dict[str, float] = {}
 _BLOB_SYNC_MIN_INTERVAL_SECONDS = int(os.getenv("BLOB_SYNC_MIN_INTERVAL_SECONDS", "20"))
 _BLOB_SYNC_VERBOSE_DOWNLOAD_LOGS = str(os.getenv("BLOB_SYNC_VERBOSE_DOWNLOAD_LOGS", "false")).strip().lower() in {"1", "true", "yes", "on"}
 
-_azure_blob_client = None
-
-
-def _get_azure_blob_container_client():
-    """Get Azure Blob Storage container client for project files.
-    
-    Returns None if not configured. Lazy initialization on first use.
-    """
-    global _azure_blob_client
-    if _azure_blob_client is not None:
-        return _azure_blob_client
-    
-    if not _AZURE_STORAGE_CONN_STR:
-        logger.debug("Azure Storage not configured")
-        return None
-    
-    try:
-        from azure.storage.blob import BlobServiceClient
-        service_client = BlobServiceClient.from_connection_string(_AZURE_STORAGE_CONN_STR)
-        _azure_blob_client = service_client.get_container_client(_AZURE_STORAGE_CONTAINER)
-        try:
-            _azure_blob_client.create_container()
-        except Exception:
-            # Container already exists
-            pass
-        return _azure_blob_client
-    except Exception as exc:
-        logger.error("Failed to initialize Azure Blob Storage: %s", exc)
-        return None
-
-
-async def _upload_file_to_azure(project_id: str, local_file_path: Path) -> bool:
-    """Upload a single file to Azure Storage.
-    
-    Returns True if successful, False otherwise.
-    """
-    if _ENABLE_LOCAL_FILE_GENERATION:
-        # Local file generation is enabled, no need to upload
-        return True
-    
-    container = _get_azure_blob_container_client()
-    if not container:
-        logger.warning("Azure Storage not available, file %s not uploaded", local_file_path)
-        return False
-    
-    try:
-        local_file = Path(local_file_path)
-        if not local_file.exists():
-            logger.warning("Local file does not exist: %s", local_file_path)
-            return False
-        
-        # Construct blob name as project_id/relative_path
-        rel_path = local_file.relative_to(_project_generated_dir(project_id)).as_posix()
-        blob_name = f"{project_id}/{rel_path}"
-        
-        # Upload to Azure asynchronously
-        loop = asyncio.get_event_loop()
-        with open(local_file, "rb") as data:
-            await loop.run_in_executor(
-                None,
-                lambda: container.upload_blob(blob_name, data, overwrite=True)
-            )
-        
-        logger.debug("Uploaded file to Azure: %s", blob_name)
-        return True
-    except Exception as exc:
-        logger.error("Failed to upload file %s to Azure: %s", local_file_path, exc)
-        return False
-
-
-async def _upload_project_to_azure(project_id: str) -> int:
-    """Upload all project files to Azure Storage.
-    
-    Returns the count of files uploaded.
-    """
-    if _ENABLE_LOCAL_FILE_GENERATION:
-        # Local file generation is enabled, no need to upload
-        return 0
-    
-    container = _get_azure_blob_container_client()
-    if not container:
-        logger.warning("Azure Storage not available, project %s not uploaded", project_id)
-        return 0
-    
-    try:
-        project_root = _project_generated_dir(project_id)
-        if not project_root.exists():
-            logger.warning("Project directory does not exist: %s", project_root)
-            return 0
-        
-        count = 0
-        for root, _, files in os.walk(project_root):
-            for name in files:
-                full_path = Path(root) / name
-                rel_path = full_path.relative_to(project_root).as_posix()
-                blob_name = f"{project_id}/{rel_path}"
-                
-                try:
-                    with open(full_path, "rb") as data:
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(
-                            None,
-                            lambda f=data, bn=blob_name: container.upload_blob(bn, f, overwrite=True)
-                        )
-                    count += 1
-                except Exception as exc:
-                    logger.warning("Failed to upload %s: %s", full_path, exc)
-                    continue
-        
-        logger.info("Uploaded %d files for project %s to Azure Storage", count, project_id)
-        return count
-    except Exception as exc:
-        logger.error("Failed to upload project %s to Azure: %s", project_id, exc)
-        return 0
-
-
-SELECTED_AGENTS_BY_PROJECT: Dict[str, Dict[str, Dict[str, Any]]] = {}
-_BLOB_SYNC_LAST_DOWNLOAD_TS: Dict[str, float] = {}
-
 AGENT_CATALOG: List[Dict[str, Any]] = [
-    # ── Tier 1 — Module Agents (GPT-4o, core execution) ──────────────────────
     {
         "id": "backend_engineer",
         "role": "backend_engineer",
         "tier": 1,
         "model_label": "GPT-4o",
-        "description": "Builds backend APIs, microservices, and orchestration logic on Azure.",
+        "description": "Builds backend APIs and orchestration logic.",
         "reputation_score": 0.93,
-        "tags": ["backend", "api", "python", "azure"],
+        "tags": ["backend", "api", "python"],
     },
     {
         "id": "frontend_engineer",
         "role": "frontend_engineer",
         "tier": 1,
         "model_label": "GPT-4o",
-        "description": "Builds React UIs and integrates frontend with backend APIs.",
+        "description": "Builds React UI and frontend integrations.",
         "reputation_score": 0.91,
-        "tags": ["frontend", "react", "ui", "tailwind"],
+        "tags": ["frontend", "react", "ui"],
     },
     {
         "id": "database_architect",
         "role": "database_architect",
-        "tier": 1,
-        "model_label": "GPT-4o",
-        "description": "Designs SQL/NoSQL schemas, indexing strategies, and data pipelines.",
+        "tier": 2,
+        "model_label": "GPT-4o-mini",
+        "description": "Designs schema and data layer conventions.",
         "reputation_score": 0.88,
-        "tags": ["database", "sql", "cosmos", "schema"],
-    },
-    # ── Tier 2 — Specialist Agents (all others, GPT-4o-mini) ─────────────────
-    {
-        "id": "solution_architect",
-        "role": "solution_architect",
-        "tier": 2,
-        "model_label": "GPT-4o-mini",
-        "description": "Designs overall system architecture, selects tech stack, and coordinates agents.",
-        "reputation_score": 0.95,
-        "tags": ["architecture", "azure", "design", "microservices"],
-    },
-    {
-        "id": "api_designer",
-        "role": "api_designer",
-        "tier": 2,
-        "model_label": "GPT-4o-mini",
-        "description": "Designs OpenAPI contracts, versioning strategy, and SDK interfaces.",
-        "reputation_score": 0.86,
-        "tags": ["api", "openapi", "design", "rest"],
-    },
-    {
-        "id": "security_engineer",
-        "role": "security_engineer",
-        "tier": 2,
-        "model_label": "GPT-4o-mini",
-        "description": "Hardens systems against OWASP Top-10, manages secrets, and enforces compliance.",
-        "reputation_score": 0.90,
-        "tags": ["security", "compliance", "azure", "owasp"],
-    },
-    {
-        "id": "devops_engineer",
-        "role": "devops_engineer",
-        "tier": 2,
-        "model_label": "GPT-4o-mini",
-        "description": "Builds CI/CD pipelines, IaC templates, and Azure deployment automation.",
-        "reputation_score": 0.87,
-        "tags": ["devops", "cicd", "azure", "iac"],
+        "tags": ["database", "sql", "schema"],
     },
     {
         "id": "qa_engineer",
         "role": "qa_engineer",
         "tier": 2,
         "model_label": "GPT-4o-mini",
-        "description": "Writes test suites, runs load tests, and enforces coverage targets.",
+        "description": "Creates tests and quality checks.",
         "reputation_score": 0.89,
-        "tags": ["qa", "testing", "automation"],
+        "tags": ["qa", "testing"],
     },
 ]
-
-# ─── Cosmos DB – AgentLibrary ────────────────────────────────────────────────
-# Reads agents from the AgentRegistry container in the agentic-nexus-db database.
-# Falls back to AGENT_CATALOG above if the DB is unreachable or the container is empty.
-_COSMOS_DB_NAME          = os.getenv("COSMOS_DB_NAME",           "agentic-nexus-db")
-_AGENT_REGISTRY_CONTAINER = os.getenv("AGENT_CONTAINER",         "AgentRegistry")
-_COSMOS_CONN_STR         = os.getenv("COSMOS_CONNECTION_STR",    "")
-_AGENT_CACHE_TTL         = int(os.getenv("AGENT_CACHE_TTL_SECONDS", "300"))
-
-_agent_catalog_cache: Optional[List[Dict[str, Any]]] = None
-_agent_cache_ts: float = 0.0
-_agent_cache_source: str = "local"
-
-
-def _get_agent_library_cosmos_container():
-    """Return a Cosmos DB ContainerClient for AgentRegistry, or raise."""
-    from azure.cosmos import CosmosClient  # lazy import – already in requirements
-    if not _COSMOS_CONN_STR:
-        raise RuntimeError("COSMOS_CONNECTION_STR is not set")
-    client = CosmosClient.from_connection_string(_COSMOS_CONN_STR)
-    db = client.get_database_client(_COSMOS_DB_NAME)
-    return db.get_container_client(_AGENT_REGISTRY_CONTAINER)
-
-
-def _query_cosmos_agents() -> List[Dict[str, Any]]:
-    """Blocking helper; call via run_in_executor.
-    Uses read_all_items() to enumerate documents without any SQL query,
-    bypassing the SDK's internal query rewriter that generates the
-    SC2001 'Identifier c could not be resolved' error.
-    """
-    container = _get_agent_library_cosmos_container()
-    items = list(container.read_all_items())
-    for item in items:
-        # Cosmos uses 'id' as partition key, so this should exist,
-        # but ensure the frontend field is consistent
-        if "id" not in item and "agent_id" in item:
-            item["id"] = item["agent_id"]
-        # Strip Cosmos system properties to keep payload clean
-        for key in ["_rid", "_self", "_etag", "_attachments", "_ts"]:
-            item.pop(key, None)
-    return items
-
-
-async def _get_agent_catalog() -> List[Dict[str, Any]]:
-    """Return agents from Cosmos DB AgentLibrary with a timed in-memory cache.
-
-    Falls back to the hardcoded AGENT_CATALOG if Cosmos DB is unreachable or
-    returns no documents.
-    """
-    global _agent_catalog_cache, _agent_cache_ts, _agent_cache_source
-    now = time.monotonic()
-    if _agent_catalog_cache is not None and (now - _agent_cache_ts) < _AGENT_CACHE_TTL:
-        return _agent_catalog_cache
-
-    try:
-        loop = asyncio.get_event_loop()
-        agents = await loop.run_in_executor(None, _query_cosmos_agents)
-        if agents:
-            _agent_catalog_cache = agents
-            _agent_cache_ts = now
-            _agent_cache_source = "cosmos"
-            return agents
-        logger.warning("AgentLibrary: Cosmos DB container returned 0 documents; using local fallback.")
-    except Exception as exc:
-        logger.warning("AgentLibrary: Cosmos DB unavailable (%s); using local fallback.", exc)
-
-    _agent_cache_source = "local"
-    return AGENT_CATALOG
-
-COSMOS_STARTUP_STATUS: Dict[str, Any] = {
-    "enabled": False,
-    "required": False,
-    "initialized": False,
-    "containers": [],
-    "template_seed": None,
-    "starter_template_seed": None,
-    "error": None,
-}
 
 _ORCHESTRATOR_MODULE = None
 DISABLED_AGENT_ROLES = {"security_engineer"}
@@ -628,69 +376,6 @@ def _discover_frontend_preview_entry(project_id: str) -> Optional[str]:
         return None
     _base, rel = target
     return rel
-
-
-def _inject_preview_console_bridge(html: str, project_id: str) -> str:
-        """Inject script that forwards generated-frontend console output to preview parent window."""
-        if not isinstance(html, str) or not html:
-                return html
-
-        marker = "data-nexus-preview-bridge=\"1\""
-        if marker in html:
-                return html
-
-        bridge = f"""
-<script {marker}>
-(function() {{
-    if (window.__NEXUS_PREVIEW_BRIDGE__) return;
-    window.__NEXUS_PREVIEW_BRIDGE__ = true;
-
-    var PROJECT_ID = {json.dumps(project_id)};
-    function send(level, msg) {{
-        try {{
-            var text = (typeof msg === 'string') ? msg : (msg && msg.message ? String(msg.message) : String(msg));
-            window.parent && window.parent.postMessage({{
-                type: 'nexus_generated_frontend_output',
-                project_id: PROJECT_ID,
-                level: String(level || 'log'),
-                message: text,
-                ts: Date.now()
-            }}, '*');
-        }} catch (_e) {{}}
-    }}
-
-    ['log', 'info', 'warn', 'error', 'debug'].forEach(function(level) {{
-        var orig = console[level];
-        console[level] = function() {{
-            try {{
-                var args = Array.prototype.slice.call(arguments || []);
-                var msg = args.map(function(a) {{
-                    if (typeof a === 'string') return a;
-                    try {{ return JSON.stringify(a); }} catch (_err) {{ return String(a); }}
-                }}).join(' ');
-                send(level, msg);
-            }} catch (_err) {{}}
-            if (typeof orig === 'function') return orig.apply(console, arguments);
-        }};
-    }});
-
-    window.addEventListener('error', function(evt) {{
-        var msg = (evt && (evt.message || (evt.error && evt.error.message))) || 'window error';
-        send('error', msg);
-    }});
-
-    window.addEventListener('unhandledrejection', function(evt) {{
-        var reason = evt && evt.reason;
-        var msg = (reason && reason.message) ? reason.message : String(reason || 'unhandled rejection');
-        send('error', msg);
-    }});
-}})();
-</script>
-"""
-
-        if "</body>" in html:
-                return html.replace("</body>", bridge + "</body>")
-        return html + bridge
 
 
 def _append_project_log(project_id: str, event: str, **data: Any) -> None:
@@ -812,9 +497,6 @@ def _snapshot_generated_output_for_project(project_id: str) -> None:
         elif child.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(child, target)
-    
-    # Upload snapshotted files to Azure Storage
-    asyncio.create_task(_upload_project_to_azure(project_id))
 
 
 def _deep_merge_dict(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
@@ -1352,6 +1034,7 @@ async def _simulate_deployment(project_id: str, request: DeploymentRequest) -> N
         store.update(project_id, status=ProjectStatus.COMPLETED, error=str(exc))
         _append_project_log(project_id, "deployment_failed_exception", error=str(exc))
 
+
 def _read_project_specs_file(project_id: str) -> Optional[str]:
     """Read the project specifications file if it exists."""
     try:
@@ -1365,6 +1048,7 @@ def _read_project_specs_file(project_id: str) -> Optional[str]:
     except Exception as exc:
         logger.warning("Could not read project specs file for %s: %s", project_id, exc)
     return None
+
 
 def _check_input_safety(text: str) -> Dict[str, Any]:
     lowered = (text or "").lower()
@@ -1389,91 +1073,11 @@ def _check_input_safety(text: str) -> Dict[str, Any]:
 
 @app.get("/api/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
-    cosmos_payload = {
-        "enabled": COSMOS_STARTUP_STATUS.get("enabled", False),
-        "required": COSMOS_STARTUP_STATUS.get("required", False),
-        "initialized": COSMOS_STARTUP_STATUS.get("initialized", False),
-        "containers": COSMOS_STARTUP_STATUS.get("containers", []),
-        "template_seed": COSMOS_STARTUP_STATUS.get("template_seed"),
-        "starter_template_seed": COSMOS_STARTUP_STATUS.get("starter_template_seed"),
-        "error": COSMOS_STARTUP_STATUS.get("error"),
-    }
     return {
-        "status": "healthy" if (not cosmos_payload["required"] or cosmos_payload["initialized"]) else "degraded",
+        "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "version": "1.0.0",
-        "cosmos": cosmos_payload,
     }
-
-
-@app.get("/api/cosmos/health", tags=["Health", "Cosmos"])
-async def cosmos_health_check():
-    if not COSMOS_STARTUP_STATUS.get("enabled", False):
-        return {
-            "status": "disabled",
-            "startup": COSMOS_STARTUP_STATUS,
-            "health": None,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-
-    try:
-        health = await asyncio.to_thread(get_cosmos_client().health_check)
-        status = "healthy" if health.get("connected") and not health.get("error") else "degraded"
-        return {
-            "status": status,
-            "startup": COSMOS_STARTUP_STATUS,
-            "health": health,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-    except Exception as exc:
-        return {
-            "status": "error",
-            "startup": COSMOS_STARTUP_STATUS,
-            "health": None,
-            "error": str(exc),
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-
-
-@app.post("/api/cosmos/templates/seed", tags=["Cosmos"])
-async def seed_cosmos_templates():
-    result = await asyncio.to_thread(seed_default_templates)
-    status = "seeded" if result.get("ok") else "failed"
-    return {
-        "status": status,
-        "result": result,
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-
-
-@app.post("/api/cosmos/starter-templates/seed", tags=["Cosmos"])
-async def seed_cosmos_starter_templates():
-    result = await asyncio.to_thread(seed_starter_templates)
-    status = "seeded" if result.get("ok") else "failed"
-    return {
-        "status": status,
-        "result": result,
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-
-
-@app.get("/api/cosmos/starter-templates/resolve/by-stack", tags=["Cosmos"])
-async def resolve_cosmos_starter_template(stack: str = Query(..., description="Comma-separated stack tokens")):
-    tokens = [token.strip().lower() for token in str(stack or "").split(",") if token.strip()]
-    if not tokens:
-        raise HTTPException(status_code=400, detail="stack query parameter is required")
-    doc = await asyncio.to_thread(resolve_starter_template_for_stack, tokens)
-    if not isinstance(doc, dict):
-        raise HTTPException(status_code=404, detail=f"No starter template matched stack tokens: {tokens}")
-    return {"template": doc, "timestamp": datetime.utcnow().isoformat()}
-
-
-@app.get("/api/cosmos/starter-templates/{template_id}", tags=["Cosmos"])
-async def get_cosmos_starter_template(template_id: str):
-    doc = await asyncio.to_thread(get_starter_template, template_id)
-    if not isinstance(doc, dict):
-        raise HTTPException(status_code=404, detail=f"Starter template not found: {template_id}")
-    return {"template": doc, "timestamp": datetime.utcnow().isoformat()}
 
 
 @app.get("/api/status", tags=["Health"])
@@ -1488,15 +1092,6 @@ async def status():
         "active_projects": len(active),
         "total_projects": len(store.projects),
         "firebase_configured": firebase_meta.get("configured", False),
-        "cosmos": {
-            "enabled": COSMOS_STARTUP_STATUS.get("enabled", False),
-            "required": COSMOS_STARTUP_STATUS.get("required", False),
-            "initialized": COSMOS_STARTUP_STATUS.get("initialized", False),
-            "containers": COSMOS_STARTUP_STATUS.get("containers", []),
-            "template_seed": COSMOS_STARTUP_STATUS.get("template_seed"),
-            "starter_template_seed": COSMOS_STARTUP_STATUS.get("starter_template_seed"),
-            "error": COSMOS_STARTUP_STATUS.get("error"),
-        },
     }
 
 
@@ -1829,14 +1424,6 @@ async def preview(project_id: str, path: str = ""):
         ".gif": "image/gif",
         ".svg": "image/svg+xml",
     }
-    if suffix == ".html":
-        try:
-            raw = target.read_text(encoding="utf-8", errors="ignore")
-            patched = _inject_preview_console_bridge(raw, project_id=project_id)
-            return HTMLResponse(content=patched, status_code=200)
-        except Exception:
-            # Fall back to regular file response if injection fails.
-            pass
     return FileResponse(target, media_type=content_types.get(suffix, "application/octet-stream"))
 
 
@@ -1891,7 +1478,7 @@ async def get_context(project_id: str):
 
 @app.get("/api/agents", tags=["Compatibility"])
 async def get_agents(tier: Optional[int] = Query(default=None), role: Optional[str] = Query(default=None), tag: Optional[str] = Query(default=None)):
-    agents = await _get_agent_catalog()
+    agents = AGENT_CATALOG
     if tier is not None:
         agents = [a for a in agents if int(a.get("tier", 0)) == int(tier)]
     if role:
@@ -1900,57 +1487,12 @@ async def get_agents(tier: Optional[int] = Query(default=None), role: Optional[s
     if tag:
         tag_l = tag.lower()
         agents = [a for a in agents if any(tag_l == str(t).lower() for t in a.get("tags", []))]
-    return {"agents": agents, "count": len(agents), "source": _agent_cache_source}
-
-@app.post("/api/agents", tags=["Compatibility"])
-async def create_custom_agent(payload: CreateAgentRequest):
-    """Create a custom agent and persist it to CosmosDB."""
-    import re as _re
-
-    # Slugify role → id (lowercase, underscores, no special chars)
-    agent_id = _re.sub(r"[^a-z0-9]+", "_", payload.role.lower().strip()).strip("_")
-    if not agent_id:
-        raise HTTPException(status_code=422, detail="role must contain at least one alphanumeric character")
-    if len(payload.description.strip()) < 10:
-        raise HTTPException(status_code=422, detail="description must be at least 10 characters")
-    if payload.tier not in (1, 2):
-        raise HTTPException(status_code=422, detail="tier must be 1 or 2")
-
-    model_label = payload.model_label or ("GPT-4o" if payload.tier == 1 else "GPT-4o-mini")
-    doc = {
-        "id": agent_id,
-        "agent_id": agent_id,
-        "role": agent_id,
-        "display_name": payload.role.strip(),
-        "tier": payload.tier,
-        "model_label": model_label,
-        "description": payload.description.strip(),
-        "reputation_score": 0.0,
-        "tags": [t.strip().lower() for t in payload.tags if t.strip()],
-        "is_custom": True,
-        "system_prompt": payload.system_prompt.strip() if payload.system_prompt else "",
-    }
-
-    try:
-        container = _get_agent_library_cosmos_container()
-        await asyncio.get_event_loop().run_in_executor(None, lambda: container.upsert_item(doc))
-        logger.info("Custom agent '%s' upserted to CosmosDB.", agent_id)
-    except Exception as exc:
-        logger.warning("CosmosDB upsert failed for custom agent '%s': %s", agent_id, exc)
-        raise HTTPException(status_code=503, detail=f"Failed to persist agent: {exc}")
-
-    # Bust in-memory cache so next GET returns fresh data (includes new agent)
-    global _agent_catalog_cache, _agent_cache_ts
-    _agent_catalog_cache = None
-    _agent_cache_ts = 0.0
-
-    return {"ok": True, "agent": doc}
+    return {"agents": agents, "count": len(agents), "source": "local"}
 
 
 @app.get("/api/agents/{agent_id}", tags=["Compatibility"])
 async def get_agent(agent_id: str):
-    agents = await _get_agent_catalog()
-    for agent in agents:
+    for agent in AGENT_CATALOG:
         if agent.get("id") == agent_id:
             return agent
     raise HTTPException(status_code=404, detail="Agent not found")
@@ -1960,8 +1502,7 @@ async def get_agent(agent_id: str):
 async def select_agent(payload: AgentSelectionRequest):
     project_id = payload.project_id or "default"
     project_map = SELECTED_AGENTS_BY_PROJECT.setdefault(project_id, {})
-    agents = await _get_agent_catalog()
-    selected = next((a for a in agents if a["id"] == payload.agent_id), None)
+    selected = next((a for a in AGENT_CATALOG if a["id"] == payload.agent_id), None)
     if not selected:
         raise HTTPException(status_code=404, detail="Agent not found")
     project_map[payload.agent_id] = {
@@ -2111,6 +1652,7 @@ async def clarify_intent(request: ClarifyRequest, background_tasks: BackgroundTa
             "project_id": request.project_id,
             "status": "processing",
         }
+
 
 @app.post("/question", tags=["QuestioningAgent"])
 async def question_endpoint(request: QuestionRequest):
@@ -2554,60 +2096,6 @@ async def general_exception_handler(_request, _exc: Exception):
 @app.on_event("startup")
 async def startup_event():
     logger.info("🚀 Nexus platform-compatible backend starting")
-
-    cosmos_connection = (os.getenv("COSMOS_CONNECTION_STR") or "").strip()
-    persist_code_to_db = str(os.getenv("PERSIST_CODE_TO_DB", "false")).strip().lower() in {"1", "true", "yes", "on"}
-    require_cosmos = str(os.getenv("REQUIRE_COSMOS_ON_STARTUP", "true")).strip().lower() in {"1", "true", "yes", "on"}
-
-    COSMOS_STARTUP_STATUS["required"] = require_cosmos and (persist_code_to_db or bool(cosmos_connection))
-    COSMOS_STARTUP_STATUS["enabled"] = bool(cosmos_connection)
-
-    if not cosmos_connection:
-        msg = "COSMOS_CONNECTION_STR not configured"
-        COSMOS_STARTUP_STATUS["error"] = msg
-        if COSMOS_STARTUP_STATUS["required"]:
-            logger.error("❌ %s (required by startup policy)", msg)
-            raise RuntimeError(msg)
-        logger.warning("⚠️ %s; continuing startup", msg)
-        return
-
-    ok = await asyncio.to_thread(init_cosmos_db)
-    if not ok:
-        COSMOS_STARTUP_STATUS["initialized"] = False
-        COSMOS_STARTUP_STATUS["error"] = "Failed to initialize Cosmos DB containers"
-        logger.error("❌ Cosmos DB initialization failed")
-        if COSMOS_STARTUP_STATUS["required"]:
-            raise RuntimeError(COSMOS_STARTUP_STATUS["error"])
-        return
-
-    health = get_cosmos_client().health_check()
-    COSMOS_STARTUP_STATUS["initialized"] = True
-    COSMOS_STARTUP_STATUS["containers"] = health.get("containers", [])
-    COSMOS_STARTUP_STATUS["error"] = health.get("error")
-
-    try:
-        seed_result = await asyncio.to_thread(seed_default_templates)
-        COSMOS_STARTUP_STATUS["template_seed"] = seed_result
-        if seed_result.get("ok"):
-            logger.info("✅ Cosmos TemplateLibrary seeded: %s", seed_result.get("upserted", []))
-        else:
-            logger.warning("⚠️ Cosmos template seeding incomplete: %s", seed_result)
-    except Exception as exc:
-        COSMOS_STARTUP_STATUS["template_seed"] = {"ok": False, "error": str(exc)}
-        logger.warning("⚠️ Cosmos template seeding failed: %s", exc)
-
-    try:
-        starter_seed_result = await asyncio.to_thread(seed_starter_templates)
-        COSMOS_STARTUP_STATUS["starter_template_seed"] = starter_seed_result
-        if starter_seed_result.get("ok"):
-            logger.info("✅ Cosmos starter_templates seeded: %s", starter_seed_result.get("upserted", []))
-        else:
-            logger.warning("⚠️ Cosmos starter template seeding incomplete: %s", starter_seed_result)
-    except Exception as exc:
-        COSMOS_STARTUP_STATUS["starter_template_seed"] = {"ok": False, "error": str(exc)}
-        logger.warning("⚠️ Cosmos starter template seeding failed: %s", exc)
-
-    logger.info("✅ Cosmos DB initialized with containers: %s", COSMOS_STARTUP_STATUS["containers"])
 
 
 @app.on_event("shutdown")

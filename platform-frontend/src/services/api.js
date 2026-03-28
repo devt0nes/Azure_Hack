@@ -38,14 +38,28 @@ export const clarifyWithAnswers = ({ projectId, userInput, answers }) =>
     body: JSON.stringify({ project_id: projectId, user_input: userInput, answers }),
   })
 
-export const askQuestion = ({ projectId, userMessage, conversationHistory = [], question_count = 0 }) =>
+export const getAEG = ({ projectId }) =>
+  apiFetch(`/aeg?project_id=${projectId}`)
+
+export const executeProject = ({ projectId }) =>
+  apiFetch('/execute', {
+    method: 'POST',
+    body: JSON.stringify({ project_id: projectId }),
+  })
+
+export const askQuestion = ({
+  projectId,
+  userMessage,
+  conversationHistory = [],
+  questionCount = 0,
+}) =>
   apiFetch('/question', {
     method: 'POST',
     body: JSON.stringify({
       project_id: projectId,
       user_message: userMessage,
       conversation_history: conversationHistory,
-      question_count: question_count,
+      question_count: questionCount,
     }),
   })
 
@@ -55,19 +69,18 @@ export const checkQuestionReadiness = ({ projectId }) =>
     body: JSON.stringify({ project_id: projectId }),
   })
 
-export const executeFromSpecs = ({ projectId }) =>
+export const executeFromSpecs = ({
+  projectId,
+  specPath = null,
+  clarificationContext = null,
+}) =>
   apiFetch('/execute-from-specs', {
     method: 'POST',
-    body: JSON.stringify({ project_id: projectId }),
-  })
-
-export const getAEG = ({ projectId }) =>
-  apiFetch(`/aeg?project_id=${projectId}`)
-
-export const executeProject = ({ projectId }) =>
-  apiFetch('/execute', {
-    method: 'POST',
-    body: JSON.stringify({ project_id: projectId }),
+    body: JSON.stringify({
+      project_id: projectId,
+      spec_path: specPath,
+      clarification_context: clarificationContext,
+    }),
   })
 
 export const deployProject = ({ projectId, mockSuccess = false }) =>
@@ -92,6 +105,61 @@ export const getProjectPreviewStatus = ({ projectId }) => apiFetch(`/api/project
 export const getProjectLogs = ({ projectId }) => apiFetch(`/api/projects/${projectId}/logs`)
 export const getProjectAgentEvents = ({ projectId }) => apiFetch(`/api/projects/${projectId}/agent-events`)
 export const listProjectArtifacts = ({ projectId }) => apiFetch(`/api/projects/${projectId}/artifacts`)
+export const getWorkspaceFiles = ({ projectId }) => apiFetch(`/api/projects/${projectId}/workspace-files`)
+export const getProjectSpecs = ({ projectId }) => apiFetch(`/api/projects/${projectId}/specs`)
+export const getProjectLedger = ({ projectId }) => apiFetch(`/api/projects/${projectId}/ledger`)
+
+export const saveCanvas = ({ projectId, canvasData }) =>
+  apiFetch(`/api/projects/${projectId}/canvas`, {
+    method: 'PUT',
+    body: JSON.stringify({ canvas_data: canvasData }),
+  })
+
+export const loadCanvas = ({ projectId }) =>
+  apiFetch(`/api/projects/${projectId}/canvas`)
+
+export const ingestProjectContext = ({
+  projectId,
+  referenceFiles = [],
+  includeCanvas = false,
+}) =>
+  apiFetch(`/api/projects/${projectId}/ingestion/context`, {
+    method: 'POST',
+    body: JSON.stringify({
+      reference_files: referenceFiles.map((file) => ({
+        filename: file.filename,
+        url: file.url,
+      })),
+      include_canvas: includeCanvas,
+    }),
+  })
+
+export async function uploadCanvasFile({ projectId, file }) {
+  requireApiBaseUrl()
+  const token = await getToken()
+
+  const formData = new FormData()
+  formData.append('file', file)
+
+  const response = await fetch(`${API_BASE_URL}/api/projects/${projectId}/canvas/upload`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    body: formData,
+  })
+
+  if (response.status === 401) {
+    window.location.href = '/'
+    throw new Error('Unauthorized')
+  }
+
+  if (!response.ok) {
+    throw new Error(`Failed to upload canvas file for project: ${projectId}`)
+  }
+
+  return response.json()
+}
 
 export async function downloadProjectArtifact({ projectId, artifactName }) {
   requireApiBaseUrl()
@@ -119,8 +187,3 @@ export async function downloadProjectArtifact({ projectId, artifactName }) {
   const blob = await response.blob()
   return { blob, filename: artifactName }
 }
-
-// Workspace file management endpoints
-export const getWorkspaceFiles = () => apiFetch('/api/workspace/files')
-export const getProjectSpecs = ({ projectId }) => apiFetch(`/api/workspace/specs/${projectId}`)
-export const getProjectLedger = ({ projectId }) => apiFetch(`/api/workspace/ledger/${projectId}`)

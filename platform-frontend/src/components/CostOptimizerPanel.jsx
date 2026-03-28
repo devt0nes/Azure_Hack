@@ -486,8 +486,8 @@ export default function CostOptimizerPanel({ projectId }) {
             key={tab.id}
             onClick={() => setActiveTab(tab.id)}
             className={`flex-1 rounded-lg py-1.5 text-[11px] font-semibold transition-all ${activeTab === tab.id
-                ? 'bg-background shadow-sm text-primary border border-border/80'
-                : 'text-foreground/60 hover:text-foreground'
+              ? 'bg-background shadow-sm text-primary border border-border/80'
+              : 'text-foreground/60 hover:text-foreground'
               }`}
           >
             {tab.label}

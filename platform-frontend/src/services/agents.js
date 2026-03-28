@@ -6,20 +6,6 @@ function requireApiBaseUrl() {
   if (!API_BASE_URL) throw new Error('VITE_API_BASE_URL is not configured')
 }
 
-// ─── Public fetch (no auth) — used for read-only catalog endpoints ───────────
-async function publicFetch(path, options = {}) {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...options.headers,
-    },
-  })
-  if (!response.ok) throw new Error(`Request failed: ${path} (${response.status})`)
-  return response.json()
-}
-
-// ─── Authenticated fetch — used for write operations ────────────────────────
 async function apiFetch(path, options = {}) {
   requireApiBaseUrl()
   const token = await getToken()  // always fresh, Firebase handles refresh
@@ -34,19 +20,18 @@ async function apiFetch(path, options = {}) {
   })
 
   if (response.status === 401) {
-    throw new Error('Unauthorized — please log in again')
+    window.location.href = '/'
   }
-  if (!response.ok) throw new Error(`Request failed: ${path} (${response.status})`)
+  if (!response.ok) throw new Error(`Request failed: ${path}`)
   return response.json()
 }
 
 /**
- * Get the full agent catalog with optional filtering.
- * Uses unauthenticated fetch — catalog is public read-only data.
- * @param {Object} params
- * @param {number} params.tier  - Optional tier filter (1 or 2)
- * @param {string} params.role  - Optional role filter
- * @param {string} params.tag   - Optional tag filter
+ * Get the full agent catalog with optional filtering
+ * @param {Object} params - Query parameters
+ * @param {number} params.tier - Optional tier to filter by (1 or 2)
+ * @param {string} params.role - Optional role to filter by
+ * @param {string} params.tag - Optional tag to filter by
  * @returns {Promise<Object>} { agents: [...], count: number, source: string }
  */
 export const getAgentCatalog = ({ tier, role, tag } = {}) => {
@@ -57,16 +42,16 @@ export const getAgentCatalog = ({ tier, role, tag } = {}) => {
 
   const queryString = query.toString()
   const path = `/api/agents${queryString ? `?${queryString}` : ''}`
-  return publicFetch(path)
+  return apiFetch(path)
 }
 
 /**
- * Get a single agent by ID (unauthenticated)
+ * Get a single agent by ID
  * @param {string} agentId - The agent ID
  * @returns {Promise<Object>} Agent document
  */
 export const getAgent = (agentId) =>
-  publicFetch(`/api/agents/${agentId}`)
+  apiFetch(`/api/agents/${agentId}`)
 
 /**
  * Select an agent for a specific AEG node in a project.
@@ -115,14 +100,3 @@ export const deselectAgentForProject = deselectAgent
  */
 export const getSelectedAgents = (projectId) =>
   apiFetch(`/api/agents/selected/${projectId}`)
-
-/**
- * Create a new custom agent and persist it to CosmosDB.
- * @param {{ role: string, description: string, tier: number, tags: string[], model_label?: string }} agentData
- * @returns {Promise<{ ok: boolean, agent: Object }>}
- */
-export const createCustomAgent = (agentData) =>
-  publicFetch('/api/agents', {
-    method: 'POST',
-    body: JSON.stringify(agentData),
-  })
