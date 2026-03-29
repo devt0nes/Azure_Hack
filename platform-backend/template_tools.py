@@ -116,6 +116,29 @@ def _build_cosmos_container():
     except Exception:
         return None
 
+def _build_chatbot_cosmos_container():
+    """Return a Cosmos container client for ChatbotTemplates, or None if not configured."""
+    if not _COSMOS_AVAILABLE:
+        return None
+
+    conn_str = os.getenv("COSMOS_CONNECTION_STR", "").strip()
+    url      = os.getenv("COSMOS_ENDPOINT",       "").strip()
+    key      = os.getenv("COSMOS_KEY",            "").strip()
+    db_name  = (os.getenv("COSMOS_DB_NAME", "agentic-nexus-db") or "agentic-nexus-db").strip()
+    ctr_name = (os.getenv("COSMOS_CHATBOT_CONTAINER", "ChatbotTemplates") or "ChatbotTemplates").strip()
+
+    try:
+        if conn_str:
+            client = CosmosClient.from_connection_string(conn_str)
+        elif url and key:
+            client = CosmosClient(url, credential=key)
+        else:
+            return None
+
+        return client.get_database_client(db_name).get_container_client(ctr_name)
+    except Exception:
+        return None
+
 
 # ---------------------------------------------------------------------------
 # TemplateTools — core logic, no dependency on ToolRegistry shape
@@ -129,8 +152,9 @@ class TemplateTools:
     use_template can write directly into the agent's sandboxed workspace.
     """
 
-    def __init__(self, files_tool=None):
+    def __init__(self, files_tool=None, container_builder=None):
         self.files_tool = files_tool
+        self._container_builder = container_builder or _build_cosmos_container
         self._container = None      # lazily initialised on first call
 
     # ------------------------------------------------------------------
@@ -139,7 +163,7 @@ class TemplateTools:
 
     def _get_container(self):
         if self._container is None:
-            self._container = _build_cosmos_container()
+            self._container = self._container_builder()
         return self._container
 
     def _cosmos_ok(self) -> bool:
@@ -577,6 +601,88 @@ TEMPLATE_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
 ]
 
+# ---------------------------------------------------------------------------
+# Chatbot-specific tool definitions  (hit ChatbotTemplates container)
+# ---------------------------------------------------------------------------
+
+CHATBOT_TEMPLATE_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_chatbot_template",
+            "description": (
+                "Search the ChatbotTemplates library for reusable chatbot/LLM backend code templates.\n"
+                "ALWAYS call this BEFORE writing any chatbot, AI assistant, or LLM integration code. "
+                "If a matching template exists, call use_chatbot_template to copy it into your workspace."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Natural-language description of the chatbot feature you need. "
+                            "Examples: 'fastapi chatbot with streaming', 'azure openai chat endpoint'."
+                        ),
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Optional category filter (e.g. 'chatbot').",
+                    },
+                    "framework": {
+                        "type": "string",
+                        "description": "Optional framework filter (e.g. 'fastapi', 'express').",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional tags that must ALL be present (e.g. ['streaming', 'azure-openai']).",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum results to return (1-20). Default: 5.",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "use_chatbot_template",
+            "description": (
+                "Copy a chatbot template's code AS-IS from the ChatbotTemplates library into your workspace. "
+                "Use the template_id returned by search_chatbot_template.\n"
+                "IMPORTANT: Do NOT modify or rewrite the code after calling this — "
+                "place it at target_path exactly as stored. "
+                "You may import or wire it from other files you write."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "template_id": {
+                        "type": "string",
+                        "description": "The template_id from a search_chatbot_template result (e.g. 'chatbot-backend-v1').",
+                    },
+                    "target_path": {
+                        "type": "string",
+                        "description": (
+                            "Exact workspace file path where template code should be placed. "
+                            "Use 'backend/chatbot_api.py' for the chatbot backend template."
+                        ),
+                    },
+                    "line_number": {
+                        "type": "integer",
+                        "description": "1-based line number to insert at. Use 1 to create the file.",
+                    },
+                },
+                "required": ["template_id", "target_path", "line_number"],
+            },
+        },
+    },
+]
 
 # ---------------------------------------------------------------------------
 # attach_template_tools()
@@ -605,12 +711,13 @@ def attach_template_tools(registry) -> None:
         files_tool = getattr(registry, "files", None)  # plain ToolRegistry path
 
     _t = TemplateTools(files_tool=files_tool)
+    _ct = TemplateTools(files_tool=files_tool, container_builder=_build_chatbot_cosmos_container)
 
     # ---- patch get_tool_definitions ----
     _orig_defs = registry.get_tool_definitions
 
     def _patched_get_tool_definitions():
-        return _orig_defs() + TEMPLATE_TOOL_DEFINITIONS
+        return _orig_defs() + TEMPLATE_TOOL_DEFINITIONS + CHATBOT_TEMPLATE_TOOL_DEFINITIONS
 
     registry.get_tool_definitions = _patched_get_tool_definitions
 
@@ -628,6 +735,20 @@ def attach_template_tools(registry) -> None:
             )
         if function_name == "use_template":
             return _t.use_template(
+                template_id=function_args.get("template_id", ""),
+                target_path=function_args.get("target_path", ""),
+                line_number=function_args.get("line_number", 1),
+            )
+        if function_name == "search_chatbot_template":
+            return _ct.search_template(
+                query=function_args.get("query", ""),
+                category=function_args.get("category"),
+                framework=function_args.get("framework"),
+                tags=function_args.get("tags"),
+                max_results=int(function_args.get("max_results", 5) or 5),
+            )
+        if function_name == "use_chatbot_template":
+            return _ct.use_template(
                 template_id=function_args.get("template_id", ""),
                 target_path=function_args.get("target_path", ""),
                 line_number=function_args.get("line_number", 1),
@@ -653,9 +774,10 @@ class TemplateToolRegistry:
 
     def __init__(self, files_tool=None):
         self.templates = TemplateTools(files_tool=files_tool)
+        self.chatbot = TemplateTools(files_tool=files_tool, container_builder=_build_chatbot_cosmos_container)
 
     def get_tool_definitions(self) -> List[Dict[str, Any]]:
-        return list(TEMPLATE_TOOL_DEFINITIONS)
+        return list(TEMPLATE_TOOL_DEFINITIONS) + list(CHATBOT_TEMPLATE_TOOL_DEFINITIONS)
 
     def execute_tool(self, function_name: str, function_args: Dict[str, Any]) -> str:
         if function_name == "search_template":
@@ -672,7 +794,22 @@ class TemplateToolRegistry:
                 target_path=function_args.get("target_path", ""),
                 line_number=function_args.get("line_number", 1),
             )
+        if function_name == "search_chatbot_template":
+            return self.chatbot.search_template(
+                query=function_args.get("query", ""),
+                category=function_args.get("category"),
+                framework=function_args.get("framework"),
+                tags=function_args.get("tags"),
+                max_results=int(function_args.get("max_results", 5) or 5),
+            )
+        if function_name == "use_chatbot_template":
+            return self.chatbot.use_template(
+                template_id=function_args.get("template_id", ""),
+                target_path=function_args.get("target_path", ""),
+                line_number=function_args.get("line_number", 1),
+            )
         return (
             f"ERROR: Unknown tool '{function_name}'. "
-            "TemplateToolRegistry only handles search_template and use_template."
+            "TemplateToolRegistry only handles search_template, use_template, "
+            "search_chatbot_template, and use_chatbot_template."
         )

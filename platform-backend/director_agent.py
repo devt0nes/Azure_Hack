@@ -124,7 +124,7 @@ def _infer_agent_phase(agent: Dict) -> int:
     if any(k in text for k in ops_keywords):
         return 2
 
-    impl_keywords = ["backend", "frontend", "fullstack", "full-stack", "ml", "engineer"]
+    impl_keywords = ["backend", "frontend", "fullstack", "full-stack", "ml", "engineer", "chatbot"]
     if any(k in text for k in impl_keywords):
         return 1
 
@@ -152,6 +152,7 @@ def default_workspace_layout() -> Dict:
             "database_architect": ["database"],
             "backend_engineer": ["backend"],
             "frontend_engineer": ["frontend"],
+            "chatbot_engineer": ["backend"],
             "devops_engineer": ["devops", "infra"],
             "qa_engineer": ["tests"],
             "ml_engineer": ["backend/ml"]
@@ -1212,6 +1213,52 @@ def execute_agent(task):
 
         # Normalize layer ordering using common-sense role semantics
         normalize_layers_common_sense(ledger.data)
+
+        # Auto-inject chatbot_engineer when project description mentions LLM/chat features
+        _chatbot_keywords = [
+            "chatbot", "llm", "ai assistant", "ai chat", "conversational",
+            "openai", "chat feature", "chat api", "language model", "gpt",
+        ]
+        _intent_text = " ".join([
+            str(ledger.data.get("user_intent", "")),
+            str(ledger.data.get("project_description", "")),
+            str(ledger.data.get("project_name", "")),
+        ]).lower()
+        _has_chatbot_intent = any(kw in _intent_text for kw in _chatbot_keywords)
+        _spec = ledger.data.get("agent_specifications") or {}
+        _existing_roles = {
+            (a.get("role") if isinstance(a, dict) else a)
+            for a in (_spec.get("required_agents") or [])
+        }
+        if _has_chatbot_intent and "chatbot_engineer" not in _existing_roles:
+            _chatbot_spec = {
+                "role": "chatbot_engineer",
+                "description": (
+                    "Integrate an LLM-powered chatbot API into the backend. "
+                    "Retrieve the FastAPI chatbot template, write backend/chatbot_api.py, "
+                    "and wire the router into the app entry-point."
+                ),
+                "instructions": "",
+            }
+            if not isinstance(_spec.get("required_agents"), list):
+                _spec["required_agents"] = []
+            _spec["required_agents"].append(_chatbot_spec)
+            # Add to layers: chatbot_engineer runs right after backend_engineer
+            _layers = _spec.get("layers") or []
+            _inserted = False
+            for _i, _layer in enumerate(_layers):
+                if isinstance(_layer, list) and any(
+                    (r.get("role") if isinstance(r, dict) else r) == "backend_engineer"
+                    for r in _layer
+                ):
+                    _layers.insert(_i + 1, ["chatbot_engineer"])
+                    _inserted = True
+                    break
+            if not _inserted:
+                _layers.append(["chatbot_engineer"])
+            _spec["layers"] = _layers
+            ledger.data["agent_specifications"] = _spec
+            print("🤖 [director] Auto-injected chatbot_engineer (LLM/chat intent detected)")
 
         # Policy: implementation details (like concrete API specs) belong to agent-level coordination, not ledger.
         ledger.data["api_specifications"] = []
