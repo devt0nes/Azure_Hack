@@ -160,6 +160,20 @@ class TutorRequest(BaseModel):
     project_id: str
     question: str
     context: Optional[Dict[str, Any]] = {}
+    depth_level: Optional[str] = "beginner"
+    session_history: Optional[List[Dict[str, Any]]] = []
+
+
+class SessionStartRequest(BaseModel):
+    project_id: str
+    depth_level: Optional[str] = "beginner"
+
+
+class SaveTourRequest(BaseModel):
+    project_id: str
+    tour_name: str
+    messages: List[Dict[str, Any]] = []
+    depth_level: Optional[str] = "beginner"
 
 
 class AgentSelectionRequest(BaseModel):
@@ -2574,24 +2588,49 @@ async def execute_project_compat(request: ExecuteRequest, background_tasks: Back
         raise HTTPException(status_code=500, detail="Failed to start execution")
 
 
-@app.post("/tutor/ask", tags=["Compatibility"])
-async def tutor_ask(request: TutorRequest):
-    q = (request.question or "").lower()
-    response_text = "I'm the Nexus learning assistant. "
-    if "explain" in q or "what is" in q:
-        response_text += "This platform uses specialized agents to build full-stack applications collaboratively."
-    elif "aeg" in q or "graph" in q:
-        response_text += "The AEG shows dependencies between agents and execution order."
-    elif "cost" in q:
-        response_text += "Cost tracking reports token usage and estimated spend."
-    else:
-        response_text += "Ask me about agent execution, AEG, cost tracking, or orchestration flow."
+@app.post("/tutor/session_start", tags=["LearningMode"])
+async def tutor_session_start(request: SessionStartRequest):
+    """Start a Learning Mode session. Returns a project-aware greeting."""
+    from learning_mode_agent import LearningModeAgent
+    agent = LearningModeAgent(
+        project_id=request.project_id,
+        store=store,
+        repo_root=REPO_ROOT,
+    )
+    return await agent.get_session_greeting(depth_level=request.depth_level or "beginner")
 
-    return {
-        "response": response_text,
-        "level": "overview",
-        "timestamp": datetime.utcnow().isoformat(),
-    }
+
+@app.post("/tutor/ask", tags=["LearningMode"])
+async def tutor_ask(request: TutorRequest):
+    """Ask the Learning Mode Agent a question about the project build."""
+    from learning_mode_agent import LearningModeAgent
+    agent = LearningModeAgent(
+        project_id=request.project_id,
+        store=store,
+        repo_root=REPO_ROOT,
+    )
+    return await agent.get_response(
+        question=request.question,
+        depth_level=request.depth_level or "beginner",
+        session_history=request.session_history or [],
+    )
+
+
+@app.post("/tutor/save_tour", tags=["LearningMode"])
+async def tutor_save_tour(request: SaveTourRequest):
+    """Persist a structured annotated code tour to disk."""
+    from learning_mode_agent import LearningModeAgent
+    agent = LearningModeAgent(
+        project_id=request.project_id,
+        store=store,
+        repo_root=REPO_ROOT,
+    )
+    tour = await agent.save_tour(
+        tour_name=request.tour_name,
+        messages=request.messages,
+        depth_level=request.depth_level or "beginner",
+    )
+    return {"ok": True, "tour": tour}
 
 
 @app.get("/api/tunnel-status", tags=["Compatibility"])
