@@ -1,8 +1,8 @@
 # Core FastAPI
-fastapi==0.104.1
+fastapi==0.95.0  # Latest stable version of FastAPI
 uvicorn[standard]==0.24.0
-pydantic==1.10.2  # Ensure this is the 1.x version, not 2.x anymore
-pydantic-settings==1.8.0
+pydantic==2.5.0  # Latest stable version of Pydantic
+pydantic-settings==2.5.0  # Compatible version of pydantic-settings
 
 # Azure Services
 azure-cosmos==4.5.1
