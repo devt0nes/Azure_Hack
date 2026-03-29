@@ -26,8 +26,9 @@ class BlobWorkspace:
             # Container already exists or no permission. Ignore for idempotency.
             pass
 
-    def download_project(self, project_id: str, local_path: str) -> int:
-        prefix = f"{project_id}/"
+    def download_project(self, project_id: str, local_path: str, remote_prefix: str = "") -> int:
+        normalized_prefix = str(remote_prefix or "").strip().strip("/")
+        prefix = f"{project_id}/" + (f"{normalized_prefix}/" if normalized_prefix else "")
         local_root = Path(local_path)
         local_root.mkdir(parents=True, exist_ok=True)
 
@@ -43,17 +44,20 @@ class BlobWorkspace:
             count += 1
         return count
 
-    def upload_project(self, project_id: str, local_path: str) -> int:
+    def upload_project(self, project_id: str, local_path: str, remote_prefix: str = "") -> int:
         local_root = Path(local_path)
         if not local_root.exists():
             return 0
+
+        normalized_prefix = str(remote_prefix or "").strip().strip("/")
+        blob_base = f"{project_id}/" + (f"{normalized_prefix}/" if normalized_prefix else "")
 
         count = 0
         for root, _, files in os.walk(local_root):
             for name in files:
                 full_path = Path(root) / name
                 rel_path = full_path.relative_to(local_root).as_posix()
-                blob_name = f"{project_id}/{rel_path}"
+                blob_name = f"{blob_base}{rel_path}"
                 with open(full_path, "rb") as data:
                     self.container.upload_blob(blob_name, data, overwrite=True)
                 count += 1

@@ -91,6 +91,7 @@ from review_agent import ReviewAgent
 from service_bus_coordination import ServiceBusCoordinator
 from contract_validator import validate_system_architect_contracts
 from dotenv import load_dotenv
+from azure_runtime_sync import write_text_azure_first
 
 load_dotenv()
 
@@ -216,15 +217,21 @@ class LayerBlackboard:
     
     def _write_file(self):
         """Write messages to file"""
-        with open(self.path, 'w') as f:
-            f.write(f"# Layer {self.layer_number} Coordination Blackboard\n\n")
-            f.write(f"Last Updated: {datetime.now().isoformat()}\n\n")
-            for msg in self.messages:
-                timestamp = msg.get("timestamp", "")
-                agent = msg.get("agent", "")
-                content = msg.get("content", "")
-                f.write(f"**[{agent}] {timestamp}**\n")
-                f.write(f"{content}\n\n")
+        chunks = [
+            f"# Layer {self.layer_number} Coordination Blackboard\n\n",
+            f"Last Updated: {datetime.now().isoformat()}\n\n",
+        ]
+        for msg in self.messages:
+            timestamp = msg.get("timestamp", "")
+            agent = msg.get("agent", "")
+            content = msg.get("content", "")
+            chunks.append(f"**[{agent}] {timestamp}**\n")
+            chunks.append(f"{content}\n\n")
+
+        payload = "".join(chunks)
+        ok, detail = write_text_azure_first(self.path, payload)
+        if not ok:
+            raise RuntimeError(f"Layer blackboard write failed (azure-first): {detail}")
     
     def post(self, agent_name: str, content: str):
         """Post a message"""
@@ -288,21 +295,27 @@ class StructuredBlackboard:
     
     def _write_file(self):
         """Write sections to file"""
-        with open(self.path, 'w') as f:
-            f.write("# Team Blackboard\n\n")
-            f.write(f"Last Updated: {datetime.now().isoformat()}\n\n")
-            f.write("---\n\n")
-            
-            for section_name in ["Discussions", "Issues", "Implementation plan"]:
-                f.write(f"## {section_name}\n\n")
-                entries = self.sections.get(section_name, [])
-                for entry in entries:
-                    timestamp = entry.get("timestamp", "")
-                    agent = entry.get("agent", "")
-                    content = entry.get("content", "")
-                    f.write(f"**[{agent}] {timestamp}**\n")
-                    f.write(f"{content}\n\n")
-                f.write("---\n\n")
+        chunks = [
+            "# Team Blackboard\n\n",
+            f"Last Updated: {datetime.now().isoformat()}\n\n",
+            "---\n\n",
+        ]
+
+        for section_name in ["Discussions", "Issues", "Implementation plan"]:
+            chunks.append(f"## {section_name}\n\n")
+            entries = self.sections.get(section_name, [])
+            for entry in entries:
+                timestamp = entry.get("timestamp", "")
+                agent = entry.get("agent", "")
+                content = entry.get("content", "")
+                chunks.append(f"**[{agent}] {timestamp}**\n")
+                chunks.append(f"{content}\n\n")
+            chunks.append("---\n\n")
+
+        payload = "".join(chunks)
+        ok, detail = write_text_azure_first(self.path, payload)
+        if not ok:
+            raise RuntimeError(f"Structured blackboard write failed (azure-first): {detail}")
     
     def post(self, agent_name: str, section: str, content: str) -> bool:
         """Post to a section with file locking"""
@@ -1584,7 +1597,12 @@ class EnhancedAgentOrchestrator:
       return layers
 
     def _verify_director_structure(self) -> None:
-      """Verify director-provided layering follows contract-first structure when standard roles exist."""
+      """Verify director-provided layering follows structural constraints.
+
+      Constraints:
+      - every required role appears in exactly one layer
+      - if system_architect exists, it is in layer 1 and alone
+      """
       spec = self.ledger.get("agent_specifications", {}) if isinstance(self.ledger, dict) else {}
       explicit_layers = spec.get("layers", []) or []
       if not explicit_layers:
@@ -1604,17 +1622,48 @@ class EnhancedAgentOrchestrator:
         else:
           continue
         for r in roles:
+          if r in role_to_layer:
+            raise RuntimeError(f"CRITICAL: role appears in multiple layers: {r}")
           role_to_layer[r] = idx
 
-      expected_order = ["system_architect", "database_architect", "backend_engineer", "frontend_engineer", "qa_engineer"]
-      present = [r for r in expected_order if r in role_to_layer]
-      for i in range(len(present) - 1):
-        left = present[i]
-        right = present[i + 1]
-        if role_to_layer[left] > role_to_layer[right]:
+      required_agents = spec.get("required_agents", []) if isinstance(spec, dict) else []
+      required_roles = set()
+      for a in required_agents:
+        norm = self._normalize_agent_spec(a)
+        if norm and norm.get("role"):
+          required_roles.add(norm.get("role"))
+
+      missing = sorted([r for r in required_roles if r not in role_to_layer])
+      if missing:
+        raise RuntimeError(f"CRITICAL: director layers missing required roles: {missing}")
+
+      if "system_architect" in role_to_layer:
+        sys_layer_index = int(role_to_layer["system_architect"])
+        if sys_layer_index != 0:
+          raise RuntimeError("CRITICAL: system_architect must be in layer 1")
+
+        first_layer = explicit_layers[0]
+        if isinstance(first_layer, list):
+          first_roles = [str(r) for r in first_layer if isinstance(r, str)]
+        elif isinstance(first_layer, dict):
+          first_roles = []
+          for a in (first_layer.get("agents", []) or []):
+            if isinstance(a, str):
+              first_roles.append(a)
+            elif isinstance(a, dict) and a.get("role"):
+              first_roles.append(str(a.get("role")))
+        else:
+          first_roles = []
+
+        normalized_first = [
+          str(x or "").strip().lower().replace(" ", "_")
+          for x in first_roles
+          if str(x or "").strip()
+        ]
+        if normalized_first != ["system_architect"]:
           raise RuntimeError(
-            "CRITICAL: Director layer order violates contract-first structure. "
-            f"Expected {left} to execute before {right}."
+            "CRITICAL: layer 1 must contain only system_architect; "
+            f"got {normalized_first}"
           )
 
     def _load_contract_context(self) -> Dict:
@@ -1954,42 +2003,29 @@ class EnhancedAgentOrchestrator:
       return route_map
 
     def _enforce_contract_first_execution_layers(self, layers: List[List[Dict]]) -> List[List[Dict]]:
-      """Force contract-first execution order when standard roles are present."""
-      flat_specs = []
-      for layer in layers or []:
-        for spec in layer or []:
-          if isinstance(spec, dict) and spec.get("role"):
-            flat_specs.append(spec)
-
-      if not flat_specs:
+      """Preserve director layers; only enforce system_architect as first layer alone."""
+      if not layers:
         return layers
 
-      by_role = {s.get("role"): s for s in flat_specs}
-      ordered_layers = []
-      consumed = set()
+      system_spec = None
+      cleaned_layers: List[List[Dict]] = []
+      for layer in layers:
+        cleaned: List[Dict] = []
+        for spec in layer or []:
+          if not isinstance(spec, dict) or not spec.get("role"):
+            continue
+          role = str(spec.get("role")).strip().lower().replace(" ", "_")
+          if role == "system_architect":
+            if system_spec is None:
+              system_spec = spec
+            continue
+          cleaned.append(spec)
+        if cleaned:
+          cleaned_layers.append(cleaned)
 
-      phase_roles = [
-        ["system_architect"],
-        ["database_architect"],
-        ["backend_engineer", "frontend_engineer"],
-        ["chatbot_engineer"],
-        ["qa_engineer"],
-      ]
-
-      for phase in phase_roles:
-        phase_specs = []
-        for role in phase:
-          if role in by_role:
-            phase_specs.append(by_role[role])
-            consumed.add(role)
-        if phase_specs:
-          ordered_layers.append(phase_specs)
-
-      remaining = [s for s in flat_specs if s.get("role") not in consumed]
-      if remaining:
-        ordered_layers.append(remaining)
-
-      return ordered_layers if ordered_layers else layers
+      if system_spec is None:
+        return layers
+      return [[system_spec]] + cleaned_layers
 
     def _require_global_contract(self) -> None:
       """Global contract existence/validity gate before executing layers."""
@@ -2131,50 +2167,17 @@ class EnhancedAgentOrchestrator:
         return context
 
     def _required_upstream_roles(self, role: str) -> List[str]:
-        role_norm = (role or "").strip().lower()
-        mapping = {
-      "database_architect": ["system_architect"],
-        "backend_engineer": ["database_architect", "system_architect"],
-        "chatbot_engineer": ["backend_engineer", "system_architect"],
-        "frontend_engineer": ["system_architect", "backend_engineer"],
-            "qa_engineer": ["database_architect", "backend_engineer", "frontend_engineer"],
-        }
-        return mapping.get(role_norm, [])
+        # Director-defined layer ordering is authoritative. We do not impose
+        # additional hard role dependencies here.
+        return []
 
     def _enforce_role_prerequisites(self, role: str, current_layer_roles: Optional[List[str]] = None) -> None:
-      """Hard gate for contract-first orchestration and upstream dependencies."""
-      role_norm = (role or "").strip().lower().replace(" ", "_")
-      required = self._required_upstream_roles(role_norm)
-      coexecuting_roles = {
-        str(r or "").strip().lower().replace(" ", "_")
-        for r in (current_layer_roles or [])
-      }
-      missing_upstream = [
-        r for r in required
-        if r not in self.completed_workspaces and r not in coexecuting_roles
-      ]
-      if missing_upstream:
-        raise RuntimeError(
-          f"CRITICAL: {role_norm} cannot start. Missing completed upstream roles: {', '.join(missing_upstream)}"
-        )
+      """No-op: execution prerequisites are encoded only via director layers.
 
-      contract_required_roles = {"database_architect", "backend_engineer", "frontend_engineer", "qa_engineer"}
-      if role_norm in contract_required_roles:
-        missing_contracts = [
-          rel for rel in SYSTEM_ARCHITECT_CONTRACTS
-          if not os.path.exists(os.path.join(WORKSPACE_DIR, rel))
-        ]
-        if missing_contracts:
-          raise RuntimeError(
-            "CRITICAL: System Architect contracts are required before this role can execute: "
-            + ", ".join(missing_contracts)
-          )
-        validation = self._validate_system_architect_contracts(report_issue=True)
-        if not validation.get("ok"):
-          raise RuntimeError(
-            "CRITICAL: System Architect contracts are invalid and cannot be used as source of truth: "
-            + str(validation.get("error", "unknown validation failure"))
-          )
+      The only hard orchestration constraint is enforced globally:
+      `system_architect` must be first layer and alone.
+      """
+      return
 
     def _validate_system_architect_contracts(self, report_issue: bool = False) -> Dict:
       """Validate all System Architect contracts and optionally report failures to system_architect."""

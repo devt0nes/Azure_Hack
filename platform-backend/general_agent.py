@@ -20,11 +20,14 @@ import time
 import random
 import re
 import shlex
+import sys
 from datetime import datetime
 from dotenv import load_dotenv
 from tooly import ToolRegistry, has_command_failed, is_done
 from issues_tracker import get_issues_tracker
 from template_tools import attach_template_tools
+from azure_runtime_sync import upload_local_path_to_blob
+from azure_runtime_sync import write_text_azure_first
 
 load_dotenv()
 
@@ -1477,8 +1480,12 @@ class CWDAwareToolRegistry:
                         return f"ERROR: Cannot write outside workspace: {selected_rel}"
 
                     os.makedirs(os.path.dirname(final_abs), exist_ok=True)
-                    with open(final_abs, "w", encoding="utf-8") as f:
-                        f.write(function_args.get("content", ""))
+                    ok_blob, detail_blob = write_text_azure_first(final_abs, function_args.get("content", ""))
+                    if ok_blob:
+                        print(f"[AzureBlob][general_agent][write_file] azure-first write: {detail_blob}", file=sys.stderr, flush=True)
+                    else:
+                        print(f"[AzureBlob][general_agent][write_file] azure-first failed: {detail_blob}", file=sys.stderr, flush=True)
+                        return f"ERROR: Failed to write file (azure-first): {detail_blob}"
 
                     self.write_operations += 1
                     self.file_write_counts[rel_key] = current_writes + 1
@@ -1574,6 +1581,12 @@ class CWDAwareToolRegistry:
                 else:
                     with open(notebook_path, 'w') as f:
                         f.write(f"# {self.agent_role or 'Agent'} Notebook\n\n## {section}\n{content}")
+
+                ok_blob, detail_blob = upload_local_path_to_blob(notebook_path)
+                if ok_blob:
+                    print(f"[AzureBlob][general_agent][notebook] uploaded: {detail_blob}", file=sys.stderr, flush=True)
+                else:
+                    print(f"[AzureBlob][general_agent][notebook] upload failed: {detail_blob}", file=sys.stderr, flush=True)
                 
                 return f"✅ Written to notebook [{section}]: {content[:80]}..."
             except Exception as e:

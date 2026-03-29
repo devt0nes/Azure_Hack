@@ -15,6 +15,15 @@ import subprocess
 import re
 import shlex
 from pathlib import Path
+import sys
+
+from azure_runtime_sync import (
+    download_blob_to_local_path,
+    sync_blob_prefix_to_local_dir,
+    sync_local_dir_to_blob_prefix,
+    upload_local_path_to_blob,
+    write_text_azure_first,
+)
 
 
 def _detect_repo_root() -> Path:
@@ -50,6 +59,7 @@ class ToolConfig:
         self.allowed_root = str(Path(allowed_root).resolve())
         self.timeout = timeout
         self.workspace_root = str(self._infer_workspace_root())
+        os.environ.setdefault("NEXUS_WORKSPACE_ROOT", self.workspace_root)
         os.makedirs(self.allowed_root, exist_ok=True)
 
     def _infer_workspace_root(self) -> Path:
@@ -123,6 +133,11 @@ class FilesTools:
             if not self.config.is_safe_path(full_path):
                 return "ERROR: Access Denied. You may only access files in the workspace directory."
 
+            # Azure-first hydration for runtime files.
+            ok, detail = download_blob_to_local_path(full_path)
+            if ok:
+                print(f"[AzureBlob][tooly][read_file] hydrated: {detail}", file=sys.stderr, flush=True)
+
             with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
 
@@ -158,10 +173,13 @@ class FilesTools:
             full_path = self.config.resolve_path(file_path)
             if not self.config.is_safe_path(full_path):
                 return "ERROR: Access Denied. You may only access files in the workspace directory."
-            
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            with open(full_path, 'w') as f:
-                f.write(content)
+
+            ok, detail = write_text_azure_first(full_path, str(content or ""))
+            if ok:
+                print(f"[AzureBlob][tooly][write_file] azure-first write: {detail}", file=sys.stderr, flush=True)
+            else:
+                print(f"[AzureBlob][tooly][write_file] azure-first failed: {detail}", file=sys.stderr, flush=True)
+                return f"ERROR: Failed to write file (azure-first): {detail}"
             return f"Successfully wrote to {full_path}"
         except Exception as e:
             return f"ERROR: Failed to write file: {str(e)}"
@@ -174,6 +192,12 @@ class FilesTools:
             if not self.config.is_safe_path(full_path):
                 return "ERROR: Access Denied."
             
+            if not os.path.isdir(full_path):
+                # Try hydrating directory from Azure runtime prefix before failing.
+                ok, detail = sync_blob_prefix_to_local_dir(full_path)
+                if ok:
+                    print(f"[AzureBlob][tooly][list_files] hydrated: {detail}", file=sys.stderr, flush=True)
+
             if not os.path.isdir(full_path):
                 root_name = Path(self.config.allowed_root).name
                 guidance = (
@@ -214,6 +238,10 @@ class CommandTools:
             
             if not self.config.is_safe_path(working_dir):
                 return "ERROR: Unsafe working directory"
+
+            ok_in, detail_in = sync_blob_prefix_to_local_dir(working_dir)
+            if ok_in:
+                print(f"[AzureBlob][tooly][run_command] hydrated: {detail_in}", file=sys.stderr, flush=True)
             
             cmd_parts = shlex.split(cmd)
             if not cmd_parts:
@@ -229,6 +257,11 @@ class CommandTools:
             )
             
             status = "SUCCESS" if result.returncode == 0 else "FAILED"
+
+            ok_out, detail_out = sync_local_dir_to_blob_prefix(working_dir)
+            if ok_out:
+                print(f"[AzureBlob][tooly][run_command] uploaded: {detail_out}", file=sys.stderr, flush=True)
+
             return f"STATUS: {status}\nEXIT_CODE: {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         except subprocess.TimeoutExpired:
             return f"ERROR: Command timed out after {self.config.timeout} seconds."
@@ -254,6 +287,10 @@ class SearchTools:
             full_path = self.config.resolve_path(directory)
             if not self.config.is_safe_path(full_path):
                 return "ERROR: Access Denied."
+
+            ok, detail = sync_blob_prefix_to_local_dir(full_path)
+            if ok:
+                print(f"[AzureBlob][tooly][search_files] hydrated: {detail}", file=sys.stderr, flush=True)
             
             import glob
             search_pattern = os.path.join(full_path, "**", pattern)
@@ -281,6 +318,10 @@ class SearchTools:
             full_path = self.config.resolve_path(directory)
             if not self.config.is_safe_path(full_path):
                 return "ERROR: Access Denied."
+
+            ok, detail = sync_blob_prefix_to_local_dir(full_path)
+            if ok:
+                print(f"[AzureBlob][tooly][search_in_files] hydrated: {detail}", file=sys.stderr, flush=True)
             
             import glob
             
@@ -340,6 +381,10 @@ class ValidationTools:
             full_path = self.config.resolve_path(file_path)
             if not self.config.is_safe_path(full_path):
                 return "ERROR: Access Denied."
+
+            ok, detail = download_blob_to_local_path(full_path)
+            if ok:
+                print(f"[AzureBlob][tooly][check_syntax] hydrated: {detail}", file=sys.stderr, flush=True)
 
             ci_path = self._resolve_case_insensitive(full_path)
             if ci_path and self.config.is_safe_path(ci_path):

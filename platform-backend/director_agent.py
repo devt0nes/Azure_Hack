@@ -165,7 +165,12 @@ def default_workspace_layout() -> Dict:
 
 
 def normalize_layers_common_sense(ledger_data: Dict) -> None:
-    """Normalize layers with minimal count while preserving practical execution order."""
+    """Normalize layers while preserving director order and enforcing hard constraints.
+
+    Hard constraints:
+    - Every required role appears exactly once across layers.
+    - If `system_architect` exists, it must be layer 1 and alone.
+    """
     if not isinstance(ledger_data, dict):
         return
 
@@ -190,7 +195,8 @@ def normalize_layers_common_sense(ledger_data: Dict) -> None:
         return
 
     raw_layers = spec.get("layers", []) or []
-    flattened_roles = []
+    normalized_layers: List[List[str]] = []
+    seen_roles = set()
 
     for layer in raw_layers:
         if isinstance(layer, list):
@@ -200,36 +206,21 @@ def normalize_layers_common_sense(ledger_data: Dict) -> None:
         else:
             entries = []
 
+        layer_roles: List[str] = []
         for entry in entries:
             role = _extract_role(entry)
+            if not role or role not in role_to_agent or role in seen_roles:
+                continue
+            seen_roles.add(role)
+            layer_roles.append(role)
 
-            if role in role_to_agent and role not in flattened_roles:
-                flattened_roles.append(role)
+        if layer_roles:
+            normalized_layers.append(layer_roles)
 
-    # Ensure all required roles are included even if model missed some in layers
-    for role in role_to_agent:
-        if role not in flattened_roles:
-            flattened_roles.append(role)
-
-    # Sort by inferred phase, stable within same phase by original appearance
-    original_order = {role: idx for idx, role in enumerate(flattened_roles)}
-    flattened_roles.sort(key=lambda r: (_infer_agent_phase(role_to_agent.get(r, {"role": r})), original_order.get(r, 10**6)))
-
-    normalized_layers = []
-    current_layer = []
-    current_phase = None
-    for role in flattened_roles:
-        phase = _infer_agent_phase(role_to_agent.get(role, {"role": role}))
-        if current_phase is None or phase == current_phase:
-            current_layer.append(role)
-            current_phase = phase
-        else:
-            if current_layer:
-                normalized_layers.append(current_layer)
-            current_layer = [role]
-            current_phase = phase
-    if current_layer:
-        normalized_layers.append(current_layer)
+    # Ensure all required roles are included even if model missed some in layers.
+    missing_roles = [role for role in role_to_agent if role not in seen_roles]
+    if missing_roles:
+        normalized_layers.append(missing_roles)
 
     spec["layers"] = enforce_system_architect_first_layer(normalized_layers)
 
@@ -821,10 +812,13 @@ CONSISTENCY RULES:
 - Each layer is an array of role names
 - Every required agent role must appear in exactly one layer
 - If system_architect exists, it MUST be in layer 1 and MUST run alone in that layer
+- system_architect must always be present and must always be the only role in layer 1
 - Layers should be ordered logically in order of execution from first to last - agents that should execute first should be put in earlier layers
 - Keep total number of layers as low as practical by parallelizing compatible agents
 - If an agent would mostly wait on another agent's deliverable, place it in a later layer
 - If two agents can coordinate effectively with bounded dependency risk, place them in the same layer
+- Do NOT force a fixed canonical pattern; derive layer composition from THIS project's requirements.
+- After layer 1 (system_architect only), arrange remaining layers exactly as your project-specific dependency analysis dictates.
 - Each agent needs: role, instructions
 - The first agent and layer must be the system_architect, always
 - Minimize agent count (quality over quantity)
@@ -954,6 +948,8 @@ CRITICAL RULES:
 ✓ ALWAYS call write_task_ledger() - NEVER skip this
 ✓ Include ALL fields in your JSON response (copy from current + add updates)
 ✓ Prefer agent_specifications.layers and minimize total layers by parallelizing where sensible
+✓ system_architect must always be the only role in layer 1
+✓ Do NOT impose a fixed generic layer pattern for all projects; choose layers from project-specific dependencies
 ✓ Put heavily blocked/waiting agents in later layers; keep decently coordinating agents together
 ✓ Ensure every required agent role appears exactly once in layers
 ✓ Populate ui_preferences with concrete UX/UI direction from user intent and clarifications

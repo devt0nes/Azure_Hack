@@ -269,7 +269,8 @@ BLOB_WORKSPACE = None
 try:
     BLOB_WORKSPACE = build_blob_workspace_from_env()
 except Exception as exc:
-    logger.warning("Blob workspace disabled: %s", exc)
+    logger.exception("Blob workspace disabled: %s", exc)
+    print(f"[AzureBlob][init] Blob workspace disabled: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
 
 # ─── Azure Storage Configuration ─────────────────────────────────────────────
 _ENABLE_LOCAL_FILE_GENERATION = str(os.getenv("ENABLE_LOCAL_FILE_GENERATION", "false")).strip().lower() in {"1", "true", "yes", "on"}
@@ -277,8 +278,29 @@ _AZURE_STORAGE_CONN_STR = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
 _AZURE_STORAGE_CONTAINER = os.getenv("AZURE_STORAGE_CONTAINER", "project-workspace")
 _BLOB_SYNC_MIN_INTERVAL_SECONDS = int(os.getenv("BLOB_SYNC_MIN_INTERVAL_SECONDS", "20"))
 _BLOB_SYNC_VERBOSE_DOWNLOAD_LOGS = str(os.getenv("BLOB_SYNC_VERBOSE_DOWNLOAD_LOGS", "false")).strip().lower() in {"1", "true", "yes", "on"}
+_ENABLE_LEGACY_BLOB_PROJECT_SYNC = str(os.getenv("ENABLE_LEGACY_BLOB_PROJECT_SYNC", "false")).strip().lower() in {"1", "true", "yes", "on"}
+_BLOB_AUTOSYNC_ENABLED = str(os.getenv("BLOB_AUTOSYNC_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
+_BLOB_AUTOSYNC_INTERVAL_SECONDS = max(1, int(os.getenv("BLOB_AUTOSYNC_INTERVAL_SECONDS", "1")))
+_ACTIVE_PROJECT_STATES_FOR_AUTOSYNC = {
+    ProjectStatus.QUEUED.value,
+    ProjectStatus.GENERATING_CODE.value,
+    ProjectStatus.GENERATING_DEPLOYMENT.value,
+    ProjectStatus.PAUSED.value,
+}
 
 _azure_blob_client = None
+_PROJECT_BLOB_AUTOSYNC_TASKS: Dict[str, asyncio.Task] = {}
+
+
+def _report_blob_error(prefix: str, exc: Exception, project_id: Optional[str] = None) -> None:
+    details = f"{type(exc).__name__}: {exc}"
+    if project_id:
+        logger.exception("%s (project=%s): %s", prefix, project_id, details)
+        _append_project_log(project_id, "blob_error", stage=prefix, error=details)
+        print(f"[AzureBlob][{project_id}] {prefix}: {details}", file=sys.stderr, flush=True)
+    else:
+        logger.exception("%s: %s", prefix, details)
+        print(f"[AzureBlob] {prefix}: {details}", file=sys.stderr, flush=True)
 
 
 def _get_azure_blob_container_client():
@@ -291,7 +313,7 @@ def _get_azure_blob_container_client():
         return _azure_blob_client
     
     if not _AZURE_STORAGE_CONN_STR:
-        logger.debug("Azure Storage not configured")
+        logger.warning("Azure Storage not configured: AZURE_STORAGE_CONNECTION_STRING is empty")
         return None
     
     try:
@@ -305,7 +327,7 @@ def _get_azure_blob_container_client():
             pass
         return _azure_blob_client
     except Exception as exc:
-        logger.error("Failed to initialize Azure Blob Storage: %s", exc)
+        _report_blob_error("Failed to initialize Azure Blob Storage", exc)
         return None
 
 
@@ -315,7 +337,12 @@ async def _upload_file_to_azure(project_id: str, local_file_path: Path) -> bool:
     Returns True if successful, False otherwise.
     """
     if _ENABLE_LOCAL_FILE_GENERATION:
-        # Local file generation is enabled, no need to upload
+        # Kept for backward compatibility with existing env behavior.
+        logger.warning(
+            "Direct Azure upload skipped because ENABLE_LOCAL_FILE_GENERATION=true (project=%s, file=%s)",
+            project_id,
+            local_file_path,
+        )
         return True
     
     container = _get_azure_blob_container_client()
@@ -344,7 +371,7 @@ async def _upload_file_to_azure(project_id: str, local_file_path: Path) -> bool:
         logger.debug("Uploaded file to Azure: %s", blob_name)
         return True
     except Exception as exc:
-        logger.error("Failed to upload file %s to Azure: %s", local_file_path, exc)
+        _report_blob_error(f"Failed to upload file to Azure ({local_file_path})", exc, project_id=project_id)
         return False
 
 
@@ -354,7 +381,11 @@ async def _upload_project_to_azure(project_id: str) -> int:
     Returns the count of files uploaded.
     """
     if _ENABLE_LOCAL_FILE_GENERATION:
-        # Local file generation is enabled, no need to upload
+        # Kept for backward compatibility with existing env behavior.
+        logger.warning(
+            "Direct Azure project upload skipped because ENABLE_LOCAL_FILE_GENERATION=true (project=%s)",
+            project_id,
+        )
         return 0
     
     container = _get_azure_blob_container_client()
@@ -384,13 +415,13 @@ async def _upload_project_to_azure(project_id: str) -> int:
                         )
                     count += 1
                 except Exception as exc:
-                    logger.warning("Failed to upload %s: %s", full_path, exc)
+                    _report_blob_error(f"Failed to upload file during project sync ({full_path})", exc, project_id=project_id)
                     continue
         
         logger.info("Uploaded %d files for project %s to Azure Storage", count, project_id)
         return count
     except Exception as exc:
-        logger.error("Failed to upload project %s to Azure: %s", project_id, exc)
+        _report_blob_error("Failed to upload project to Azure", exc, project_id=project_id)
         return 0
 
 
@@ -731,8 +762,26 @@ def _sync_project_from_blob(project_id: str) -> None:
 
     local_dir = _project_generated_dir(project_id)
     local_dir.mkdir(parents=True, exist_ok=True)
+    for stale in [local_dir / "runtime", local_dir / "generated_code"]:
+        try:
+            if stale.exists() and stale.is_dir():
+                shutil.rmtree(stale)
+        except Exception as exc:
+            logger.warning("Could not remove stale recursive folder %s: %s", stale, exc)
+    workspace_dir = REPO_ROOT / "workspace"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
     try:
-        count = BLOB_WORKSPACE.download_project(project_id, str(local_dir))
+        count = 0
+        # Preferred runtime source-of-truth layout.
+        count += BLOB_WORKSPACE.download_project(
+            project_id,
+            str(workspace_dir),
+            remote_prefix="runtime/workspace",
+        )
+
+        # Optional legacy path support (disabled by default to avoid recursive nesting).
+        if _ENABLE_LEGACY_BLOB_PROJECT_SYNC:
+            count += BLOB_WORKSPACE.download_project(project_id, str(local_dir))
         _BLOB_SYNC_LAST_DOWNLOAD_TS[project_id] = now
         if _BLOB_SYNC_VERBOSE_DOWNLOAD_LOGS:
             logger.info("Blob sync download complete for %s: %s files -> %s", project_id, count, local_dir.resolve())
@@ -745,26 +794,40 @@ def _sync_project_from_blob(project_id: str) -> None:
         elif count > 0:
             logger.info("Blob sync download updated %s: %s files -> %s", project_id, count, local_dir.resolve())
     except Exception as exc:
-        logger.warning("Blob download failed for %s: %s", project_id, exc)
-        _append_project_log(project_id, "blob_download_failed", error=str(exc))
+        _report_blob_error("Blob download failed", exc, project_id=project_id)
+        _append_project_log(project_id, "blob_download_failed", error=f"{type(exc).__name__}: {exc}")
 
 
 def _sync_project_to_blob(project_id: str) -> None:
     if not BLOB_WORKSPACE:
         return
     local_dir = _project_generated_dir(project_id)
+    workspace_dir = REPO_ROOT / "workspace"
     try:
-        count = BLOB_WORKSPACE.upload_project(project_id, str(local_dir))
+        count = 0
+        # Source-of-truth runtime layout in Azure.
+        if workspace_dir.exists():
+            count += BLOB_WORKSPACE.upload_project(
+                project_id,
+                str(workspace_dir),
+                remote_prefix="runtime/workspace",
+            )
+
+        # Optional legacy mirror path (disabled by default to avoid recursive nesting).
+        if _ENABLE_LEGACY_BLOB_PROJECT_SYNC and _ENABLE_LOCAL_FILE_GENERATION and local_dir.exists():
+            count += BLOB_WORKSPACE.upload_project(project_id, str(local_dir))
+
         logger.info("Blob sync upload complete for %s: %s files <- %s", project_id, count, local_dir.resolve())
         _append_project_log(
             project_id,
             "blob_upload",
             file_count=count,
             local_path=str(local_dir.resolve()),
+            source_of_truth_prefixes=["runtime/workspace"],
         )
     except Exception as exc:
-        logger.warning("Blob upload failed for %s: %s", project_id, exc)
-        _append_project_log(project_id, "blob_upload_failed", error=str(exc))
+        _report_blob_error("Blob upload failed", exc, project_id=project_id)
+        _append_project_log(project_id, "blob_upload_failed", error=f"{type(exc).__name__}: {exc}")
 
 
 def _resolve_orchestrator_main_path() -> Path:
@@ -801,29 +864,77 @@ def _load_orchestrator_module():
 
 
 def _snapshot_generated_output_for_project(project_id: str) -> None:
-    """Copy generated_code outputs into project-scoped folder for preview/blob sync."""
-    source_root = Path(__file__).resolve().parent / "generated_code"
+    """Copy generated outputs into project-scoped local reference folder."""
+    if not _ENABLE_LOCAL_FILE_GENERATION:
+        return
+
     project_root = _project_generated_dir(project_id)
     project_root.mkdir(parents=True, exist_ok=True)
 
-    if not source_root.exists():
-        return
+    # Cleanup stale recursive folders created by older sync logic.
+    # We only remove known problematic roots under the project folder.
+    for stale in [project_root / "runtime", project_root / "generated_code"]:
+        try:
+            if stale.exists() and stale.is_dir():
+                shutil.rmtree(stale)
+        except Exception as exc:
+            logger.warning("Could not remove stale recursive folder %s: %s", stale, exc)
 
-    for child in source_root.iterdir():
-        # avoid recursive nesting of project snapshots
-        if child.name == project_id:
-            continue
-        target = project_root / child.name
-        if child.is_dir():
-            if target.exists():
-                shutil.rmtree(target)
-            shutil.copytree(child, target)
-        elif child.is_file():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(child, target)
-    
-    # Upload snapshotted files to Azure Storage
-    asyncio.create_task(_upload_project_to_azure(project_id))
+    # Upload is intentionally performed via _sync_project_to_blob() so the
+    # configured BlobWorkspace path remains the single write mechanism.
+
+
+def _blob_autosync_enabled() -> bool:
+    return bool(BLOB_WORKSPACE) and bool(_BLOB_AUTOSYNC_ENABLED)
+
+
+async def _project_blob_autosync_worker(project_id: str) -> None:
+    _append_project_log(
+        project_id,
+        "blob_autosync_started",
+        interval_seconds=_BLOB_AUTOSYNC_INTERVAL_SECONDS,
+    )
+    try:
+        while True:
+            project = store.get(project_id)
+            if not project:
+                break
+
+            status = str(project.get("status") or "")
+            if status not in _ACTIVE_PROJECT_STATES_FOR_AUTOSYNC:
+                break
+
+            try:
+                _snapshot_generated_output_for_project(project_id)
+                _sync_project_to_blob(project_id)
+            except Exception as exc:
+                _report_blob_error("Blob autosync iteration failed", exc, project_id=project_id)
+
+            await asyncio.sleep(_BLOB_AUTOSYNC_INTERVAL_SECONDS)
+    except asyncio.CancelledError:
+        _append_project_log(project_id, "blob_autosync_cancelled")
+        raise
+    except Exception as exc:
+        _report_blob_error("Blob autosync worker failed", exc, project_id=project_id)
+    finally:
+        _PROJECT_BLOB_AUTOSYNC_TASKS.pop(project_id, None)
+        _append_project_log(project_id, "blob_autosync_stopped")
+
+
+def _start_project_blob_autosync(project_id: str) -> None:
+    if not _blob_autosync_enabled():
+        return
+    existing = _PROJECT_BLOB_AUTOSYNC_TASKS.get(project_id)
+    if existing and not existing.done():
+        return
+    _PROJECT_BLOB_AUTOSYNC_TASKS[project_id] = asyncio.create_task(_project_blob_autosync_worker(project_id))
+
+
+def _stop_project_blob_autosync(project_id: str) -> None:
+    task = _PROJECT_BLOB_AUTOSYNC_TASKS.get(project_id)
+    if not task or task.done():
+        return
+    task.cancel()
 
 
 def _deep_merge_dict(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
@@ -1062,6 +1173,11 @@ async def _invoke_real_orchestrator(project_id: str, project_data: Dict[str, Any
     )
 
     try:
+        prev_active_project_id = os.getenv("NEXUS_ACTIVE_PROJECT_ID")
+        prev_workspace_root = os.getenv("NEXUS_WORKSPACE_ROOT")
+        os.environ["NEXUS_ACTIVE_PROJECT_ID"] = str(project_id)
+        os.environ["NEXUS_WORKSPACE_ROOT"] = str((REPO_ROOT / "workspace").resolve())
+
         # Step 0: Read project specifications file if it exists
         project_specs = _read_project_specs_file(project_id)
         if project_specs:
@@ -1253,6 +1369,16 @@ async def _invoke_real_orchestrator(project_id: str, project_data: Dict[str, Any
         logger.exception("Orchestration failed for %s: %s", project_id, exc)
         _append_project_log(project_id, "orchestration_failed", error=str(exc)[:500])
         raise RuntimeError(f"Orchestration pipeline failed: {exc}")
+    finally:
+        if prev_active_project_id is None:
+            os.environ.pop("NEXUS_ACTIVE_PROJECT_ID", None)
+        else:
+            os.environ["NEXUS_ACTIVE_PROJECT_ID"] = prev_active_project_id
+
+        if prev_workspace_root is None:
+            os.environ.pop("NEXUS_WORKSPACE_ROOT", None)
+        else:
+            os.environ["NEXUS_WORKSPACE_ROOT"] = prev_workspace_root
 
 
 # ------------------------------
@@ -1263,8 +1389,10 @@ async def _simulate_generation(project_id: str) -> None:
     """Background worker to run real orchestrator generation."""
     try:
         store.update(project_id, status=ProjectStatus.GENERATING_CODE, progress=10)
+        _start_project_blob_autosync(project_id)
         project_dir = _project_generated_dir(project_id)
         project_dir.mkdir(parents=True, exist_ok=True)
+        _sync_project_from_blob(project_id)
         logger.info("Generation started for %s; local output dir: %s", project_id, project_dir.resolve())
         _append_project_log(
             project_id,
@@ -1319,11 +1447,20 @@ async def _simulate_generation(project_id: str) -> None:
         logger.exception("Generation failed for %s", project_id)
         store.update(project_id, status=ProjectStatus.FAILED, progress=0, error=str(exc))
         _append_project_log(project_id, "generation_failed", error=str(exc))
+    finally:
+        _stop_project_blob_autosync(project_id)
 
 
 async def _simulate_deployment(project_id: str, request: DeploymentRequest) -> None:
+    prev_active_project_id = os.getenv("NEXUS_ACTIVE_PROJECT_ID")
+    prev_workspace_root = os.getenv("NEXUS_WORKSPACE_ROOT")
     try:
+        os.environ["NEXUS_ACTIVE_PROJECT_ID"] = str(project_id)
+        os.environ["NEXUS_WORKSPACE_ROOT"] = str((REPO_ROOT / "workspace").resolve())
+
         store.update(project_id, status=ProjectStatus.GENERATING_DEPLOYMENT, progress=60)
+        _start_project_blob_autosync(project_id)
+        _sync_project_from_blob(project_id)
         _append_project_log(
             project_id,
             "deployment_started",
@@ -1403,6 +1540,17 @@ async def _simulate_deployment(project_id: str, request: DeploymentRequest) -> N
         logger.exception("Deployment failed for %s", project_id)
         store.update(project_id, status=ProjectStatus.COMPLETED, error=str(exc))
         _append_project_log(project_id, "deployment_failed_exception", error=str(exc))
+    finally:
+        _stop_project_blob_autosync(project_id)
+        if prev_active_project_id is None:
+            os.environ.pop("NEXUS_ACTIVE_PROJECT_ID", None)
+        else:
+            os.environ["NEXUS_ACTIVE_PROJECT_ID"] = prev_active_project_id
+
+        if prev_workspace_root is None:
+            os.environ.pop("NEXUS_WORKSPACE_ROOT", None)
+        else:
+            os.environ["NEXUS_WORKSPACE_ROOT"] = prev_workspace_root
 
 def _read_project_specs_file(project_id: str) -> Optional[str]:
     """Read the project specifications file if it exists."""
@@ -1630,8 +1778,11 @@ async def get_project_storage(project_id: str):
         },
         "blob_storage": {
             "enabled": bool(BLOB_WORKSPACE),
-            "container": (os.getenv("AZURE_STORAGE_CONTAINER") or "workspace"),
+            "container": _AZURE_STORAGE_CONTAINER,
             "prefix": f"{project_id}/",
+            "source_of_truth_prefixes": [
+                f"{project_id}/runtime/workspace/",
+            ],
         },
         "project_log": str(_project_log_file(project_id).resolve()),
     }
@@ -1846,6 +1997,16 @@ async def generate_project_ingestion_context(
     }
     project["updated_at"] = datetime.utcnow().isoformat()
     store._save()
+    _append_project_log(
+        project_id,
+        "ingestion_context_generated",
+        file_count=len(context.get("file_results") or []),
+        has_canvas=bool(context.get("canvas_result")),
+        persisted_files=context.get("persisted_files") or {},
+    )
+
+    # Ensure ingestion outputs are pushed to blob storage immediately.
+    _sync_project_to_blob(project_id)
 
     return context
 
@@ -2201,8 +2362,12 @@ async def question_endpoint(request: QuestionRequest):
     Conducts natural conversation to gather project specifications.
     Updates project specification file iteratively.
     """
+    prev_active_project_id = os.getenv("NEXUS_ACTIVE_PROJECT_ID")
+    prev_workspace_root = os.getenv("NEXUS_WORKSPACE_ROOT")
     try:
         from questioning_agent import QuestioningAgent
+        os.environ["NEXUS_ACTIVE_PROJECT_ID"] = str(request.project_id)
+        os.environ["NEXUS_WORKSPACE_ROOT"] = str((REPO_ROOT / "workspace").resolve())
         
         project = store.get(request.project_id)
         current_question_count = request.question_count or 0
@@ -2260,13 +2425,27 @@ async def question_endpoint(request: QuestionRequest):
             "project_id": request.project_id,
             "error": str(exc)
         }
+    finally:
+        if prev_active_project_id is None:
+            os.environ.pop("NEXUS_ACTIVE_PROJECT_ID", None)
+        else:
+            os.environ["NEXUS_ACTIVE_PROJECT_ID"] = prev_active_project_id
+
+        if prev_workspace_root is None:
+            os.environ.pop("NEXUS_WORKSPACE_ROOT", None)
+        else:
+            os.environ["NEXUS_WORKSPACE_ROOT"] = prev_workspace_root
 
 
 @app.post("/question-readiness", tags=["QuestioningAgent"])
 async def question_readiness_endpoint(request: QuestionReadinessRequest):
     """Check if project specifications are complete and ready for execution."""
+    prev_active_project_id = os.getenv("NEXUS_ACTIVE_PROJECT_ID")
+    prev_workspace_root = os.getenv("NEXUS_WORKSPACE_ROOT")
     try:
         from questioning_agent import QuestioningAgent
+        os.environ["NEXUS_ACTIVE_PROJECT_ID"] = str(request.project_id)
+        os.environ["NEXUS_WORKSPACE_ROOT"] = str((REPO_ROOT / "workspace").resolve())
         
         project = store.get(request.project_id)
         if not project:
@@ -2282,11 +2461,11 @@ async def question_readiness_endpoint(request: QuestionReadinessRequest):
         readiness = agent.suggest_execution(request.project_id, [])
         
         return {
-            "is_ready": readiness["is_ready"],
-            "completeness": readiness["completeness"],
-            "message": readiness["message"],
-            "missing_areas": readiness["missing_areas"],
-            "full_spec_path": readiness["full_spec_path"],
+            "is_ready": bool(readiness.get("is_ready", False)),
+            "completeness": int(readiness.get("completeness", 0)),
+            "message": readiness.get("message") or "Readiness assessed.",
+            "missing_areas": readiness.get("missing_areas") or [],
+            "full_spec_path": readiness.get("full_spec_path") or "",
             "project_id": request.project_id
         }
     except Exception as exc:
@@ -2298,6 +2477,16 @@ async def question_readiness_endpoint(request: QuestionReadinessRequest):
             "project_id": request.project_id,
             "error": str(exc)
         }
+    finally:
+        if prev_active_project_id is None:
+            os.environ.pop("NEXUS_ACTIVE_PROJECT_ID", None)
+        else:
+            os.environ["NEXUS_ACTIVE_PROJECT_ID"] = prev_active_project_id
+
+        if prev_workspace_root is None:
+            os.environ.pop("NEXUS_WORKSPACE_ROOT", None)
+        else:
+            os.environ["NEXUS_WORKSPACE_ROOT"] = prev_workspace_root
 
 
 @app.post("/execute-from-specs", tags=["QuestioningAgent"])
@@ -2636,6 +2825,21 @@ async def general_exception_handler(_request, _exc: Exception):
 @app.on_event("startup")
 async def startup_event():
     logger.info("🚀 Nexus platform-compatible backend starting")
+    logger.info(
+        "Azure Blob config | conn_configured=%s container=%s blob_workspace_enabled=%s enable_local_file_generation=%s legacy_project_sync=%s autosync_enabled=%s autosync_interval_seconds=%s",
+        bool(_AZURE_STORAGE_CONN_STR),
+        _AZURE_STORAGE_CONTAINER,
+        bool(BLOB_WORKSPACE),
+        _ENABLE_LOCAL_FILE_GENERATION,
+        _ENABLE_LEGACY_BLOB_PROJECT_SYNC,
+        _BLOB_AUTOSYNC_ENABLED,
+        _BLOB_AUTOSYNC_INTERVAL_SECONDS,
+    )
+    if _ENABLE_LOCAL_FILE_GENERATION:
+        logger.warning(
+            "ENABLE_LOCAL_FILE_GENERATION=true. Direct upload helpers (_upload_*_to_azure) are skipped by design. "
+            "Blob sync via BLOB_WORKSPACE is still used where wired."
+        )
 
     cosmos_connection = (os.getenv("COSMOS_CONNECTION_STR") or "").strip()
     persist_code_to_db = str(os.getenv("PERSIST_CODE_TO_DB", "false")).strip().lower() in {"1", "true", "yes", "on"}

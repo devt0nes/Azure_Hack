@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Tuple, Any
 
 from openai import AzureOpenAI
 from dotenv import load_dotenv
+from azure_runtime_sync import download_blob_to_local_path, write_text_azure_first
 
 load_dotenv()
 
@@ -81,6 +82,7 @@ class QuestioningAgent:
     def _load_spec_file(self, project_id: str) -> str:
         """Load existing specification file if it exists."""
         spec_path = self._get_spec_file_path(project_id)
+        download_blob_to_local_path(spec_path)
         if os.path.exists(spec_path):
             with open(spec_path, 'r', encoding='utf-8') as f:
                 return f.read()
@@ -89,8 +91,9 @@ class QuestioningAgent:
     def _save_spec_file(self, project_id: str, content: str) -> None:
         """Save the specification file."""
         spec_path = self._get_spec_file_path(project_id)
-        with open(spec_path, 'w', encoding='utf-8') as f:
-            f.write(content)
+        ok, detail = write_text_azure_first(spec_path, content)
+        if not ok:
+            raise RuntimeError(f"Failed to save project specs (azure-first): {detail}")
 
     def get_response(
         self,
@@ -409,8 +412,10 @@ Keep it concise but comprehensive."""
         if not existing_specs:
             return {
                 "is_ready": False,
+                "completeness": 0,
                 "message": "Let's gather some specifications first! Tell me about your project.",
-                "missing_areas": ["Project vision", "Core features", "Technical requirements"]
+                "missing_areas": ["Project vision", "Core features", "Technical requirements"],
+                "full_spec_path": self._get_spec_file_path(project_id),
             }
         
         readiness_prompt = [

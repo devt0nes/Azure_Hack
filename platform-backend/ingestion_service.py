@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from openai import AzureOpenAI
+from azure_runtime_sync import write_text_azure_first
 
 
 def _safe_json_loads(value: str) -> Optional[Dict[str, Any]]:
@@ -492,8 +493,12 @@ def build_ingestion_context(
     latest_file = out_dir / "ingestion_context_latest.json"
     versioned_file = out_dir / f"ingestion_context_{ts}.json"
     content = json.dumps(context, indent=2, ensure_ascii=False)
-    latest_file.write_text(content, encoding="utf-8")
-    versioned_file.write_text(content, encoding="utf-8")
+    ok_latest, err_latest = write_text_azure_first(str(latest_file), content)
+    if not ok_latest:
+        raise RuntimeError(f"Failed to persist ingestion latest context (azure-first): {err_latest}")
+    ok_versioned, err_versioned = write_text_azure_first(str(versioned_file), content)
+    if not ok_versioned:
+        raise RuntimeError(f"Failed to persist ingestion versioned context (azure-first): {err_versioned}")
 
     context["persisted_files"] = {
         "latest": str(latest_file),

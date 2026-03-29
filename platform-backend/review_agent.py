@@ -14,6 +14,7 @@ import subprocess
 from typing import Dict, List
 
 from issues_tracker import get_issues_tracker
+from azure_runtime_sync import write_text_azure_first
 
 
 def _detect_repo_root() -> str:
@@ -400,8 +401,9 @@ class ReviewAgent:
                 ""
             ])
 
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+        ok, detail = write_text_azure_first(report_path, "\n".join(lines))
+        if not ok:
+            raise RuntimeError(f"Failed to write review report (azure-first): {detail}")
 
     def _run_checked(self, args: List[str], cwd: str) -> Dict:
         """Run a command safely (no shell) and return status/output."""

@@ -13,6 +13,7 @@ import os
 from datetime import datetime
 from typing import List, Dict, Optional
 import threading
+from azure_runtime_sync import download_blob_to_local_path, write_text_azure_first
 
 
 
@@ -72,8 +73,20 @@ class IssuesTracker:
         """Create issues file if it doesn't exist"""
         os.makedirs(os.path.dirname(self.file_path) or ".", exist_ok=True)
         if not os.path.exists(self.file_path):
-            with open(self.file_path, "w") as f:
-                json.dump({"issues": [], "resolved": []}, f, indent=2)
+            ok, detail = write_text_azure_first(self.file_path, json.dumps({"issues": [], "resolved": []}, indent=2))
+            if not ok:
+                raise RuntimeError(f"Failed to initialize issues file (azure-first): {detail}")
+
+    def _read_state(self) -> Dict:
+        # Azure-first hydration for source-of-truth issue state.
+        download_blob_to_local_path(self.file_path)
+        with open(self.file_path, "r", encoding="utf-8", errors="ignore") as f:
+            return json.load(f)
+
+    def _write_state(self, data: Dict) -> None:
+        ok, detail = write_text_azure_first(self.file_path, json.dumps(data, indent=2))
+        if not ok:
+            raise RuntimeError(f"Failed to persist issues file (azure-first): {detail}")
     
     def report_issue(self, 
                      component: str, 
@@ -99,8 +112,7 @@ class IssuesTracker:
             Issue object with ID and timestamp
         """
         with self.lock:
-            with open(self.file_path, "r") as f:
-                data = json.load(f)
+            data = self._read_state()
             
             issue_id = len(data["issues"]) + len(data["resolved"]) + 1
             normalized_assignee = _normalize_assigned_role(assigned_to)
@@ -121,8 +133,7 @@ class IssuesTracker:
             
             data["issues"].append(issue)
             
-            with open(self.file_path, "w") as f:
-                json.dump(data, f, indent=2)
+            self._write_state(data)
             
             return issue
     
@@ -140,8 +151,7 @@ class IssuesTracker:
             List of open issues
         """
         with self.lock:
-            with open(self.file_path, "r") as f:
-                data = json.load(f)
+            data = self._read_state()
         
         issues = data.get("issues", [])
         
@@ -157,8 +167,7 @@ class IssuesTracker:
     def get_blocking_issues(self, agent_role: str) -> List[Dict]:
         """Get issues that are blocking a specific agent"""
         with self.lock:
-            with open(self.file_path, "r") as f:
-                data = json.load(f)
+            data = self._read_state()
         
         # Issues reported BY this agent are blocking them until resolved
         blocking = [i for i in data.get("issues", []) if i["reported_by"] == agent_role]
@@ -176,8 +185,7 @@ class IssuesTracker:
             Resolved issue object
         """
         with self.lock:
-            with open(self.file_path, "r") as f:
-                data = json.load(f)
+            data = self._read_state()
             
             # Find and mark as resolved
             issue = None
@@ -191,16 +199,14 @@ class IssuesTracker:
                     data["issues"].remove(i)
                     break
             
-            with open(self.file_path, "w") as f:
-                json.dump(data, f, indent=2)
+            self._write_state(data)
             
             return issue
     
     def clear(self):
         """Clear all issues"""
         with self.lock:
-            with open(self.file_path, "w") as f:
-                json.dump({"issues": [], "resolved": []}, f, indent=2)
+            self._write_state({"issues": [], "resolved": []})
     
     def print_issues(self):
         """Print all open issues"""

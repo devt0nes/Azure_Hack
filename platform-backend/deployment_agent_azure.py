@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
+from azure_runtime_sync import write_text_azure_first
 
 
 @dataclass
@@ -58,12 +59,17 @@ class AzureDeploymentAgent:
             "deploy_to_azure": self.deploy_to_azure,
         }
 
+    def _write_text(self, path: Path, content: str) -> None:
+        ok, detail = write_text_azure_first(str(path), content)
+        if not ok:
+            raise RuntimeError(f"Azure-first write failed for {path}: {detail}")
+
     def run(self) -> Path:
         self.generate_artifacts()
         self.create_mock_secrets()
         checks = self._run_local_checks()
         self.output_file.parent.mkdir(parents=True, exist_ok=True)
-        self.output_file.write_text(self._render_markdown(checks), encoding="utf-8")
+        self._write_text(self.output_file, self._render_markdown(checks))
         return self.output_file
 
     def run_tool(self, tool_name: str, **kwargs) -> DeploymentResult:
@@ -82,7 +88,8 @@ class AzureDeploymentAgent:
         self.backend_dir.mkdir(parents=True, exist_ok=True)
         self.frontend_dir.mkdir(parents=True, exist_ok=True)
 
-        self.backend_dockerfile.write_text(
+        self._write_text(
+            self.backend_dockerfile,
             """FROM node:18-alpine
 WORKDIR /app
 COPY package*.json ./
@@ -91,10 +98,10 @@ COPY . .
 EXPOSE 5000
 CMD [\"npm\", \"start\"]
 """,
-            encoding="utf-8",
         )
 
-        self.frontend_nginx_conf.write_text(
+        self._write_text(
+            self.frontend_nginx_conf,
             """server {
   listen 80;
   server_name _;
@@ -103,10 +110,10 @@ CMD [\"npm\", \"start\"]
   location / { try_files $uri /index.html; }
 }
 """,
-            encoding="utf-8",
         )
 
-        self.frontend_dockerfile.write_text(
+        self._write_text(
+            self.frontend_dockerfile,
             """FROM node:18-alpine AS build
 WORKDIR /app
 COPY package*.json ./
@@ -120,10 +127,10 @@ COPY --from=build /app/build /usr/share/nginx/html
 EXPOSE 80
 CMD [\"nginx\", \"-g\", \"daemon off;\"]
 """,
-            encoding="utf-8",
         )
 
-        self.bicep_file.write_text(
+        self._write_text(
+            self.bicep_file,
             """param location string = resourceGroup().location
 param projectName string
 param logAnalyticsName string = '${projectName}-law'
@@ -154,10 +161,10 @@ resource containerAppEnv 'Microsoft.App/managedEnvironments@2023-05-01' = {
 
 output containerAppEnvironmentId string = containerAppEnv.id
 """,
-            encoding="utf-8",
         )
 
-        self.bicep_params.write_text(
+        self._write_text(
+            self.bicep_params,
             json.dumps(
                 {
                     "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
@@ -169,7 +176,6 @@ output containerAppEnvironmentId string = containerAppEnv.id
                 indent=2,
             )
             + "\n",
-            encoding="utf-8",
         )
 
     def create_mock_secrets(self) -> Path:
@@ -185,7 +191,7 @@ output containerAppEnvironmentId string = containerAppEnv.id
             "DB_PORT": "5432",
             "DB_NAME": "mockdb",
         }
-        self.mock_env.write_text("\n".join([f"{k}={v}" for k, v in mock_values.items()]) + "\n", encoding="utf-8")
+        self._write_text(self.mock_env, "\n".join([f"{k}={v}" for k, v in mock_values.items()]) + "\n")
         return self.mock_env
 
     def deploy_to_azure(
@@ -388,7 +394,7 @@ output containerAppEnvironmentId string = containerAppEnv.id
             "message": result.message,
             "details": result.details,
         }
-        self.deploy_result.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        self._write_text(self.deploy_result, json.dumps(payload, indent=2) + "\n")
 
     def _run_local_checks(self) -> List[CheckResult]:
         backend_pkg = self.backend_dir / "package.json"

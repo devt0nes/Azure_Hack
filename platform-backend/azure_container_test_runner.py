@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 from typing import Any, Dict, List, Optional
@@ -297,26 +298,24 @@ class AzureContainerTestRunner:
         }
         
         try:
-            # Look for pytest summary line
-            for line in logs.split('\n'):
-                if "passed" in line or "failed" in line:
-                    # Extract numbers from pytest summary
-                    if "passed" in line:
-                        parts = line.split()
-                        for i, part in enumerate(parts):
-                            if "passed" in part and i > 0:
-                                try:
-                                    summary["passed"] = int(parts[i-1])
-                                except:
-                                    pass
-                    if "failed" in line:
-                        parts = line.split()
-                        for i, part in enumerate(parts):
-                            if "failed" in part and i > 0:
-                                try:
-                                    summary["failed"] = int(parts[i-1])
-                                except:
-                                    pass
+            candidates = [line.strip() for line in logs.split("\n") if line.strip()]
+            # Prefer the last pytest summary-like line if multiple are present.
+            summary_line = ""
+            for line in candidates:
+                if any(token in line for token in [" passed", " failed", " skipped", " error", " errors"]):
+                    summary_line = line
+
+            if summary_line:
+                for key, target in [
+                    ("passed", "passed"),
+                    ("failed", "failed"),
+                    ("skipped", "skipped"),
+                    ("error", "errors"),
+                    ("errors", "errors"),
+                ]:
+                    m = re.search(rf"(\d+)\s+{key}\b", summary_line)
+                    if m:
+                        summary[target] = int(m.group(1))
         except Exception as exc:
             logger.warning("Failed to parse test summary: %s", exc)
         
