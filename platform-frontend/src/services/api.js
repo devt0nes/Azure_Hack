@@ -73,6 +73,7 @@ export const executeFromSpecs = ({
   projectId,
   specPath = null,
   clarificationContext = null,
+  serviceApiKeys = null,
 }) =>
   apiFetch('/execute-from-specs', {
     method: 'POST',
@@ -80,8 +81,12 @@ export const executeFromSpecs = ({
       project_id: projectId,
       spec_path: specPath,
       clarification_context: clarificationContext,
+      service_api_keys: serviceApiKeys,
     }),
   })
+
+export const getProjectApiKeyStatus = ({ projectId }) =>
+  apiFetch(`/api/projects/${projectId}/service-api-keys/status`)
 
 export const deployProject = ({ projectId, mockSuccess = false }) =>
   apiFetch(`/api/projects/${projectId}/deploy`, {
