@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from ingestion_service import build_ingestion_context
 from blob_workspace import build_blob_workspace_from_env
 from cosmos_client import (
     get_cosmos_client,
@@ -56,6 +57,14 @@ def _detect_repo_root() -> Path:
 
 REPO_ROOT = _detect_repo_root()
 
+class ReferenceFileItem(BaseModel):
+	filename: str
+	url: str
+
+
+class IngestionContextRequest(BaseModel):
+	reference_files: List[ReferenceFileItem] = []
+	include_canvas: bool = False
 
 # ------------------------------
 # App + logging
@@ -1809,6 +1818,36 @@ async def list_projects():
             for p in store.projects.values()
         ],
     }
+
+@app.post("/api/projects/{project_id}/ingestion/context", tags=["Ingestion"])
+async def generate_project_ingestion_context(
+    project_id: str,
+    request: IngestionContextRequest,
+):
+    project = store.get(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    context = build_ingestion_context(
+        repo_root=REPO_ROOT,
+        project_id=project_id,
+        reference_files=[item.model_dump() for item in request.reference_files],
+        include_canvas=bool(request.include_canvas),
+        canvas_data=project.get("canvas_data") if request.include_canvas else None,
+    )
+
+    project["ingestion_context"] = {
+        "generated_at": context.get("generated_at"),
+        "combined_summary": context.get("combined_summary"),
+        "task_ledger_seeds": context.get("task_ledger_seeds") or [],
+        "file_count": len(context.get("file_results") or []),
+        "has_canvas": bool(context.get("canvas_result")),
+        "persisted_files": context.get("persisted_files") or {},
+    }
+    project["updated_at"] = datetime.utcnow().isoformat()
+    store._save()
+
+    return context
 
 
 @app.get("/api/preview/{project_id}/{path:path}", tags=["Compatibility"])
