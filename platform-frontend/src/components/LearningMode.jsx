@@ -60,7 +60,11 @@ export default function LearningMode({ projectId }) {
       const tutorMessage = {
         id: `tutor-${Date.now()}`,
         role: 'tutor',
-        content: response.response || 'No response from tutor.',
+        content:
+          `${response.response || 'No response from tutor.'}` +
+          `${Array.isArray(response?.sources) && response.sources.length > 0
+            ? `\n\n**Sources used**\n${response.sources.slice(0, 12).map((s) => `- ${s}`).join('\n')}`
+            : ''}`,
       }
 
       setMessages((prev) => [...prev, tutorMessage])

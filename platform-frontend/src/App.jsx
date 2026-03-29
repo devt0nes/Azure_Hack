@@ -48,6 +48,7 @@ export default function App() {
   const [theme, setTheme] = useState('light')
   const [showMarketplace, setShowMarketplace] = useState(false)
   const [showIdeaCanvas, setShowIdeaCanvas] = useState(false)
+  const [canvasSaveState, setCanvasSaveState] = useState('saved')
   const [selectedAegNodeId, setSelectedAegNodeId] = useState(null)
   const [isSidebarExpanded, setIsSidebarExpanded] = useState(false)
   const [isProjectMenuOpen, setIsProjectMenuOpen] = useState(false)
@@ -481,8 +482,22 @@ export default function App() {
   const openIdeaCanvas = () => {
     setActivePopup(null)
     setShowMarketplace(false)
+    setCanvasSaveState('saved')
     setShowIdeaCanvas(true)
   }
+
+  const canvasSaveLabel =
+    canvasSaveState === 'saving' ? 'Saving…' :
+      canvasSaveState === 'unsaved' ? 'Unsaved changes' :
+        canvasSaveState === 'saved-local' ? 'Saved locally' :
+          canvasSaveState === 'error' ? 'Save failed' : 'Saved'
+
+  const canvasSaveClasses =
+    canvasSaveState === 'saving' ? 'border-amber-500/35 bg-amber-500/12 text-amber-300' :
+      canvasSaveState === 'unsaved' ? 'border-orange-500/35 bg-orange-500/12 text-orange-300' :
+        canvasSaveState === 'saved-local' ? 'border-sky-500/35 bg-sky-500/12 text-sky-300' :
+          canvasSaveState === 'error' ? 'border-red-500/40 bg-red-500/12 text-red-300' :
+            'border-emerald-500/35 bg-emerald-500/12 text-emerald-300'
 
   const togglePreviewPane = () => {
     setHiddenPane((prev) => (prev === 'preview' ? 'none' : 'preview'))
@@ -672,7 +687,7 @@ export default function App() {
                     {selectedAegNodeId && (
                       <span className="inline-flex items-center gap-1.5 rounded-full border border-primary/25 bg-primary/8 px-2.5 py-1">
                         <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
-                        <span className="mono font-semibold text-primary text-[11px]">Node: {selectedAegNodeId}</span>
+                        <span className="mono font-semibold text-primary text-[11px]">Layer: {selectedAegNodeId}</span>
                       </span>
                     )}
                   </div>
@@ -906,15 +921,29 @@ export default function App() {
               <p className="mono text-[11px] uppercase tracking-[0.25em] text-primary/80">Director Workspace</p>
               <h2 className="text-lg font-bold text-foreground">Idea Canvas</h2>
             </div>
-            <button
-              onClick={() => setShowIdeaCanvas(false)}
-              className="rounded-xl border border-border bg-card px-3 py-2 text-sm font-semibold text-foreground transition hover:border-foreground/30 hover:bg-accent"
-            >
-              Close Canvas
-            </button>
+            <div className="flex items-center gap-3">
+              <span className={`inline-flex items-center rounded-lg border px-2.5 py-1 text-xs font-semibold ${canvasSaveClasses}`}>
+                {canvasSaveLabel}
+              </span>
+              <button
+                onClick={() => setShowIdeaCanvas(false)}
+                className="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-red-500/45 bg-red-500/12 text-red-300 transition hover:bg-red-500/20"
+                title="Close Canvas"
+                aria-label="Close Canvas"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M18 6L6 18" />
+                  <path d="M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
           </div>
           <div className="min-h-0 flex-1 pt-3">
-            <IdeaCanvas projectId={currentProjectId} isFullscreen />
+            <IdeaCanvas
+              projectId={currentProjectId}
+              isFullscreen
+              onSaveStatusChange={setCanvasSaveState}
+            />
           </div>
         </div>
       )}

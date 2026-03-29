@@ -19,7 +19,7 @@ import os
 import re
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -28,6 +28,107 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+
+
+def normalize_acr_registry(registry: str) -> str:
+    """Normalize registry value to an ACR login server host.
+
+    Accepts values such as:
+      - "nipunregistry" -> "nipunregistry.azurecr.io"
+      - "nipunregistry.azurecr.io" -> unchanged
+      - "https://nipunregistry.azurecr.io" -> "nipunregistry.azurecr.io"
+    """
+    value = str(registry or "").strip()
+    if not value:
+        return ""
+
+    value = re.sub(r"^https?://", "", value, flags=re.IGNORECASE).strip("/")
+    if "/" in value:
+        value = value.split("/", 1)[0]
+    if "." not in value:
+        value = f"{value}.azurecr.io"
+    return value
+
+
+def build_container_image_ref(registry: str, repository: str, tag: str = "latest") -> str:
+    """Build full container image reference from registry/repository/tag."""
+    host = normalize_acr_registry(registry)
+    repo = str(repository or "").strip().strip("/")
+    if not repo:
+        raise ValueError("Container repository/name is required")
+
+    image_tag = str(tag or "latest").strip() or "latest"
+    if ":" in repo and "/" in repo and (not tag or tag == "latest"):
+        # Already full image reference with explicit tag
+        return repo
+    if host:
+        return f"{host}/{repo}:{image_tag}"
+    return f"{repo}:{image_tag}"
+
+
+def sanitize_aci_name(name: str, fallback_prefix: str = "nexus-smoke") -> str:
+    """Return an Azure Container Instance compliant name."""
+    value = str(name or "").strip().lower()
+    value = re.sub(r"[^a-z0-9-]", "-", value)
+    value = re.sub(r"-+", "-", value).strip("-")
+
+    if not value:
+        fallback = re.sub(r"[^a-z0-9-]", "-", str(fallback_prefix or "nexus-smoke").lower())
+        fallback = re.sub(r"-+", "-", fallback).strip("-") or "nexus-smoke"
+        value = f"{fallback}-{int(time.time())}"
+
+    value = value[:63]
+    value = value.strip("-")
+
+    if not value:
+        value = "nexus-smoke"
+    if not value[0].isalnum():
+        value = f"n{value}"
+    if not value[-1].isalnum():
+        value = value.rstrip("-")
+        if not value:
+            value = "nexus-smoke"
+
+    value = re.sub(r"[^a-z0-9-]", "-", value)
+    value = re.sub(r"-+", "-", value).strip("-")
+    return (value or "nexus-smoke")[:63]
+
+
+def fetch_acr_credentials_from_cli(registry_name: str) -> Optional[Tuple[str, str]]:
+    """Try to fetch ACR credentials from Azure CLI (az acr credential show).
+
+    Args:
+        registry_name: ACR registry name (e.g., "nipunregistry")
+
+    Returns:
+        Tuple of (username, password) or None if not found/failed.
+    """
+    try:
+        import subprocess as sp
+        registry = str(registry_name or "").strip()
+        if not registry:
+            return None
+
+        result = sp.run(
+            ["az", "acr", "credential", "show", "-n", registry, "-o", "json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            logger.warning("az acr credential show failed for %s: %s", registry, result.stderr[:200])
+            return None
+
+        creds = json.loads(result.stdout)
+        username = str(creds.get("username") or "").strip()
+        password = str(creds.get("passwords", [{}])[0].get("value") or "").strip()
+
+        if username and password:
+            logger.info("Auto-fetched ACR credentials from Azure CLI for %s", registry)
+            return (username, password)
+    except Exception as exc:
+        logger.debug("Failed to fetch ACR credentials from CLI: %s", exc)
+    return None
 
 
 class AzureContainerTestRunner:
@@ -98,14 +199,72 @@ class AzureContainerTestRunner:
                 ResourceRequests,
                 ResourceRequirements,
                 EnvironmentVariable,
+                ImageRegistryCredential,
             )
         except ImportError as exc:
-            logger.error("azure-mgmt-containerinstances not installed: %s", exc)
-            return {
-                "success": False,
-                "error": "Required Azure SDK not installed",
-                "container_name": container_name,
-            }
+            ImageRegistryCredential = None  # type: ignore[assignment]
+            try:
+                from azure.mgmt.containerinstance.models import (
+                    ContainerGroup,
+                    Container,
+                    ResourceRequests,
+                    ResourceRequirements,
+                    EnvironmentVariable,
+                )
+            except ImportError:
+                logger.error("azure-mgmt-containerinstances not installed: %s", exc)
+                return {
+                    "success": False,
+                    "error": "Required Azure SDK not installed",
+                    "container_name": container_name,
+                }
+
+        registry_username = (
+            os.getenv("AZURE_CONTAINER_REGISTRY_USERNAME")
+            or os.getenv("AZURE_ACR_USERNAME")
+            or ""
+        ).strip()
+        registry_password = (
+            os.getenv("AZURE_CONTAINER_REGISTRY_PASSWORD")
+            or os.getenv("AZURE_ACR_PASSWORD")
+            or ""
+        ).strip()
+
+        if not registry_username or not registry_password:
+            cli_creds = fetch_acr_credentials_from_cli(self.container_registry)
+            if cli_creds:
+                registry_username, registry_password = cli_creds
+
+        image_registry_credentials = []
+        if ImageRegistryCredential and registry_username and registry_password:
+            image_registry_credentials.append(
+                ImageRegistryCredential(
+                    server=normalize_acr_registry(self.container_registry),
+                    username=registry_username,
+                    password=registry_password,
+                )
+            )
+
+        if not image_registry_credentials and registry_username and not registry_password:
+            logger.warning("ACR username was provided without password; private image pull may fail")
+        if not image_registry_credentials and registry_password and not registry_username:
+            logger.warning("ACR password was provided without username; private image pull may fail")
+        if not image_registry_credentials and not registry_username and not registry_password:
+            logger.warning("No ACR credentials found in env or Azure CLI; image pull may fail for private registries")
+
+        try:
+            from azure.mgmt.containerinstance.models import ContainerGroup as _ContainerGroupClass
+            supports_registry_credentials = "image_registry_credentials" in getattr(_ContainerGroupClass, "__init__", object).__code__.co_varnames  # type: ignore[attr-defined]
+        except Exception:
+            supports_registry_credentials = True
+
+        logger.info("Registry host: %s", normalize_acr_registry(self.container_registry))
+        if image_registry_credentials:
+            logger.info("Using explicit ACR credentials for image pull")
+
+        sanitized_container_name = sanitize_aci_name(container_name)
+        if sanitized_container_name != container_name:
+            logger.info("Sanitized container name: %s -> %s", container_name, sanitized_container_name)
 
         client = self._get_container_client()
         
@@ -138,7 +297,7 @@ class AzureContainerTestRunner:
         # Create container specification
         # Increase resources for faster test execution
         container = Container(
-            name=container_name,
+            name=sanitized_container_name,
             image=self.container_image,
             command=test_command,
             resources=ResourceRequirements(
@@ -148,14 +307,18 @@ class AzureContainerTestRunner:
         )
         
         # Create container group
-        container_group = ContainerGroup(
-            location="eastus",
-            containers=[container],
-            os_type="Linux",
-            restart_policy="Never",
-        )
+        container_group_kwargs = {
+            "location": "eastus",
+            "containers": [container],
+            "os_type": "Linux",
+            "restart_policy": "Never",
+        }
+        if image_registry_credentials and supports_registry_credentials:
+            container_group_kwargs["image_registry_credentials"] = image_registry_credentials
+
+        container_group = ContainerGroup(**container_group_kwargs)
         
-        logger.info("Creating container: %s", container_name)
+        logger.info("Creating container: %s", sanitized_container_name)
         logger.info("Image: %s", self.container_image)
         logger.info("Timeout: %d seconds", self.timeout_seconds)
         
@@ -164,32 +327,32 @@ class AzureContainerTestRunner:
             if hasattr(client.container_groups, "begin_create_or_update"):
                 poller = client.container_groups.begin_create_or_update(
                     self.resource_group,
-                    container_name,
+                    sanitized_container_name,
                     container_group,
                 )
                 poller.result()
             else:
                 client.container_groups.create_or_update(
                     self.resource_group,
-                    container_name,
+                    sanitized_container_name,
                     container_group,
                 )
             
             # Wait for container to complete
             result = await self._wait_for_completion(
-                client, container_name, self.timeout_seconds
+                client, sanitized_container_name, self.timeout_seconds
             )
             
             # Always cleanup
-            logger.info("Deleting container: %s", container_name)
+            logger.info("Deleting container: %s", sanitized_container_name)
             try:
                 if hasattr(client.container_groups, "begin_delete"):
                     delete_poller = client.container_groups.begin_delete(
-                        self.resource_group, container_name
+                        self.resource_group, sanitized_container_name
                     )
                     delete_poller.result()
                 else:
-                    client.container_groups.delete(self.resource_group, container_name)
+                    client.container_groups.delete(self.resource_group, sanitized_container_name)
             except Exception as cleanup_exc:
                 logger.warning("Failed to delete container: %s", cleanup_exc)
             
@@ -200,18 +363,18 @@ class AzureContainerTestRunner:
             try:
                 if hasattr(client.container_groups, "begin_delete"):
                     delete_poller = client.container_groups.begin_delete(
-                        self.resource_group, container_name
+                        self.resource_group, sanitized_container_name
                     )
                     delete_poller.result()
                 else:
-                    client.container_groups.delete(self.resource_group, container_name)
+                    client.container_groups.delete(self.resource_group, sanitized_container_name)
             except Exception:
                 pass
             
             return {
                 "success": False,
                 "error": str(exc),
-                "container_name": container_name,
+                "container_name": sanitized_container_name,
             }
 
     async def _wait_for_completion(
@@ -280,10 +443,11 @@ class AzureContainerTestRunner:
     def _get_container_logs(self, client: Any, container_name: str) -> str:
         """Retrieve container logs."""
         try:
-            logs = client.container_logs.list(
+            # Use the correct Azure SDK method for logs
+            logs = client.container.list_logs(
                 self.resource_group, container_name, container_name
             )
-            return logs.logs if logs.logs else ""
+            return logs.logs if hasattr(logs, 'logs') and logs.logs else ""
         except Exception as exc:
             logger.warning("Failed to retrieve container logs: %s", exc)
             return ""
@@ -328,17 +492,18 @@ async def main():
 
     # Load configuration from environment
     resource_group = os.getenv("AZURE_RESOURCE_GROUP", "Nipun-Bhattad-RG")
-    container_registry = os.getenv("AZURE_CONTAINER_REGISTRY", "nipunregistry.azurecr.io")
-    container_name = os.getenv("AZURE_CONTAINER_NAME", "nexus-test-runner")
+    container_registry = os.getenv("AZURE_CONTAINER_REGISTRY", "nipunregistry")
+    container_repository = os.getenv("AZURE_CONTAINER_REPOSITORY", os.getenv("AZURE_CONTAINER_NAME", "nexus-test-runner"))
     container_tag = os.getenv("AZURE_CONTAINER_TAG", "latest")
     timeout_seconds = int(os.getenv("AZURE_CONTAINER_INSTANCES_TIMEOUT", "3600"))
-    
-    container_image = f"{container_registry}/{container_name}:{container_tag}"
+
+    container_image = build_container_image_ref(container_registry, container_repository, container_tag)
     
     logger.info("=" * 70)
     logger.info("AZURE CONTAINER TEST RUNNER - ALL TESTS IN SINGLE CONTAINER")
     logger.info("=" * 70)
     logger.info("Resource Group: %s", resource_group)
+    logger.info("Container Repository: %s", container_repository)
     logger.info("Container Image: %s", container_image)
     logger.info("Timeout: %d seconds", timeout_seconds)
     logger.info("=" * 70)

@@ -2,7 +2,7 @@ import types
 
 import pytest
 
-from azure_container_test_runner import AzureContainerTestRunner
+from azure_container_test_runner import AzureContainerTestRunner, sanitize_aci_name
 
 
 class _FakePoller:
@@ -135,3 +135,48 @@ FAILED test_api.py::test_health
     assert summary["failed"] == 2
     assert summary["skipped"] == 3
     assert summary["errors"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_all_tests_sanitizes_invalid_container_name(monkeypatch):
+    _install_fake_aci_models(monkeypatch)
+
+    runner = AzureContainerTestRunner(
+        resource_group="rg-test",
+        container_registry="registry.example.io",
+        container_image="registry.example.io/nexus-tests:latest",
+        timeout_seconds=120,
+    )
+
+    fake_client = _FakeClient()
+    monkeypatch.setattr(runner, "_get_container_client", lambda: fake_client)
+
+    async def _fake_wait_for_completion(client, container_name, timeout_seconds):
+        assert client is fake_client
+        assert container_name == "nexus-smoke-project"
+        assert timeout_seconds == 120
+        return {
+            "success": True,
+            "container_name": container_name,
+            "status": "completed",
+            "duration_seconds": 1,
+            "logs": "",
+            "summary": {},
+        }
+
+    monkeypatch.setattr(runner, "_wait_for_completion", _fake_wait_for_completion)
+
+    requested_name = "nexus-smoke-project-"
+    assert sanitize_aci_name(requested_name) == "nexus-smoke-project"
+
+    result = await runner.run_all_tests(container_name=requested_name, environment_vars={})
+
+    assert result["success"] is True
+    assert len(fake_client.container_groups.created) == 1
+    created_rg, created_name, created_group = fake_client.container_groups.created[0]
+    assert created_rg == "rg-test"
+    assert created_name == "nexus-smoke-project"
+    assert created_group.containers[0].name == "nexus-smoke-project"
+
+    assert len(fake_client.container_groups.deleted) == 1
+    assert fake_client.container_groups.deleted[0] == ("rg-test", "nexus-smoke-project")

@@ -3,6 +3,7 @@ import {
   askQuestion,
   checkQuestionReadiness,
   clarifyWithAnswers,
+  createProject,
   executeFromSpecs,
   getProjectApiKeyStatus,
   getProjectLedger,
@@ -100,6 +101,58 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
   const messagesEndRef = useRef(null)
   const referenceInputRef = useRef(null)
   const previousProjectIdRef = useRef(activeProjectId)
+
+  const pushApiKeyInlineNotice = (services) => {
+    const cleanServices = (services || [])
+      .map((service) => String(service || '').trim())
+      .filter(Boolean)
+
+    if (cleanServices.length === 0) return
+
+    setMessages((prev) => {
+      const hasExistingNotice = prev.some(
+        (msg) =>
+          msg?.id?.startsWith('api-key-inline-notice-') ||
+          String(msg?.content || '').includes('API keys required before execution')
+      )
+
+      if (hasExistingNotice) return prev
+
+      return [
+        ...prev,
+        {
+          id: `api-key-inline-notice-${Date.now()}`,
+          role: 'system',
+          content: `🔐 API keys required before execution for: ${cleanServices.join(', ')}.\nClick the API Keys button to open the popup and continue execution.`,
+        },
+      ]
+    })
+  }
+
+  async function ensureProjectExists(seedIntent = 'Project setup') {
+    const existingProjectId = activeProjectId || projectId
+    if (existingProjectId) return existingProjectId
+
+    const now = new Date()
+    const fallbackName = `Project ${now.toLocaleDateString()} ${now.toLocaleTimeString()}`
+    const created = await createProject({
+      projectName: fallbackName,
+      userIntent: String(seedIntent || 'Project setup').slice(0, 500),
+      description: 'Created automatically for pre-prompt assets/canvas context.',
+    })
+
+    const createdProjectId = created?.project_id || ''
+    if (!createdProjectId) {
+      throw new Error('Unable to create project')
+    }
+
+    setActiveProjectId(createdProjectId)
+    if (onProjectChange) {
+      onProjectChange(createdProjectId)
+    }
+
+    return createdProjectId
+  }
 
   const sortedMessages = useMemo(() => messages, [messages])
 
@@ -244,6 +297,7 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
             })
             return next
           })
+          pushApiKeyInlineNotice(readinessServices)
         } else {
           setRequiredApiKeyServices([])
           setServiceApiKeys({})
@@ -267,6 +321,7 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
               })
               return next
             })
+            pushApiKeyInlineNotice(cleanServices)
           }
 
           try {
@@ -319,18 +374,20 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
     setIsSending(true)
 
     try {
-      const requestProjectId = activeProjectId || projectId || `project-${Date.now()}`
+      const shouldIngest = referenceFiles.length > 0 || includeCanvasContext
+      const requestProjectId = shouldIngest
+        ? await ensureProjectExists(userMessage.content)
+        : (activeProjectId || projectId || `project-${Date.now()}`)
       let payloadInput = userMessage.content
       let legacyCanvasContext = ''
       let legacyFilesBlock = ''
 
-      const canIngest = Boolean(activeProjectId || projectId)
-      const shouldIngest = referenceFiles.length > 0 || includeCanvasContext
+      const canIngest = Boolean(requestProjectId)
 
       if (canIngest && shouldIngest) {
         try {
           const ingestion = await ingestProjectContext({
-            projectId: activeProjectId || projectId,
+            projectId: requestProjectId,
             referenceFiles,
             includeCanvas: includeCanvasContext,
           })
@@ -350,8 +407,8 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
         }
       }
 
-      if (includeCanvasContext && (activeProjectId || projectId)) {
-        const canvasPayload = await loadCanvas({ projectId: activeProjectId || projectId })
+      if (includeCanvasContext && requestProjectId) {
+        const canvasPayload = await loadCanvas({ projectId: requestProjectId })
         const canvasContext = exportCanvasAsContext(canvasPayload?.canvas_data)
         if (canvasContext) {
           legacyCanvasContext = canvasContext
@@ -476,14 +533,9 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
     event.target.value = ''
     if (!file) return
 
-    const targetProjectId = activeProjectId || projectId
-    if (!targetProjectId) {
-      setError('Please send one message first to create/select a project before uploading reference files.')
-      return
-    }
-
     try {
       setError('')
+      const targetProjectId = await ensureProjectExists(`Upload reference file: ${file.name}`)
       const uploaded = await uploadCanvasFile({ projectId: targetProjectId, file })
       setReferenceFiles((prev) => [
         ...prev,
@@ -812,18 +864,18 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
                       </svg>
                       <span className="mono uppercase tracking-[0.12em]">Idea Canvas</span>
                     </button>
-                    {hasApiKeyRequirements ? (
-                      <button
-                        type="button"
-                        onClick={() => setIsApiKeyModalOpen(true)}
-                        className="inline-flex h-10 items-center rounded-full border border-amber-500/55 bg-amber-500/10 px-3 text-xs font-semibold text-amber-700 transition hover:bg-amber-500/20"
-                        title="Open API key popup"
-                        aria-label="Open API key popup"
-                      >
-                        API Keys
-                      </button>
-                    ) : null}
                   </div>
+                  {hasApiKeyRequirements ? (
+                    <button
+                      type="button"
+                      onClick={() => setIsApiKeyModalOpen(true)}
+                      className="inline-flex h-8 items-center rounded-full border border-amber-500/55 bg-amber-500/10 px-3 text-xs font-semibold text-amber-700 transition hover:bg-amber-500/20"
+                      title="Open API key popup"
+                      aria-label="Open API key popup"
+                    >
+                      API Keys
+                    </button>
+                  ) : null}
                 </div>
               </div>
             </div>
@@ -855,26 +907,11 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
             ) : null}
           </form>
 
-          {nextTopics.length > 0 ? (
-            <div className="rounded-lg border border-border bg-card px-4 py-3 text-xs text-foreground/70">
-              Suggested next topics: {nextTopics.join(' • ')}
-            </div>
-          ) : null}
-
           {specPreview ? (
             <details className="rounded-lg border border-border bg-card px-4 py-3 text-xs text-foreground/70">
               <summary className="cursor-pointer select-none">Specification preview ({effectiveCompleteness}%)</summary>
               <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap text-[11px] leading-relaxed">{specPreview}</pre>
             </details>
-          ) : null}
-
-          {specReady && requiredApiKeyServices.length > 0 ? (
-            <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 py-3 text-sm">
-              <p className="font-semibold text-amber-800 mb-2">API keys required before execution</p>
-              <p className="text-amber-700 text-xs mb-3">
-                Click the API Keys button to open the popup and continue execution.
-              </p>
-            </div>
           ) : null}
 
           {questionCount >= 10 ? (

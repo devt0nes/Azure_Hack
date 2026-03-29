@@ -117,13 +117,16 @@ CMD [\"npm\", \"start\"]
             """FROM node:18-alpine AS build
 WORKDIR /app
 COPY package*.json ./
-RUN npm install
+RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
 COPY . .
 RUN npm run build
+RUN if [ -d /app/dist ]; then cp -r /app/dist /tmp/static; \\
+    elif [ -d /app/build ]; then cp -r /app/build /tmp/static; \\
+    else echo 'No frontend build output found (expected dist/ or build/)'; exit 1; fi
 
 FROM nginx:1.27-alpine
 COPY nginx.conf /etc/nginx/conf.d/default.conf
-COPY --from=build /app/build /usr/share/nginx/html
+COPY --from=build /tmp/static /usr/share/nginx/html
 EXPOSE 80
 CMD [\"nginx\", \"-g\", \"daemon off;\"]
 """,
@@ -265,6 +268,8 @@ output containerAppEnvironmentId string = containerAppEnv.id
             db_host = os.getenv("DB_HOST", "mock-db.postgres.database.azure.com")
             db_port = os.getenv("DB_PORT", "5432")
             db_name = os.getenv("DB_NAME", "mockdb")
+            frontend_min_replicas = os.getenv("AZURE_FRONTEND_MIN_REPLICAS", "1").strip() or "1"
+            frontend_max_replicas = os.getenv("AZURE_FRONTEND_MAX_REPLICAS", "2").strip() or "2"
 
             self._run_az(
                 az_path,
@@ -297,6 +302,8 @@ output containerAppEnvironmentId string = containerAppEnv.id
                     "--registry-server", acr_server,
                     "--registry-username", acr_user,
                     "--registry-password", acr_pass,
+                    "--min-replicas", frontend_min_replicas,
+                    "--max-replicas", frontend_max_replicas,
                 ],
             )
 
@@ -316,6 +323,8 @@ output containerAppEnvironmentId string = containerAppEnv.id
                     "frontend_app": frontend_name,
                     "backend_url": f"https://{backend_fqdn}" if backend_fqdn else "",
                     "frontend_url": f"https://{frontend_fqdn}" if frontend_fqdn else "",
+                    "frontend_min_replicas": frontend_min_replicas,
+                    "frontend_max_replicas": frontend_max_replicas,
                 },
             )
             self._write_deployment_result(result)

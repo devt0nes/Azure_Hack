@@ -53,6 +53,26 @@ export const getAgentCatalog = ({ tier, role, tag } = {}) => {
 export const getAgent = (agentId) =>
   apiFetch(`/api/agents/${agentId}`)
 
+export const createCustomAgent = ({
+  role,
+  description,
+  tier = 2,
+  model_label,
+  tags = [],
+  system_prompt,
+}) =>
+  apiFetch('/api/agents', {
+    method: 'POST',
+    body: JSON.stringify({
+      role,
+      description,
+      tier,
+      model_label,
+      tags,
+      system_prompt,
+    }),
+  })
+
 /**
  * Select an agent for a specific AEG node in a project.
  * Accepts both snake_case and camelCase callers because the hrit marketplace

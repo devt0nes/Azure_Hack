@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  downloadProjectArtifact,
+  downloadAllProjectArtifacts,
   getDeploymentStatus,
   getProject,
+  getProjectPreviewProgress,
   getProjectPreviewStatus,
-  listProjectArtifacts,
 } from '../services/api.js'
 
 export default function Preview({ currentProjectId, projectData, compactInfo = false }) {
@@ -18,22 +18,34 @@ export default function Preview({ currentProjectId, projectData, compactInfo = f
   const [deploymentError, setDeploymentError] = useState(null)
   const [deploymentNotice, setDeploymentNotice] = useState('')
   const [deployMenuOpen, setDeployMenuOpen] = useState(false)
+  const [previewProgress, setPreviewProgress] = useState(null)
+  const [remotePreviewInfo, setRemotePreviewInfo] = useState(null)
+  const [frontendConsole, setFrontendConsole] = useState([])
   const deployMenuRef = useRef(null)
 
+  // Always use Azure static web URL for preview
+  const AZURE_STATIC_WEB_URL = 'https://agenticnexusstorage.z29.web.core.windows.net/'
   useEffect(() => {
-    loadTunnelInfo()
+    setTunnelInfo({
+      url: AZURE_STATIC_WEB_URL,
+      status: 'ready',
+      projectId: currentProjectId,
+      source: 'azure-static-web',
+    })
+    setLoading(false)
   }, [currentProjectId, refreshKey])
 
   useEffect(() => {
-    if (!currentProjectId) return undefined
-
-    const timer = window.setInterval(() => {
-      loadTunnelInfo({ silent: true })
-    }, 5000)
-
-    return () => {
-      window.clearInterval(timer)
+    const onMessage = (event) => {
+      const payload = event?.data
+      if (!payload || payload.type !== 'nexus_generated_frontend_output') return
+      if (payload.project_id !== currentProjectId) return
+      const line = `[${payload.level || 'log'}] ${payload.message || ''}`
+      setFrontendConsole((prev) => [...prev.slice(-120), line])
     }
+
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
   }, [currentProjectId])
 
   useEffect(() => {
@@ -106,12 +118,53 @@ export default function Preview({ currentProjectId, projectData, compactInfo = f
 
       // Route preview as soon as frontend artifacts are available.
       const previewStatus = await getProjectPreviewStatus({ projectId: currentProjectId })
-      if (previewStatus?.preview_ready && previewStatus?.preview_url) {
-        const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+      const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+      setRemotePreviewInfo({
+        state: previewStatus?.remote_preview_state || null,
+        autoDeploy: previewStatus?.remote_preview_auto_deploy || null,
+      })
+      if (previewStatus?.remote_preview_url) {
+        setTunnelInfo({
+          url: previewStatus.remote_preview_url,
+          status: 'ready',
+          projectId: currentProjectId,
+          source: 'azure-container',
+        })
+      } else if (previewStatus?.preview_ready && previewStatus?.preview_url) {
         setTunnelInfo({
           url: `${apiBase}${previewStatus.preview_url}`,
           status: 'ready',
-          projectId: currentProjectId
+          projectId: currentProjectId,
+          source: 'workspace-files',
+        })
+      } else {
+        // If no remote URL yet, default to preview entry if available
+        if (previewStatus?.entry) {
+          setTunnelInfo({
+            url: `${apiBase}/api/preview/${currentProjectId}/${previewStatus.entry}`,
+            status: 'ready',
+            projectId: currentProjectId,
+            source: 'workspace-files',
+          })
+        }
+      }
+
+      const progress = await getProjectPreviewProgress({ projectId: currentProjectId })
+      setPreviewProgress(progress)
+
+      if (!previewStatus?.remote_preview_url && !previewStatus?.preview_ready && progress?.remote_preview_url) {
+        setTunnelInfo({
+          url: progress.remote_preview_url,
+          status: 'ready',
+          projectId: currentProjectId,
+          source: 'azure-container',
+        })
+      } else if (!previewStatus?.preview_ready && progress?.preview_ready && progress?.preview_url) {
+        setTunnelInfo({
+          url: `${apiBase}${progress.preview_url}`,
+          status: 'ready',
+          projectId: currentProjectId,
+          source: 'workspace-files',
         })
       }
     } catch (err) {
@@ -160,54 +213,16 @@ export default function Preview({ currentProjectId, projectData, compactInfo = f
     setDeploymentNotice('Preparing local files...')
 
     try {
-      const artifactPayload = await listProjectArtifacts({ projectId: currentProjectId })
-      const artifacts = Array.isArray(artifactPayload?.artifacts) ? artifactPayload.artifacts : []
-
-      if (artifacts.length === 0) {
-        setDeploymentNotice('No generated artifacts available to download yet.')
-        return
-      }
-
-      const topLevelArtifacts = artifacts.filter((artifact) => !String(artifact?.path || '').includes('/'))
-      let downloaded = 0
-      let failed = 0
-
-      for (const artifact of topLevelArtifacts) {
-        const fileName = String(artifact?.name || '').trim()
-        if (!fileName) continue
-
-        try {
-          const { blob, filename } = await downloadProjectArtifact({
-            projectId: currentProjectId,
-            artifactName: fileName,
-          })
-
-          const url = URL.createObjectURL(blob)
-          const anchor = document.createElement('a')
-          anchor.href = url
-          anchor.download = filename
-          document.body.appendChild(anchor)
-          anchor.click()
-          anchor.remove()
-          URL.revokeObjectURL(url)
-          downloaded += 1
-
-          await new Promise((resolve) => setTimeout(resolve, 80))
-        } catch (downloadErr) {
-          failed += 1
-        }
-      }
-
-      const skippedNested = artifacts.length - topLevelArtifacts.length
-      setDeploymentNotice(
-        `Downloaded ${downloaded} file(s)` +
-        (skippedNested > 0 ? `, skipped ${skippedNested} nested file(s)` : '') +
-        '.'
-      )
-
-      if (failed > 0) {
-        setDeploymentError(`Failed to download ${failed} file(s).`)
-      }
+      const { blob, filename } = await downloadAllProjectArtifacts({ projectId: currentProjectId })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = filename
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(url)
+      setDeploymentNotice(`Downloaded ${filename}`)
     } catch (err) {
       setDeploymentError('Unable to fetch project artifacts for local save.')
       setDeploymentNotice('')
@@ -243,7 +258,7 @@ export default function Preview({ currentProjectId, projectData, compactInfo = f
               : error
                 ? 'Preview unavailable'
                 : tunnelInfo?.url
-                  ? 'Frontend preview ready'
+                  ? `Frontend preview ready (${tunnelInfo?.source === 'azure-container' ? 'azure container' : 'workspace'})`
                   : !currentProjectId
                     ? 'No project selected'
                     : currentProject?.status === 'queued'
@@ -256,6 +271,16 @@ export default function Preview({ currentProjectId, projectData, compactInfo = f
                             ? 'Project complete - preview ready'
                             : `Current status: ${currentProject?.status || 'unknown'}`}
           </p>
+          {!!remotePreviewInfo?.autoDeploy?.queued && (
+            <p className="mt-1 text-[11px] text-emerald-700/90">
+              Azure remote preview deployment queued. This view will switch automatically when container URL is ready.
+            </p>
+          )}
+          {remotePreviewInfo?.state === 'pending' && !tunnelInfo?.url && (
+            <p className="mt-1 text-[11px] text-foreground/60">
+              Waiting for Azure container preview to become available...
+            </p>
+          )}
         </div>
 
         {/* Controls */}
@@ -382,14 +407,44 @@ export default function Preview({ currentProjectId, projectData, compactInfo = f
         )}
 
         {!loading && !error && !tunnelInfo?.url && currentProjectId && (
-          <div className="flex h-full items-center justify-center rounded-lg border border-border bg-secondary/40">
-            <div className="text-center">
+          <div className="h-full rounded-lg border border-border bg-secondary/40 p-4 overflow-auto">
+            <div className="text-center mb-3">
               <p className="text-sm text-foreground/60">
                 {currentProject?.status === 'generating_code'
-                  ? 'Generating code...'
-                  : 'Preview will be available once code generation completes'}
+                  ? 'Generating frontend files...'
+                  : 'Preview will be available once a frontend entry file is generated'}
               </p>
               <p className="mt-1 text-xs text-foreground/50">Current status: {currentProject?.status || 'unknown'}</p>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-2">
+              <div className="rounded-md border border-border bg-card/70 p-3">
+                <p className="text-xs font-semibold text-foreground/70 mb-2">Recent frontend files</p>
+                <div className="max-h-44 overflow-auto space-y-1">
+                  {(previewProgress?.recent_frontend_files || []).slice(0, 20).map((file, idx) => (
+                    <div key={`${file.path}-${idx}`} className="text-[11px] text-foreground/70 font-mono break-all">
+                      {file.path}
+                    </div>
+                  ))}
+                  {(!previewProgress?.recent_frontend_files || previewProgress.recent_frontend_files.length === 0) && (
+                    <p className="text-[11px] text-foreground/50">No frontend files yet.</p>
+                  )}
+                </div>
+              </div>
+
+              <div className="rounded-md border border-border bg-card/70 p-3">
+                <p className="text-xs font-semibold text-foreground/70 mb-2">Live frontend output</p>
+                <div className="max-h-44 overflow-auto space-y-1">
+                  {[...(previewProgress?.recent_frontend_logs || []), ...frontendConsole].slice(-60).map((line, idx) => (
+                    <div key={`log-${idx}`} className="text-[11px] text-foreground/70 font-mono break-all">
+                      {line}
+                    </div>
+                  ))}
+                  {[...(previewProgress?.recent_frontend_logs || []), ...frontendConsole].length === 0 && (
+                    <p className="text-[11px] text-foreground/50">Waiting for frontend agent output...</p>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
         )}

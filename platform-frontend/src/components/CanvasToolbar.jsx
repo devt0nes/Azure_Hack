@@ -11,7 +11,11 @@ export default function CanvasToolbar({
     onUploadFile,
     onAddUrl,
     drawMode,
+    drawTool,
     onToggleDrawMode,
+    onSelectDrawTool,
+    shapeType,
+    onSelectShape,
     onClearDrawings,
     onClearCanvas,
 }) {
@@ -137,8 +141,8 @@ export default function CanvasToolbar({
                 <button
                     onClick={onToggleDrawMode}
                     className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-medium transition dark:border-border ${drawMode
-                            ? 'border-[#F26A2E]/60 bg-[#F26A2E]/12 text-[#F26A2E]'
-                            : 'border-white/40 bg-white/80 text-ink hover:border-[#F26A2E]/40 hover:text-[#F26A2E] dark:bg-secondary/60 dark:text-foreground'
+                        ? 'border-[#F26A2E]/60 bg-[#F26A2E]/12 text-[#F26A2E]'
+                        : 'border-white/40 bg-white/80 text-ink hover:border-[#F26A2E]/40 hover:text-[#F26A2E] dark:bg-secondary/60 dark:text-foreground'
                         }`}
                 >
                     <ToolbarIcon>
@@ -149,6 +153,61 @@ export default function CanvasToolbar({
                     </ToolbarIcon>
                     {drawMode ? 'Drawing On' : 'Draw'}
                 </button>
+
+                <div className="flex items-center gap-2 rounded-xl border border-white/40 bg-white/80 px-2 py-1.5 dark:border-border dark:bg-secondary/60">
+                    <button
+                        onClick={() => onSelectDrawTool('pen')}
+                        title="Pen"
+                        aria-label="Pen"
+                        className={`inline-flex h-8 w-8 items-center justify-center rounded-md border transition ${drawTool === 'pen'
+                            ? 'border-[#F26A2E]/60 bg-[#F26A2E]/12 text-[#F26A2E]'
+                            : 'border-white/40 bg-white text-ink hover:border-[#F26A2E]/40 hover:text-[#F26A2E] dark:border-border dark:bg-card dark:text-foreground'
+                            }`}
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-4 w-4">
+                            <path d="M12 20h9" />
+                            <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" />
+                        </svg>
+                    </button>
+
+                    <button
+                        onClick={() => onSelectDrawTool('eraser')}
+                        title="Eraser"
+                        aria-label="Eraser"
+                        className={`inline-flex h-8 w-8 items-center justify-center rounded-md border transition ${drawTool === 'eraser'
+                            ? 'border-[#F26A2E]/60 bg-[#F26A2E]/12 text-[#F26A2E]'
+                            : 'border-white/40 bg-white text-ink hover:border-[#F26A2E]/40 hover:text-[#F26A2E] dark:border-border dark:bg-card dark:text-foreground'
+                            }`}
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-4 w-4">
+                            <path d="M3 16l6-6 8 8-4 4H7z" />
+                            <path d="M14 5l5 5" />
+                        </svg>
+                    </button>
+
+                    <div className="flex items-center gap-1">
+                        <span className="text-[11px] font-medium text-ink dark:text-foreground">Shape</span>
+                        <select
+                            value={shapeType}
+                            onChange={(event) => onSelectShape(event.target.value)}
+                            className="rounded-md border border-white/40 bg-white px-2 py-1 text-[11px] text-ink outline-none dark:border-border dark:bg-card dark:text-foreground"
+                        >
+                            <option value="rectangle">Rectangle</option>
+                            <option value="roundedRectangle">Rounded Rectangle</option>
+                            <option value="square">Square</option>
+                            <option value="circle">Circle</option>
+                            <option value="ellipse">Ellipse</option>
+                            <option value="triangle">Triangle</option>
+                            <option value="diamond">Diamond</option>
+                            <option value="pentagon">Pentagon</option>
+                            <option value="hexagon">Hexagon</option>
+                            <option value="octagon">Octagon</option>
+                            <option value="line">Line</option>
+                            <option value="arrow">Arrow</option>
+                            <option value="star">Star</option>
+                        </select>
+                    </div>
+                </div>
 
                 <button
                     onClick={onClearDrawings}

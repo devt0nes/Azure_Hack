@@ -170,6 +170,7 @@ def normalize_layers_common_sense(ledger_data: Dict) -> None:
     Hard constraints:
     - Every required role appears exactly once across layers.
     - If `system_architect` exists, it must be layer 1 and alone.
+    - If `qa_engineer` exists, it must be the final layer and alone.
     """
     if not isinstance(ledger_data, dict):
         return
@@ -226,30 +227,43 @@ def normalize_layers_common_sense(ledger_data: Dict) -> None:
 
 
 def enforce_system_architect_first_layer(layers: List[List[str]]) -> List[List[str]]:
-    """Ensure system_architect executes first and alone when present."""
+    """Ensure system_architect is first+alone and qa_engineer is last+alone when present."""
     if not isinstance(layers, list):
         return layers
 
-    has_system_architect = any(
-        isinstance(layer, list) and any(_extract_role(role) == AgentRole.SYSTEM_ARCHITECT.value for role in layer)
-        for layer in layers
-    )
-    if not has_system_architect:
-        return layers
-
-    cleaned_layers: List[List[str]] = []
+    normalized: List[List[str]] = []
     for layer in layers:
         if not isinstance(layer, list):
             continue
-        filtered = [
-            _extract_role(r)
-            for r in layer
-            if isinstance(r, str) and _extract_role(r) != AgentRole.SYSTEM_ARCHITECT.value
-        ]
-        if filtered:
-            cleaned_layers.append(filtered)
+        roles = []
+        for role_entry in layer:
+            role = _extract_role(role_entry)
+            if role:
+                roles.append(role)
+        if roles:
+            normalized.append(roles)
 
-    return [[AgentRole.SYSTEM_ARCHITECT.value]] + cleaned_layers
+    has_system_architect = any(AgentRole.SYSTEM_ARCHITECT.value in layer for layer in normalized)
+    has_qa = any(AgentRole.QA_ENGINEER.value in layer for layer in normalized)
+
+    if has_system_architect:
+        cleaned_layers: List[List[str]] = []
+        for layer in normalized:
+            filtered = [r for r in layer if r != AgentRole.SYSTEM_ARCHITECT.value]
+            if filtered:
+                cleaned_layers.append(filtered)
+        normalized = [[AgentRole.SYSTEM_ARCHITECT.value]] + cleaned_layers
+
+    if has_qa:
+        cleaned_layers = []
+        for layer in normalized:
+            filtered = [r for r in layer if r != AgentRole.QA_ENGINEER.value]
+            if filtered:
+                cleaned_layers.append(filtered)
+        cleaned_layers.append([AgentRole.QA_ENGINEER.value])
+        normalized = cleaned_layers
+
+    return normalized
 
 class TaskLedger:
     """
@@ -815,12 +829,14 @@ CONSISTENCY RULES:
 - Every required agent role must appear in exactly one layer
 - If system_architect exists, it MUST be in layer 1 and MUST run alone in that layer
 - system_architect must always be present and must always be the only role in layer 1
+- If qa_engineer exists, it MUST be the final layer and MUST run alone in that layer
 - Layers should be ordered logically in order of execution from first to last - agents that should execute first should be put in earlier layers
 - Keep total number of layers as low as practical by parallelizing compatible agents
 - If an agent would mostly wait on another agent's deliverable, place it in a later layer
 - If two agents can coordinate effectively with bounded dependency risk, place them in the same layer
 - Do NOT force a fixed canonical pattern; derive layer composition from THIS project's requirements.
 - After layer 1 (system_architect only), arrange remaining layers exactly as your project-specific dependency analysis dictates.
+- Try to put frontend engineer in the layer after system architect so the user can see the preview early.
 - Each agent needs: role, instructions
 - The first agent and layer must be the system_architect, always
 - Minimize agent count (quality over quantity)
@@ -957,6 +973,7 @@ CRITICAL RULES:
 ✓ Include ALL fields in your JSON response (copy from current + add updates)
 ✓ Prefer agent_specifications.layers and minimize total layers by parallelizing where sensible
 ✓ system_architect must always be the only role in layer 1
+✓ qa_engineer must always be the only role in the final layer
 ✓ Do NOT impose a fixed generic layer pattern for all projects; choose layers from project-specific dependencies
 ✓ Put heavily blocked/waiting agents in later layers; keep decently coordinating agents together
 ✓ Ensure every required agent role appears exactly once in layers

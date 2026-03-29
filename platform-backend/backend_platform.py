@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import inspect
+import io
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ import shutil
 import sys
 import time
 import uuid
+import zipfile
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -24,7 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from ingestion_service import build_ingestion_context
@@ -42,6 +44,11 @@ from cosmos_client import (
 
 load_dotenv()
 AZURE_MODEL_DEPLOYMENT = os.getenv("AZURE_MODEL_DEPLOYMENT") or os.getenv("AZURE_OPENAI_DEPLOYMENT") or "gpt-4o"
+DEFAULT_AZURE_RESOURCE_GROUP = os.getenv("AZURE_RESOURCE_GROUP", "agentic_brocode")
+DEFAULT_AZURE_LOCATION = os.getenv("AZURE_LOCATION", "eastus")
+ENABLE_AUTO_REMOTE_PREVIEW = str(os.getenv("ENABLE_AUTO_REMOTE_PREVIEW", "true")).lower() in {"1", "true", "yes"}
+AUTO_REMOTE_PREVIEW_MOCK_SUCCESS = str(os.getenv("AUTO_REMOTE_PREVIEW_MOCK_SUCCESS", "false")).lower() in {"1", "true", "yes"}
+REMOTE_PREVIEW_DEPLOY_COOLDOWN_SECONDS = max(30, int(os.getenv("REMOTE_PREVIEW_DEPLOY_COOLDOWN_SECONDS", "120")))
 
 
 def _detect_repo_root() -> Path:
@@ -80,6 +87,8 @@ logger = logging.getLogger("nexus-platform-backend")
 logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
 logging.getLogger("azure.servicebus").setLevel(logging.WARNING)
 logging.getLogger("azure.core").setLevel(logging.WARNING)
+
+_remote_preview_last_deploy_attempt: Dict[str, float] = {}
 
 app = FastAPI(
     title="Nexus Platform Backend",
@@ -136,8 +145,8 @@ class DeploymentRequest(BaseModel):
     enable_infrastructure: bool = True
     enable_cicd: bool = True
     mock_success: bool = False
-    resource_group: str = "agentic_brocode"
-    location: str = "southeastasia"
+    resource_group: str = DEFAULT_AZURE_RESOURCE_GROUP
+    location: str = DEFAULT_AZURE_LOCATION
 
 
 class HealthResponse(BaseModel):
@@ -630,11 +639,68 @@ def _project_log_file(project_id: str) -> Path:
 def _frontend_preview_bases(project_id: str) -> List[Path]:
     """Candidate frontend output roots for preview serving."""
     project_root = _project_generated_dir(project_id)
+    workspace_root = REPO_ROOT / "workspace"
     candidates = [
         project_root / "frontend_engineer",
         project_root / "frontend",
+        workspace_root / project_id / "frontend_engineer",
+        workspace_root / project_id / "frontend",
+        workspace_root / "frontend_engineer",
+        workspace_root / "frontend",
     ]
-    return [p for p in candidates if p.exists() and p.is_dir()]
+    seen: set[str] = set()
+    unique: List[Path] = []
+    for p in candidates:
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(p)
+    return [p for p in unique if p.exists() and p.is_dir()]
+
+
+def _collect_preview_progress(project_id: str, limit_files: int = 30, limit_logs: int = 40) -> Dict[str, Any]:
+    _sync_project_from_blob(project_id)
+    preview_entry = _discover_frontend_preview_entry(project_id)
+    remote_preview_url = _resolve_remote_frontend_preview_url(project_id)
+
+    recent_files: List[Dict[str, Any]] = []
+    for base in _frontend_preview_bases(project_id):
+        for file_path in base.rglob("*"):
+            if not file_path.is_file():
+                continue
+            rel = str(file_path.relative_to(base)).replace("\\", "/")
+            recent_files.append(
+                {
+                    "base": str(base),
+                    "path": rel,
+                    "size": file_path.stat().st_size,
+                    "modified_at": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat(),
+                }
+            )
+    recent_files.sort(key=lambda x: x.get("modified_at", ""), reverse=True)
+
+    log_lines: List[str] = []
+    log_file = _project_log_file(project_id)
+    if log_file.exists() and log_file.is_file():
+        lines = log_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+        for line in lines:
+            text = line.strip()
+            if not text:
+                continue
+            hay = text.lower()
+            if any(k in hay for k in ["frontend", "preview", "vite", "react", "build", "orchestrator", "layer"]):
+                log_lines.append(text)
+
+    return {
+        "project_id": project_id,
+        "preview_ready": bool(preview_entry),
+        "entry": preview_entry,
+        "preview_url": f"/api/preview/{project_id}/{preview_entry}" if preview_entry else None,
+        "remote_preview_url": remote_preview_url,
+        "recent_frontend_files": recent_files[:limit_files],
+        "recent_frontend_logs": log_lines[-limit_logs:],
+    }
 
 
 def _discover_frontend_preview_target(project_id: str) -> Optional[Tuple[Path, str]]:
@@ -671,6 +737,91 @@ def _discover_frontend_preview_entry(project_id: str) -> Optional[str]:
         return None
     _base, rel = target
     return rel
+
+
+def _resolve_remote_frontend_preview_url(project_id: str) -> Optional[str]:
+    """Resolve deployed frontend URL when Azure deployment artifacts are present."""
+    candidate_paths = [
+        _project_generated_dir(project_id) / "deployment" / "azure" / "deployment_result.json",
+        REPO_ROOT / "workspace" / project_id / "deployment" / "azure" / "deployment_result.json",
+        REPO_ROOT / "workspace" / "deployment" / "azure" / "deployment_result.json",
+    ]
+    for result_path in candidate_paths:
+        if not result_path.exists() or not result_path.is_file():
+            continue
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            details = payload.get("details", {}) if isinstance(payload, dict) else {}
+            if not isinstance(details, dict):
+                continue
+            url = str(details.get("frontend_url") or "").strip()
+            if url.startswith("http://") or url.startswith("https://"):
+                return url
+        except Exception:
+            continue
+    return None
+
+
+def _queue_auto_remote_preview_deployment(
+    project_id: str,
+    project: Optional[Dict[str, Any]],
+    background_tasks: Optional[BackgroundTasks],
+) -> Dict[str, Any]:
+    """Queue deployment for remote preview if enabled and needed."""
+    if not ENABLE_AUTO_REMOTE_PREVIEW:
+        return {"enabled": False, "queued": False, "reason": "disabled"}
+
+    if background_tasks is None:
+        return {"enabled": True, "queued": False, "reason": "no_background_tasks"}
+
+    if not isinstance(project, dict):
+        return {"enabled": True, "queued": False, "reason": "project_not_found"}
+
+    existing_url = _resolve_remote_frontend_preview_url(project_id)
+    if existing_url:
+        return {"enabled": True, "queued": False, "reason": "remote_preview_ready", "remote_preview_url": existing_url}
+
+    if not _discover_frontend_preview_entry(project_id):
+        return {"enabled": True, "queued": False, "reason": "frontend_artifacts_not_ready"}
+
+    current_status = str(project.get("status") or "")
+    if current_status == ProjectStatus.GENERATING_DEPLOYMENT.value:
+        return {"enabled": True, "queued": False, "reason": "deployment_already_running"}
+
+    now = time.time()
+    last_attempt = _remote_preview_last_deploy_attempt.get(project_id, 0.0)
+    if (now - last_attempt) < REMOTE_PREVIEW_DEPLOY_COOLDOWN_SECONDS:
+        return {
+            "enabled": True,
+            "queued": False,
+            "reason": "cooldown",
+            "next_retry_in_seconds": int(REMOTE_PREVIEW_DEPLOY_COOLDOWN_SECONDS - (now - last_attempt)),
+        }
+
+    request = DeploymentRequest(
+        project_id=project_id,
+        mock_success=AUTO_REMOTE_PREVIEW_MOCK_SUCCESS,
+        resource_group=DEFAULT_AZURE_RESOURCE_GROUP,
+        location=DEFAULT_AZURE_LOCATION,
+    )
+
+    _remote_preview_last_deploy_attempt[project_id] = now
+    store.update(project_id, status=ProjectStatus.GENERATING_DEPLOYMENT, progress=max(int(project.get("progress") or 0), 50))
+    background_tasks.add_task(_simulate_deployment, project_id, request)
+    _append_project_log(
+        project_id,
+        "remote_preview_auto_deploy_queued",
+        resource_group=request.resource_group,
+        location=request.location,
+        mock_success=bool(request.mock_success),
+    )
+    return {
+        "enabled": True,
+        "queued": True,
+        "reason": "queued",
+        "resource_group": request.resource_group,
+        "location": request.location,
+    }
 
 
 def _inject_preview_console_bridge(html: str, project_id: str) -> str:
@@ -734,6 +885,82 @@ def _inject_preview_console_bridge(html: str, project_id: str) -> str:
         if "</body>" in html:
                 return html.replace("</body>", bridge + "</body>")
         return html + bridge
+
+
+def _rewrite_preview_html_paths(html: str, project_id: str, requested_filename: str) -> str:
+    """Rewrite absolute asset URLs so iframe preview can resolve files via /api/preview."""
+    if not isinstance(html, str) or not html:
+        return html
+
+    rel = str(requested_filename or "index.html").strip().lstrip("/")
+    rel_dir = str(Path(rel).parent).replace("\\", "/")
+    if rel_dir == ".":
+        rel_dir = ""
+    preview_base = f"/api/preview/{project_id}/" + (f"{rel_dir}/" if rel_dir else "")
+
+    # Inject base href for relative paths.
+    base_tag = f'<base href="{preview_base}">'
+    if "<base " not in html.lower():
+        if "<head>" in html:
+            html = html.replace("<head>", f"<head>{base_tag}")
+        else:
+            html = base_tag + html
+
+    # Rewrite absolute src/href URLs (e.g. /assets/...) into preview-routed URLs.
+    html = re.sub(
+        r'(?i)(\b(?:src|href)=(["\"]))/(?!/)',
+        lambda m: f"{m.group(1)}{preview_base}",
+        html,
+    )
+    # Rewrite CSS url(/...)
+    html = re.sub(r'(?i)url\((\s*["\"])\/(?!\/)', lambda m: f"url({m.group(1)}{preview_base}", html)
+    html = re.sub(r'(?i)url\((\s*)\/(?!\/)', lambda m: f"url({m.group(1)}{preview_base}", html)
+    return html
+
+
+def _iter_project_artifact_files(project_id: str):
+    """Yield (archive_rel_path, absolute_path) for project artifacts from synced locations."""
+    workspace_root = REPO_ROOT / "workspace"
+    roots: List[Tuple[str, Path]] = [
+        ("generated", _project_generated_dir(project_id)),
+        ("workspace", workspace_root / project_id),
+    ]
+
+    # Include project-scoped workspace files even if they are not inside workspace/{project_id}/
+    extra_workspace_files = [
+        workspace_root / f"ledger_{project_id}.json",
+        workspace_root / f"project_specs_{project_id}.md",
+        workspace_root / f"service_api_keys_{project_id}.json",
+        workspace_root / f"conversation_context_{project_id}.json",
+        workspace_root / f"ingestion_context_{project_id}.json",
+    ]
+
+    seen: set[str] = set()
+    for root_label, root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = str(path.relative_to(root)).replace("\\", "/")
+            low = rel.lower()
+            if any(seg in low for seg in ["__pycache__", "/.git/", "node_modules/"]):
+                continue
+            archive_rel = f"{root_label}/{rel}"
+            if archive_rel in seen:
+                continue
+            seen.add(archive_rel)
+            yield archive_rel, path
+
+    for extra in extra_workspace_files:
+        if not extra.exists() or not extra.is_file():
+            continue
+        rel = str(extra.relative_to(workspace_root)).replace("\\", "/")
+        archive_rel = f"workspace/{rel}"
+        if archive_rel in seen:
+            continue
+        seen.add(archive_rel)
+        yield archive_rel, extra
 
 
 def _append_project_log(project_id: str, event: str, **data: Any) -> None:
@@ -2022,6 +2249,164 @@ def _check_input_safety(text: str) -> Dict[str, Any]:
     }
 
 
+def _is_probably_text_file(path: Path) -> bool:
+    text_suffixes = {
+        ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".md", ".txt", ".yml", ".yaml",
+        ".toml", ".ini", ".env", ".css", ".scss", ".html", ".xml", ".sql", ".sh",
+        ".dockerfile", "",
+    }
+    name = path.name.lower()
+    if name in {"dockerfile", "makefile", "readme", "readme.md"}:
+        return True
+    return path.suffix.lower() in text_suffixes
+
+
+def _rank_file_relevance(question: str, rel_path: str, snippet: str) -> int:
+    q_tokens = [t for t in re.split(r"[^a-z0-9_]+", str(question or "").lower()) if len(t) >= 3]
+    if not q_tokens:
+        return 0
+
+    hay_path = rel_path.lower()
+    hay_snippet = str(snippet or "").lower()
+    score = 0
+    for token in q_tokens:
+        if token in hay_path:
+            score += 5
+        if token in hay_snippet:
+            score += 2
+    if any(k in hay_path for k in ["readme", "architecture", "ledger", "spec", "agent", "orchestrator"]):
+        score += 1
+    return score
+
+
+def _collect_learning_context(project_id: str, question: str, *, max_files: int = 10, max_chars: int = 28000) -> Dict[str, Any]:
+    _sync_project_from_blob(project_id)
+
+    project_dir = _project_generated_dir(project_id)
+    workspace_dir = REPO_ROOT / "workspace"
+
+    candidates: List[Tuple[int, str, str]] = []
+
+    def _append_candidate(path: Path, base: Path) -> None:
+        if not path.exists() or not path.is_file() or not _is_probably_text_file(path):
+            return
+        try:
+            raw = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return
+        if not raw.strip():
+            return
+        try:
+            rel = str(path.relative_to(base)).replace("\\", "/")
+        except Exception:
+            rel = path.name
+        # Keep snippets bounded to preserve context budget.
+        snippet = raw[:3000]
+        score = _rank_file_relevance(question, rel, snippet)
+        if score <= 0:
+            return
+        candidates.append((score, rel, raw))
+
+    if project_dir.exists():
+        for p in project_dir.rglob("*"):
+            _append_candidate(p, project_dir)
+
+    # Add project-spec and ledger context as high-value sources.
+    spec_file = workspace_dir / f"project_specs_{project_id}.md"
+    ledger_file = workspace_dir / f"ledger_{project_id}.json"
+    if spec_file.exists():
+        _append_candidate(spec_file, workspace_dir)
+    if ledger_file.exists():
+        _append_candidate(ledger_file, workspace_dir)
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    selected: List[Dict[str, str]] = []
+    used_chars = 0
+    for _score, rel, raw in candidates:
+        if len(selected) >= max_files:
+            break
+        remaining = max_chars - used_chars
+        if remaining <= 0:
+            break
+        chunk = raw[: max(0, min(remaining, 4500))]
+        if not chunk.strip():
+            continue
+        selected.append({"path": rel, "content": chunk})
+        used_chars += len(chunk)
+
+    return {
+        "selected_files": selected,
+        "selected_count": len(selected),
+        "project_dir": str(project_dir.resolve()),
+    }
+
+
+def _answer_learning_question(project_id: str, question: str, selected_files: List[Dict[str, str]]) -> str:
+    question_text = str(question or "").strip()
+    if not question_text:
+        return "Please ask a specific question about the codebase."
+
+    if not selected_files:
+        return (
+            "I couldn't find relevant project files yet. Run project generation first, then ask again with a specific"
+            " file/module topic."
+        )
+
+    context_blocks = []
+    for item in selected_files:
+        rel = str(item.get("path") or "")
+        content = str(item.get("content") or "")
+        context_blocks.append(f"FILE: {rel}\n---\n{content}")
+    context_text = "\n\n".join(context_blocks)
+
+    try:
+        from openai import AzureOpenAI
+
+        client = AzureOpenAI(
+            api_key=os.getenv("AZURE_OPENAI_KEY"),
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are Nexus Learning Agent. Explain how the existing code works using ONLY the provided files. "
+                    "If uncertain, say what is missing. Be concise and practical. Include file paths you used."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Project ID: {project_id}\n"
+                    f"Question: {question_text}\n\n"
+                    "Relevant files:\n"
+                    f"{context_text}"
+                ),
+            },
+        ]
+        response = client.chat.completions.create(
+            model=AZURE_MODEL_DEPLOYMENT,
+            messages=messages,
+            temperature=0.2,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        if text:
+            return text
+    except Exception as exc:
+        logger.warning("Learning agent model fallback used for %s: %s", project_id, exc)
+
+    # Deterministic fallback if model is unavailable.
+    preview_paths = [f"- {item.get('path')}" for item in selected_files[:8]]
+    return (
+        "I reviewed the most relevant project files and found likely implementation context.\n\n"
+        "Top files inspected:\n"
+        + "\n".join(preview_paths)
+        + "\n\nPlease retry once model connectivity is available for a fully detailed explanation."
+    )
+
+
 # ------------------------------
 # Routes (parity with tentative-backend)
 # ------------------------------
@@ -2315,18 +2700,93 @@ async def list_artifacts(project_id: str):
     }
 
 
-@app.get("/api/projects/{project_id}/artifacts/{artifact_name}", tags=["Artifacts"])
+@app.get("/api/projects/{project_id}/artifacts/{artifact_name:path}", tags=["Artifacts"])
 async def download_artifact(project_id: str, artifact_name: str):
     project = store.get(project_id)
     if not project:
         raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
 
     _sync_project_from_blob(project_id)
-    artifact_path = _project_generated_dir(project_id) / artifact_name
-    if not artifact_path.exists() or not artifact_path.is_file():
+    candidates = [
+        (_project_generated_dir(project_id) / artifact_name),
+        (REPO_ROOT / "workspace" / artifact_name),
+    ]
+    artifact_path: Optional[Path] = None
+    for candidate in candidates:
+        try:
+            candidate.resolve()
+        except Exception:
+            continue
+        if candidate.exists() and candidate.is_file():
+            artifact_path = candidate
+            break
+
+    if artifact_path is None:
         raise HTTPException(status_code=404, detail=f"Artifact {artifact_name} not found")
 
-    return FileResponse(path=artifact_path, filename=artifact_name, media_type="application/octet-stream")
+    return FileResponse(path=artifact_path, filename=Path(artifact_name).name, media_type="application/octet-stream")
+
+
+@app.get("/api/projects/{project_id}/artifacts/download-all", tags=["Artifacts"])
+async def download_all_artifacts(project_id: str):
+    project = store.get(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    _sync_project_from_blob(project_id)
+
+    buffer = io.BytesIO()
+    file_count = 0
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for archive_rel, abs_path in _iter_project_artifact_files(project_id):
+            try:
+                zf.write(abs_path, archive_rel)
+                file_count += 1
+            except Exception:
+                continue
+
+    if file_count == 0:
+        raise HTTPException(status_code=404, detail="No generated artifacts available to download")
+
+    filename = f"{project_id}_artifacts.zip"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return JSONResponse(
+        status_code=200,
+        content={
+            "download": True,
+            "message": "Use /api/projects/{project_id}/artifacts/download-all/blob to fetch binary zip",
+            "project_id": project_id,
+            "file_count": file_count,
+            "filename": filename,
+        },
+        headers=headers,
+    )
+
+
+@app.get("/api/projects/{project_id}/artifacts/download-all/blob", tags=["Artifacts"])
+async def download_all_artifacts_blob(project_id: str):
+    project = store.get(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    _sync_project_from_blob(project_id)
+
+    buffer = io.BytesIO()
+    file_count = 0
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for archive_rel, abs_path in _iter_project_artifact_files(project_id):
+            try:
+                zf.write(abs_path, archive_rel)
+                file_count += 1
+            except Exception:
+                continue
+
+    if file_count == 0:
+        raise HTTPException(status_code=404, detail="No generated artifacts available to download")
+
+    filename = f"{project_id}_artifacts.zip"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(content=buffer.getvalue(), media_type="application/zip", headers=headers)
 
 
 @app.get("/api/projects/{project_id}/logs", tags=["Logs"])
@@ -2514,7 +2974,36 @@ async def preview(project_id: str, path: str = ""):
     raw_path = path.strip("/") if path and path.strip() != "/" else ""
     requested_filename = raw_path or "index.html"
 
+    # Try to serve from Azure Blob Storage first
+    container = _get_azure_blob_container_client()
+    blob_path = f"{project_id}/frontend_engineer/dist/{path.strip('/') or 'index.html'}"
+    if container:
+        try:
+            blob = container.get_blob_client(blob_path)
+            if blob.exists():
+                stream = blob.download_blob()
+                suffix = os.path.splitext(blob_path)[1].lower()
+                content_types = {
+                    ".html": "text/html",
+                    ".css": "text/css",
+                    ".js": "application/javascript",
+                    ".json": "application/json",
+                    ".png": "image/png",
+                    ".jpg": "image/jpeg",
+                    ".gif": "image/gif",
+                    ".svg": "image/svg+xml",
+                }
+                return Response(
+                    content=stream.readall(),
+                    media_type=content_types.get(suffix, "application/octet-stream")
+                )
+        except Exception as exc:
+            logger.warning(f"Azure Blob preview fetch failed: {exc}")
+    # Fallback to local logic if not in Azure
     bases = _frontend_preview_bases(project_id)
+    fallback_dist = (REPO_ROOT / "platform-frontend" / "dist").resolve()
+    if not bases and fallback_dist.exists() and fallback_dist.is_dir():
+        bases = [fallback_dist]
     if not bases:
         return HTMLResponse(
             content=(
@@ -2572,7 +3061,8 @@ async def preview(project_id: str, path: str = ""):
     if suffix == ".html":
         try:
             raw = target.read_text(encoding="utf-8", errors="ignore")
-            patched = _inject_preview_console_bridge(raw, project_id=project_id)
+            patched = _rewrite_preview_html_paths(raw, project_id=project_id, requested_filename=requested_filename)
+            patched = _inject_preview_console_bridge(patched, project_id=project_id)
             return HTMLResponse(content=patched, status_code=200)
         except Exception:
             # Fall back to regular file response if injection fails.
@@ -2581,14 +3071,17 @@ async def preview(project_id: str, path: str = ""):
 
 
 @app.get("/api/projects/{project_id}/preview-status", tags=["Compatibility"])
-async def get_project_preview_status(project_id: str):
+async def get_project_preview_status(project_id: str, background_tasks: BackgroundTasks):
     project = store.get(project_id)
     if not project:
         raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
 
     _sync_project_from_blob(project_id)
+    auto_deploy = _queue_auto_remote_preview_deployment(project_id, project, background_tasks)
     entry = _discover_frontend_preview_entry(project_id)
+    remote_preview_url = _resolve_remote_frontend_preview_url(project_id)
     preview_ready = bool(entry)
+    remote_state = "ready" if remote_preview_url else ("pending" if auto_deploy.get("queued") or str(project.get("status") or "") == ProjectStatus.GENERATING_DEPLOYMENT.value else "unavailable")
 
     return {
         "project_id": project_id,
@@ -2596,8 +3089,28 @@ async def get_project_preview_status(project_id: str):
         "preview_ready": preview_ready,
         "entry": entry,
         "preview_url": f"/api/preview/{project_id}/{entry}" if preview_ready and entry else None,
+        "remote_preview_url": remote_preview_url,
+        "remote_preview_state": remote_state,
+        "remote_preview_auto_deploy": auto_deploy,
         "message": "Frontend preview is ready" if preview_ready else "Frontend preview is not ready yet",
     }
+
+
+@app.get("/api/projects/{project_id}/preview-progress", tags=["Compatibility"])
+async def get_project_preview_progress(project_id: str):
+    project = store.get(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    payload = _collect_preview_progress(project_id)
+    payload["project_status"] = project.get("status")
+    payload["project_progress"] = project.get("progress")
+    payload["remote_preview_state"] = "ready" if payload.get("remote_preview_url") else (
+        "pending" if str(project.get("status") or "") == ProjectStatus.GENERATING_DEPLOYMENT.value else "unavailable"
+    )
+    payload["remote_preview_auto_deploy_enabled"] = ENABLE_AUTO_REMOTE_PREVIEW
+    payload["message"] = "Preview progress snapshot"
+    return payload
 
 
 @app.get("/context/{project_id}", tags=["Compatibility"])
@@ -3423,20 +3936,25 @@ async def execute_project_compat(request: ExecuteRequest, background_tasks: Back
 
 @app.post("/tutor/ask", tags=["Compatibility"])
 async def tutor_ask(request: TutorRequest):
-    q = (request.question or "").lower()
-    response_text = "I'm the Nexus learning assistant. "
-    if "explain" in q or "what is" in q:
-        response_text += "This platform uses specialized agents to build full-stack applications collaboratively."
-    elif "aeg" in q or "graph" in q:
-        response_text += "The AEG shows dependencies between agents and execution order."
-    elif "cost" in q:
-        response_text += "Cost tracking reports token usage and estimated spend."
-    else:
-        response_text += "Ask me about agent execution, AEG, cost tracking, or orchestration flow."
+    project = store.get(request.project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {request.project_id} not found")
+
+    learning_context = _collect_learning_context(request.project_id, request.question)
+    selected_files = learning_context.get("selected_files", [])
+    response_text = _answer_learning_question(request.project_id, request.question, selected_files)
+
+    _append_project_log(
+        request.project_id,
+        "learning_agent_answered",
+        selected_file_count=len(selected_files),
+        question_preview=str(request.question or "")[:200],
+    )
 
     return {
         "response": response_text,
-        "level": "overview",
+        "level": "project-aware",
+        "sources": [item.get("path") for item in selected_files],
         "timestamp": datetime.utcnow().isoformat(),
     }
 

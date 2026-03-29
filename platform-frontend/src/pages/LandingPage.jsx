@@ -132,6 +132,10 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
     }
   }
 
+  const scrollToTop = () => {
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
   return (
     <div className="relative min-h-screen overflow-hidden bg-background text-foreground">
       <AnimatedGridBackground theme={theme} />
@@ -153,7 +157,15 @@ export default function LandingPage({ onLogin, theme, onToggleTheme }) {
       <nav className={`fixed top-0 left-0 right-0 z-50 transition-all duration-500 ${scrolled ? 'border-b border-border/50 bg-background/80 backdrop-blur-lg shadow-glass' : 'bg-transparent'} px-6 py-4`}>
         <div className="mx-auto flex max-w-7xl items-center justify-between">
           <div className="flex items-center gap-8">
-            <p className="mono text-sm font-medium uppercase tracking-[0.3em] text-foreground/90"><span className="text-gradient-ember font-bold">Agentic</span><span className="text-foreground/50 mx-1">_</span><span>Nexus</span></p>
+            <button
+              type="button"
+              onClick={scrollToTop}
+              className="mono text-sm font-medium uppercase tracking-[0.3em] text-foreground/90 transition-colors duration-300 hover:text-foreground px-0 py-0"
+              aria-label="Scroll to top"
+              title="Back to top"
+            >
+              <span className="text-gradient-ember font-bold">Agentic</span><span className="text-foreground/50 mx-1">_</span><span>Nexus</span>
+            </button>
             <div className="hidden md:flex items-center gap-6">
               <a href="#workflow" className="mono text-xs uppercase tracking-[0.15em] text-foreground/50 transition-colors duration-300 hover:text-foreground/90">Workflow</a>
               <a href="#how-it-works" className="mono text-xs uppercase tracking-[0.15em] text-foreground/50 transition-colors duration-300 hover:text-foreground/90">How It Works</a>

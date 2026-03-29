@@ -105,8 +105,18 @@ export const getDeploymentStatus = ({ projectId }) =>
 
 export const getHealth = () => apiFetch('/api/health')
 export const listProjects = () => apiFetch('/api/projects')
+export const createProject = ({ projectName, userIntent, description = '' }) =>
+  apiFetch('/api/projects', {
+    method: 'POST',
+    body: JSON.stringify({
+      project_name: projectName,
+      user_intent: userIntent,
+      description,
+    }),
+  })
 export const getProject = ({ projectId }) => apiFetch(`/api/projects/${projectId}`)
 export const getProjectPreviewStatus = ({ projectId }) => apiFetch(`/api/projects/${projectId}/preview-status`)
+export const getProjectPreviewProgress = ({ projectId }) => apiFetch(`/api/projects/${projectId}/preview-progress`)
 export const getProjectLogs = ({ projectId }) => apiFetch(`/api/projects/${projectId}/logs`)
 export const getProjectAgentEvents = ({ projectId }) => apiFetch(`/api/projects/${projectId}/agent-events`)
 export const listProjectArtifacts = ({ projectId }) => apiFetch(`/api/projects/${projectId}/artifacts`)
@@ -191,4 +201,34 @@ export async function downloadProjectArtifact({ projectId, artifactName }) {
 
   const blob = await response.blob()
   return { blob, filename: artifactName }
+}
+
+export async function downloadAllProjectArtifacts({ projectId }) {
+  requireApiBaseUrl()
+  const token = await getToken()
+
+  const response = await fetch(
+    `${API_BASE_URL}/api/projects/${projectId}/artifacts/download-all/blob`,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    }
+  )
+
+  if (response.status === 401) {
+    window.location.href = '/'
+    throw new Error('Unauthorized')
+  }
+
+  if (!response.ok) {
+    throw new Error(`Failed to download project artifacts: ${projectId}`)
+  }
+
+  const contentDisposition = response.headers.get('content-disposition') || ''
+  const match = /filename="?([^";]+)"?/i.exec(contentDisposition)
+  const filename = match?.[1] || `${projectId}_artifacts.zip`
+  const blob = await response.blob()
+  return { blob, filename }
 }
