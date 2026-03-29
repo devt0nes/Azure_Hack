@@ -312,6 +312,8 @@ class TaskLedger:
                 "development_tools": []
             },
             "feature_catalog": [],
+            "required_api_key_services": [],
+            "service_api_keys": {},
             "layer_onboarding": [],
             "workspace_layout": {
                 "directories": [],
@@ -825,6 +827,12 @@ CONSISTENCY RULES:
 - Match technology stack to requirements
 - Populate ui_preferences with user-facing design direction (theme, tone, colors, layout and accessibility preferences).
 - Populate feature_catalog with ALL expected product features/capabilities.
+- Populate required_api_key_services with inferred third-party services that need credentials (API keys, tokens, DSNs, connection strings), e.g. OpenAI, Stripe, Twilio, SendGrid, Supabase, Pinecone, SerpAPI, Firebase, Anthropic, Google Gemini, MongoDB Atlas.
+- IMPORTANT INFERENCE RULE: infer services from explicit project context, stack, integrations, and feature requirements; do NOT add services by default.
+- DATABASE RULE: include "MongoDB Atlas" only when specs indicate managed/cloud Atlas usage (e.g., Atlas, mongodb+srv URI, cloud-hosted MongoDB, connection-string-based hosted DB).
+- Populate service_api_keys as an object with one key per required service and empty-string values, for example: {{"OpenAI": "", "MongoDB Atlas": ""}}.
+- service_api_keys keys MUST exactly match required_api_key_services values (same names, same count).
+- If there are truly no credential-backed services, set required_api_key_services to [] and service_api_keys to {{}} explicitly.
 - Populate layer_onboarding with one entry per layer. Each entry must include:
     • layer_index
     • stage_name
@@ -954,6 +962,12 @@ CRITICAL RULES:
 ✓ Ensure every required agent role appears exactly once in layers
 ✓ Populate ui_preferences with concrete UX/UI direction from user intent and clarifications
 ✓ Populate feature_catalog with ALL expected project features/capabilities
+✓ Infer and populate required_api_key_services for external API/SaaS/managed DB providers actually mentioned or clearly implied by requirements
+✓ Do not include services that are not grounded in project context
+✓ Include "MongoDB Atlas" only when managed/cloud Atlas cues are present (Atlas, mongodb+srv, hosted/cloud MongoDB URI)
+✓ Populate service_api_keys as placeholders keyed by required services with empty-string values
+✓ service_api_keys keys must exactly mirror required_api_key_services
+✓ If no credential-backed providers are needed, explicitly set required_api_key_services=[] and service_api_keys={{}}
 ✓ Populate layer_onboarding with one detailed onboarding entry per execution layer
 ✓ In layer_onboarding, specify WHAT each layer must deliver, per-role expectations, and next-stage readiness outputs
 ✓ Populate workspace_layout with production-style directories and role_output_roots per role

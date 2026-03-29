@@ -44,3 +44,5 @@ env/
 # Testing
 coverage/
 .coverage
+diff-comps/
+Azure_Hack-working_backend/

@@ -1,10 +1,7 @@
 export default function LogStream({ logs }) {
   return (
-    <div className="workshop-panel rounded-xl p-4">
-      <h2 className="mono text-sm font-semibold uppercase tracking-wide text-foreground/80">
-        Live Logs
-      </h2>
-      <div className="mono mt-4 max-h-48 space-y-1.5 overflow-y-auto text-xs text-foreground/70">
+    <div className="workshop-panel flex h-full min-h-0 flex-col rounded-xl p-4">
+      <div className="mono min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-1 text-xs text-foreground/70">
         {logs.map((log, index) => (
           <p
             key={index}

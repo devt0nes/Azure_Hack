@@ -3,12 +3,21 @@ import {
   askQuestion,
   checkQuestionReadiness,
   clarifyWithAnswers,
+  createProject,
   executeFromSpecs,
+  getProjectApiKeyStatus,
+  getProjectLedger,
   ingestProjectContext,
   loadCanvas,
   uploadCanvasFile,
 } from '../services/api.js'
 import { exportCanvasAsContext } from './IdeaCanvas.jsx'
+
+const CONVERSATION_STATE_PREFIX = 'nexus-conversation-state-v1:'
+
+function getConversationStateStorageKey(projectId) {
+  return `${CONVERSATION_STATE_PREFIX}${projectId}`
+}
 
 const initialMessages = [
   {
@@ -83,12 +92,173 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
   const [isExecuting, setIsExecuting] = useState(false)
   const [nextTopics, setNextTopics] = useState([])
   const [ingestionHint, setIngestionHint] = useState('')
+  const [requiredApiKeyServices, setRequiredApiKeyServices] = useState([])
+  const [serviceApiKeys, setServiceApiKeys] = useState({})
+  const [savedApiKeyServices, setSavedApiKeyServices] = useState([])
+  const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false)
 
   const messagesContainerRef = useRef(null)
   const messagesEndRef = useRef(null)
   const referenceInputRef = useRef(null)
+  const previousProjectIdRef = useRef(activeProjectId)
+
+  const pushApiKeyInlineNotice = (services) => {
+    const cleanServices = (services || [])
+      .map((service) => String(service || '').trim())
+      .filter(Boolean)
+
+    if (cleanServices.length === 0) return
+
+    setMessages((prev) => {
+      const hasExistingNotice = prev.some(
+        (msg) =>
+          msg?.id?.startsWith('api-key-inline-notice-') ||
+          String(msg?.content || '').includes('API keys required before execution')
+      )
+
+      if (hasExistingNotice) return prev
+
+      return [
+        ...prev,
+        {
+          id: `api-key-inline-notice-${Date.now()}`,
+          role: 'system',
+          content: `🔐 API keys required before execution for: ${cleanServices.join(', ')}.\nClick the API Keys button to open the popup and continue execution.`,
+        },
+      ]
+    })
+  }
+
+  async function ensureProjectExists(seedIntent = 'Project setup') {
+    const existingProjectId = activeProjectId || projectId
+    if (existingProjectId) return existingProjectId
+
+    const now = new Date()
+    const fallbackName = `Project ${now.toLocaleDateString()} ${now.toLocaleTimeString()}`
+    const created = await createProject({
+      projectName: fallbackName,
+      userIntent: String(seedIntent || 'Project setup').slice(0, 500),
+      description: 'Created automatically for pre-prompt assets/canvas context.',
+    })
+
+    const createdProjectId = created?.project_id || ''
+    if (!createdProjectId) {
+      throw new Error('Unable to create project')
+    }
+
+    setActiveProjectId(createdProjectId)
+    if (onProjectChange) {
+      onProjectChange(createdProjectId)
+    }
+
+    return createdProjectId
+  }
 
   const sortedMessages = useMemo(() => messages, [messages])
+
+  useEffect(() => {
+    if (!projectId) return
+    if (projectId !== activeProjectId) {
+      setActiveProjectId(projectId)
+    }
+  }, [projectId, activeProjectId])
+
+  useEffect(() => {
+    const previousProjectId = previousProjectIdRef.current
+    previousProjectIdRef.current = activeProjectId
+
+    // Reset conversation state only when switching between existing projects.
+    // Do not reset on initial project assignment after first user message.
+    if (!previousProjectId || !activeProjectId || previousProjectId === activeProjectId) return
+
+    setMessages(initialMessages)
+    setInput('')
+    setError('')
+    setLastUserIntent('')
+    setReferenceFiles([])
+    setIncludeCanvasContext(false)
+    setIngestionHint('')
+    setQuestionCount(0)
+    setCompleteness(0)
+    setSpecReady(false)
+    setSpecPreview('')
+    setNextTopics([])
+    setPendingQuestions([])
+    setAnswerDrafts({})
+    setRequiredApiKeyServices([])
+    setServiceApiKeys({})
+    setSavedApiKeyServices([])
+    setIsApiKeyModalOpen(false)
+  }, [activeProjectId])
+
+  useEffect(() => {
+    if (!activeProjectId) return
+
+    try {
+      const raw = window.localStorage.getItem(getConversationStateStorageKey(activeProjectId))
+      if (!raw) return
+      const saved = JSON.parse(raw)
+
+      if (Array.isArray(saved?.messages) && saved.messages.length > 0) {
+        setMessages(saved.messages)
+      }
+      if (typeof saved?.input === 'string') setInput(saved.input)
+      if (typeof saved?.lastUserIntent === 'string') setLastUserIntent(saved.lastUserIntent)
+      if (typeof saved?.specReady === 'boolean') setSpecReady(saved.specReady)
+      if (typeof saved?.specPreview === 'string') setSpecPreview(saved.specPreview)
+      if (typeof saved?.completeness === 'number') setCompleteness(saved.completeness)
+      if (typeof saved?.questionCount === 'number') setQuestionCount(saved.questionCount)
+      if (Array.isArray(saved?.nextTopics)) setNextTopics(saved.nextTopics)
+      if (Array.isArray(saved?.pendingQuestions)) setPendingQuestions(saved.pendingQuestions)
+      if (saved?.answerDrafts && typeof saved.answerDrafts === 'object') setAnswerDrafts(saved.answerDrafts)
+      if (Array.isArray(saved?.requiredApiKeyServices)) setRequiredApiKeyServices(saved.requiredApiKeyServices)
+      if (Array.isArray(saved?.savedApiKeyServices)) setSavedApiKeyServices(saved.savedApiKeyServices)
+    } catch {
+      // no-op: persistence is best effort
+    }
+  }, [activeProjectId])
+
+  useEffect(() => {
+    if (!activeProjectId) return
+
+    const payload = {
+      messages,
+      input,
+      lastUserIntent,
+      specReady,
+      specPreview,
+      completeness,
+      questionCount,
+      nextTopics,
+      pendingQuestions,
+      answerDrafts,
+      requiredApiKeyServices,
+      savedApiKeyServices,
+    }
+
+    try {
+      window.localStorage.setItem(
+        getConversationStateStorageKey(activeProjectId),
+        JSON.stringify(payload)
+      )
+    } catch {
+      // no-op: persistence is best effort
+    }
+  }, [
+    activeProjectId,
+    messages,
+    input,
+    lastUserIntent,
+    specReady,
+    specPreview,
+    completeness,
+    questionCount,
+    nextTopics,
+    pendingQuestions,
+    answerDrafts,
+    requiredApiKeyServices,
+    savedApiKeyServices,
+  ])
 
   useEffect(() => {
     const container = messagesContainerRef.current
@@ -110,8 +280,71 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
       setIsCheckingReadiness(true)
       try {
         const response = await checkQuestionReadiness({ projectId: activeProjectId })
-        setSpecReady(Boolean(response?.is_ready))
+        const isReady = Boolean(response?.is_ready)
+        setSpecReady(isReady)
         setCompleteness(Number(response?.completeness || 0))
+
+        const readinessServices = Array.isArray(response?.required_api_key_services)
+          ? response.required_api_key_services.map((service) => String(service || '').trim()).filter(Boolean)
+          : []
+
+        if (isReady) {
+          setRequiredApiKeyServices(readinessServices)
+          setServiceApiKeys((prev) => {
+            const next = { ...prev }
+            readinessServices.forEach((service) => {
+              if (!(service in next)) next[service] = ''
+            })
+            return next
+          })
+          pushApiKeyInlineNotice(readinessServices)
+        } else {
+          setRequiredApiKeyServices([])
+          setServiceApiKeys({})
+        }
+
+        if (isReady) {
+          const ledgerResponse = await getProjectLedger({ projectId: activeProjectId })
+          const ledger = ledgerResponse?.ledger_data || {}
+          const services = Array.isArray(ledger?.required_api_key_services)
+            ? ledger.required_api_key_services
+            : []
+          const cleanServices = services
+            .map((service) => String(service || '').trim())
+            .filter(Boolean)
+          if (cleanServices.length > 0) {
+            setRequiredApiKeyServices(cleanServices)
+            setServiceApiKeys((prev) => {
+              const next = { ...prev }
+              cleanServices.forEach((service) => {
+                if (!(service in next)) next[service] = ''
+              })
+              return next
+            })
+            pushApiKeyInlineNotice(cleanServices)
+          }
+
+          try {
+            const keyStatus = await getProjectApiKeyStatus({ projectId: activeProjectId })
+            const savedServices = Array.isArray(keyStatus?.saved_services)
+              ? keyStatus.saved_services.map((service) => String(service || '').trim()).filter(Boolean)
+              : []
+            setSavedApiKeyServices(savedServices)
+            if (savedServices.length > 0) {
+              setServiceApiKeys((prev) => {
+                const next = { ...prev }
+                savedServices.forEach((service) => {
+                  if (!(service in next)) next[service] = ''
+                })
+                return next
+              })
+            }
+          } catch {
+            setSavedApiKeyServices([])
+          }
+        } else {
+          setSavedApiKeyServices([])
+        }
       } catch {
         // no-op: readiness is best-effort
       } finally {
@@ -141,18 +374,20 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
     setIsSending(true)
 
     try {
-      const requestProjectId = activeProjectId || projectId || `project-${Date.now()}`
+      const shouldIngest = referenceFiles.length > 0 || includeCanvasContext
+      const requestProjectId = shouldIngest
+        ? await ensureProjectExists(userMessage.content)
+        : (activeProjectId || projectId || `project-${Date.now()}`)
       let payloadInput = userMessage.content
       let legacyCanvasContext = ''
       let legacyFilesBlock = ''
 
-      const canIngest = Boolean(activeProjectId || projectId)
-      const shouldIngest = referenceFiles.length > 0 || includeCanvasContext
+      const canIngest = Boolean(requestProjectId)
 
       if (canIngest && shouldIngest) {
         try {
           const ingestion = await ingestProjectContext({
-            projectId: activeProjectId || projectId,
+            projectId: requestProjectId,
             referenceFiles,
             includeCanvas: includeCanvasContext,
           })
@@ -172,8 +407,8 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
         }
       }
 
-      if (includeCanvasContext && (activeProjectId || projectId)) {
-        const canvasPayload = await loadCanvas({ projectId: activeProjectId || projectId })
+      if (includeCanvasContext && requestProjectId) {
+        const canvasPayload = await loadCanvas({ projectId: requestProjectId })
         const canvasContext = exportCanvasAsContext(canvasPayload?.canvas_data)
         if (canvasContext) {
           legacyCanvasContext = canvasContext
@@ -298,14 +533,9 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
     event.target.value = ''
     if (!file) return
 
-    const targetProjectId = activeProjectId || projectId
-    if (!targetProjectId) {
-      setError('Please send one message first to create/select a project before uploading reference files.')
-      return
-    }
-
     try {
       setError('')
+      const targetProjectId = await ensureProjectExists(`Upload reference file: ${file.name}`)
       const uploaded = await uploadCanvasFile({ projectId: targetProjectId, file })
       setReferenceFiles((prev) => [
         ...prev,
@@ -363,21 +593,82 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
       return
     }
 
-    if (onExecuteProject) {
-      onExecuteProject()
+    if (!specReady) {
+      setError('Specifications are not ready yet. Please answer more questions first.')
+      return
     }
 
     setError('')
     setIsExecuting(true)
     try {
-      await executeFromSpecs({ projectId: activeProjectId })
+      const ledgerMessage = {
+        id: `ledger-gen-${Date.now()}`,
+        role: 'system',
+        content: '🧠 Director is generating your task ledger from the gathered specifications...',
+      }
+      setMessages((prev) => [...prev, ledgerMessage])
+
+      const nonEmptyApiKeys = Object.fromEntries(
+        Object.entries(serviceApiKeys).filter(([, value]) => String(value || '').trim())
+      )
+
+      const response = await executeFromSpecs({ projectId: activeProjectId, serviceApiKeys: nonEmptyApiKeys })
+      if (response?.status && response.status !== 'running') {
+        const backendMessage = response?.message || 'Execution did not start.'
+        const missingServices = Array.isArray(response?.missing_services)
+          ? response.missing_services
+          : []
+        const requiredServices = Array.isArray(response?.required_api_key_services)
+          ? response.required_api_key_services
+          : []
+
+        const nextRequired = (requiredServices.length > 0 ? requiredServices : missingServices)
+          .map((service) => String(service || '').trim())
+          .filter(Boolean)
+
+        if (nextRequired.length > 0) {
+          setRequiredApiKeyServices(nextRequired)
+          setServiceApiKeys((prev) => {
+            const next = { ...prev }
+            nextRequired.forEach((service) => {
+              if (!(service in next)) next[service] = ''
+            })
+            return next
+          })
+          setSpecReady(true)
+          setIsApiKeyModalOpen(true)
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `api-key-gate-${Date.now()}`,
+              role: 'system',
+              content: `🔐 Task ledger generated. API keys required for: ${nextRequired.join(', ')}. Please fill the popup to continue.`,
+            },
+          ])
+          setError('Please provide the required API keys to continue execution.')
+        }
+
+        if (missingServices.length > 0) {
+          setError(`${backendMessage} Missing: ${missingServices.join(', ')}`)
+        } else {
+          setError(backendMessage)
+        }
+        setIsExecuting(false)
+        return
+      }
+
       const executionMessage = {
         id: `execution-${Date.now()}`,
         role: 'system',
         content:
-          '✨ Starting execution with your specifications. The Director Agent is now taking over to create your project structure and distribute tasks to the implementation agents.',
+          '✨ Task ledger is ready. Starting agent execution and opening AEG + Preview.',
       }
       setMessages((prev) => [...prev, executionMessage])
+      setIsApiKeyModalOpen(false)
+
+      if (onExecuteProject && response?.orchestration_started !== false) {
+        onExecuteProject()
+      }
 
       if (onProjectChange) {
         onProjectChange(activeProjectId)
@@ -390,6 +681,7 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
   }
 
   const effectiveCompleteness = Math.max(completeness, Math.min(questionCount * 10, 100))
+  const hasApiKeyRequirements = requiredApiKeyServices.length > 0
 
   return (
     <div className="h-full min-h-0 flex flex-col">
@@ -510,7 +802,7 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
                 <button
                   type="button"
                   onClick={handleExecuteFromSpecs}
-                  disabled={isExecuting || isSending || !activeProjectId}
+                  disabled={isExecuting || isSending || !activeProjectId || !specReady}
                   className="group inline-flex h-10 items-center gap-2 overflow-hidden rounded-full border border-green-500/55 bg-green-500/10 px-3 text-sm font-semibold text-green-700 transition-all duration-300 hover:bg-green-500/20 disabled:cursor-not-allowed disabled:opacity-70"
                   title="Execute and generate project"
                   aria-label="Execute and generate project"
@@ -573,6 +865,17 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
                       <span className="mono uppercase tracking-[0.12em]">Idea Canvas</span>
                     </button>
                   </div>
+                  {hasApiKeyRequirements ? (
+                    <button
+                      type="button"
+                      onClick={() => setIsApiKeyModalOpen(true)}
+                      className="inline-flex h-8 items-center rounded-full border border-amber-500/55 bg-amber-500/10 px-3 text-xs font-semibold text-amber-700 transition hover:bg-amber-500/20"
+                      title="Open API key popup"
+                      aria-label="Open API key popup"
+                    >
+                      API Keys
+                    </button>
+                  ) : null}
                 </div>
               </div>
             </div>
@@ -604,12 +907,6 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
             ) : null}
           </form>
 
-          {nextTopics.length > 0 ? (
-            <div className="rounded-lg border border-border bg-card px-4 py-3 text-xs text-foreground/70">
-              Suggested next topics: {nextTopics.join(' • ')}
-            </div>
-          ) : null}
-
           {specPreview ? (
             <details className="rounded-lg border border-border bg-card px-4 py-3 text-xs text-foreground/70">
               <summary className="cursor-pointer select-none">Specification preview ({effectiveCompleteness}%)</summary>
@@ -628,6 +925,71 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
 
         </div>
       </div>
+
+      {isApiKeyModalOpen && requiredApiKeyServices.length > 0 ? (
+        <div className="fixed inset-0 z-[180] flex items-center justify-center bg-black/45 px-4">
+          <div className="w-full max-w-xl rounded-2xl border border-amber-500/45 bg-card p-5 shadow-2xl">
+            <div className="mb-4 flex items-start justify-between gap-4">
+              <div>
+                <h3 className="text-base font-bold text-foreground">API keys required to continue</h3>
+                <p className="mt-1 text-xs text-foreground/70">
+                  We generated your task ledger. Please provide keys for required services, then continue execution.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsApiKeyModalOpen(false)}
+                className="rounded-lg border border-border bg-card px-2 py-1 text-xs font-semibold text-foreground/70 transition hover:bg-accent"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              {requiredApiKeyServices.map((service) => (
+                <div key={service} className="space-y-1">
+                  <label className="text-xs font-medium text-amber-800">
+                    {service} API Key
+                    {savedApiKeyServices.includes(service) ? (
+                      <span className="ml-2 text-[11px] font-semibold text-emerald-700">Saved on backend</span>
+                    ) : null}
+                  </label>
+                  <input
+                    type="password"
+                    value={serviceApiKeys[service] || ''}
+                    onChange={(event) =>
+                      setServiceApiKeys((prev) => ({
+                        ...prev,
+                        [service]: event.target.value,
+                      }))
+                    }
+                    placeholder={`Enter ${service} API key`}
+                    className="w-full rounded-xl border border-amber-300/60 bg-card px-3 py-2 text-sm text-foreground outline-none focus:border-amber-500"
+                  />
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setIsApiKeyModalOpen(false)}
+                className="rounded-full border border-border bg-card px-4 py-2 text-xs font-semibold text-foreground transition hover:bg-accent"
+              >
+                Save for later
+              </button>
+              <button
+                type="button"
+                onClick={handleExecuteFromSpecs}
+                disabled={isExecuting || isSending}
+                className="rounded-full border border-green-500/55 bg-green-500/12 px-4 py-2 text-xs font-semibold text-green-700 transition hover:bg-green-500/20 disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                {isExecuting ? 'Submitting...' : 'Submit keys & continue'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

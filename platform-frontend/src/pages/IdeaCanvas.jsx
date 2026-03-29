@@ -16,6 +16,7 @@ import CanvasToolbar from '../components/CanvasToolbar.jsx'
 import { loadCanvas, saveCanvas, uploadCanvasFile } from '../services/api.js'
 
 const EDGE_LABELS = ['related to', 'input for', 'depends on', 'inspires']
+const LOCAL_CANVAS_DRAFT_KEY = 'idea-canvas-draft-v1'
 
 const CANVAS_API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 
@@ -27,6 +28,183 @@ function getStickyClasses(color) {
     if (color === 'pink') return 'bg-pink-100 border-pink-300'
     if (color === 'blue') return 'bg-blue-100 border-blue-300'
     return 'bg-yellow-100 border-yellow-300'
+}
+
+function normalizeDrawing(drawing) {
+    if (!drawing || typeof drawing !== 'object') return null
+
+    if (drawing.kind === 'shape') {
+        const start = drawing.start
+        const end = drawing.end
+        if (!start || !end) return null
+        const allowedShapes = new Set([
+            'rectangle',
+            'roundedRectangle',
+            'square',
+            'circle',
+            'ellipse',
+            'triangle',
+            'diamond',
+            'pentagon',
+            'hexagon',
+            'octagon',
+            'line',
+            'arrow',
+            'star',
+        ])
+        if (!allowedShapes.has(drawing.shape)) return null
+        return {
+            kind: 'shape',
+            shape: drawing.shape,
+            start,
+            end,
+        }
+    }
+
+    const points = Array.isArray(drawing.points) ? drawing.points : []
+    if (points.length < 2) return null
+    return {
+        kind: 'path',
+        tool: drawing.tool === 'eraser' ? 'eraser' : 'pen',
+        points,
+    }
+}
+
+function drawPolygon(ctx, points) {
+    if (!Array.isArray(points) || points.length < 3) return
+    ctx.beginPath()
+    ctx.moveTo(points[0][0], points[0][1])
+    for (let index = 1; index < points.length; index += 1) {
+        ctx.lineTo(points[index][0], points[index][1])
+    }
+    ctx.closePath()
+    ctx.stroke()
+}
+
+function polygonPoints(cx, cy, radius, sides, rotation = -Math.PI / 2) {
+    return Array.from({ length: sides }, (_, index) => {
+        const angle = rotation + (index * Math.PI * 2) / sides
+        return [cx + radius * Math.cos(angle), cy + radius * Math.sin(angle)]
+    })
+}
+
+function drawStar(ctx, cx, cy, outerRadius, innerRadius, points = 5) {
+    const starPoints = []
+    for (let index = 0; index < points * 2; index += 1) {
+        const angle = -Math.PI / 2 + (index * Math.PI) / points
+        const radius = index % 2 === 0 ? outerRadius : innerRadius
+        starPoints.push([cx + radius * Math.cos(angle), cy + radius * Math.sin(angle)])
+    }
+    drawPolygon(ctx, starPoints)
+}
+
+function drawShape(ctx, shape, startX, startY, endX, endY) {
+    const minX = Math.min(startX, endX)
+    const minY = Math.min(startY, endY)
+    const width = Math.abs(endX - startX)
+    const height = Math.abs(endY - startY)
+    const centerX = minX + width / 2
+    const centerY = minY + height / 2
+    const radius = Math.min(width, height) / 2
+
+    if (shape === 'line' || shape === 'arrow') {
+        ctx.beginPath()
+        ctx.moveTo(startX, startY)
+        ctx.lineTo(endX, endY)
+        ctx.stroke()
+
+        if (shape === 'arrow') {
+            const headLength = 12
+            const angle = Math.atan2(endY - startY, endX - startX)
+            ctx.beginPath()
+            ctx.moveTo(endX, endY)
+            ctx.lineTo(endX - headLength * Math.cos(angle - Math.PI / 7), endY - headLength * Math.sin(angle - Math.PI / 7))
+            ctx.moveTo(endX, endY)
+            ctx.lineTo(endX - headLength * Math.cos(angle + Math.PI / 7), endY - headLength * Math.sin(angle + Math.PI / 7))
+            ctx.stroke()
+        }
+        return
+    }
+
+    if (shape === 'rectangle') {
+        ctx.strokeRect(minX, minY, width, height)
+        return
+    }
+
+    if (shape === 'roundedRectangle') {
+        const corner = Math.min(14, width / 4, height / 4)
+        ctx.beginPath()
+        ctx.moveTo(minX + corner, minY)
+        ctx.lineTo(minX + width - corner, minY)
+        ctx.quadraticCurveTo(minX + width, minY, minX + width, minY + corner)
+        ctx.lineTo(minX + width, minY + height - corner)
+        ctx.quadraticCurveTo(minX + width, minY + height, minX + width - corner, minY + height)
+        ctx.lineTo(minX + corner, minY + height)
+        ctx.quadraticCurveTo(minX, minY + height, minX, minY + height - corner)
+        ctx.lineTo(minX, minY + corner)
+        ctx.quadraticCurveTo(minX, minY, minX + corner, minY)
+        ctx.closePath()
+        ctx.stroke()
+        return
+    }
+
+    if (shape === 'square') {
+        const side = Math.min(width, height)
+        ctx.strokeRect(minX, minY, side, side)
+        return
+    }
+
+    if (shape === 'circle') {
+        ctx.beginPath()
+        ctx.ellipse(centerX, centerY, radius, radius, 0, 0, Math.PI * 2)
+        ctx.stroke()
+        return
+    }
+
+    if (shape === 'ellipse') {
+        ctx.beginPath()
+        ctx.ellipse(centerX, centerY, width / 2, height / 2, 0, 0, Math.PI * 2)
+        ctx.stroke()
+        return
+    }
+
+    if (shape === 'triangle') {
+        drawPolygon(ctx, [
+            [centerX, minY],
+            [minX + width, minY + height],
+            [minX, minY + height],
+        ])
+        return
+    }
+
+    if (shape === 'diamond') {
+        drawPolygon(ctx, [
+            [centerX, minY],
+            [minX + width, centerY],
+            [centerX, minY + height],
+            [minX, centerY],
+        ])
+        return
+    }
+
+    if (shape === 'pentagon') {
+        drawPolygon(ctx, polygonPoints(centerX, centerY, radius, 5))
+        return
+    }
+
+    if (shape === 'hexagon') {
+        drawPolygon(ctx, polygonPoints(centerX, centerY, radius, 6, 0))
+        return
+    }
+
+    if (shape === 'octagon') {
+        drawPolygon(ctx, polygonPoints(centerX, centerY, radius, 8))
+        return
+    }
+
+    if (shape === 'star') {
+        drawStar(ctx, centerX, centerY, radius, Math.max(radius * 0.45, 4), 5)
+    }
 }
 
 function getNodeCardLabel(node) {
@@ -70,6 +248,39 @@ function sanitizeCanvasData(nodes, edges) {
             markerEnd: edge.markerEnd,
             data: edge.data || {},
         })),
+    }
+}
+
+function readLocalCanvasDraft() {
+    try {
+        if (typeof window === 'undefined') return null
+        const raw = window.localStorage.getItem(LOCAL_CANVAS_DRAFT_KEY)
+        if (!raw) return null
+        const parsed = JSON.parse(raw)
+        if (!parsed || typeof parsed !== 'object') return null
+        return {
+            nodes: Array.isArray(parsed.nodes) ? parsed.nodes : [],
+            edges: Array.isArray(parsed.edges) ? parsed.edges : [],
+            drawings: Array.isArray(parsed.drawings) ? parsed.drawings : [],
+        }
+    } catch {
+        return null
+    }
+}
+
+function writeLocalCanvasDraft(canvasData) {
+    try {
+        if (typeof window === 'undefined' || !canvasData) return
+        window.localStorage.setItem(LOCAL_CANVAS_DRAFT_KEY, JSON.stringify(canvasData))
+    } catch {
+    }
+}
+
+function clearLocalCanvasDraft() {
+    try {
+        if (typeof window === 'undefined') return
+        window.localStorage.removeItem(LOCAL_CANVAS_DRAFT_KEY)
+    } catch {
     }
 }
 
@@ -217,7 +428,7 @@ function StickyNoteNode({ id, data, selected }) {
                 value={data.text || ''}
                 onChange={(event) => data.onChange?.(id, { text: event.target.value })}
                 placeholder="Sticky text"
-                className="w-[180px] rounded-md bg-transparent text-sm font-medium text-ink outline-none"
+                className="w-[180px] rounded-md bg-transparent text-sm font-medium text-black outline-none placeholder:text-black/70 dark:text-black dark:placeholder:text-black/70"
             />
             <Handle
                 type="source"
@@ -228,16 +439,46 @@ function StickyNoteNode({ id, data, selected }) {
     )
 }
 
-export default function IdeaCanvas({ projectId, isFullscreen = false }) {
+export default function IdeaCanvas({ projectId, isFullscreen = false, onSaveStatusChange }) {
     const [nodes, setNodes, onNodesChange] = useNodesState([])
     const [edges, setEdges, onEdgesChange] = useEdgesState([])
     const [isLoading, setIsLoading] = useState(false)
     const [error, setError] = useState('')
     const [drawMode, setDrawMode] = useState(false)
+    const [drawTool, setDrawTool] = useState('pen')
+    const [shapeType, setShapeType] = useState('rectangle')
     const [drawings, setDrawings] = useState([])
     const drawCanvasRef = useRef(null)
     const drawContainerRef = useRef(null)
+    const miniDrawingsCanvasRef = useRef(null)
     const liveStrokeRef = useRef(null)
+    const hasHydratedRef = useRef(false)
+    const saveTimerRef = useRef(null)
+    const lastSavedFingerprintRef = useRef('')
+    const latestCanvasSnapshotRef = useRef({ projectId: '', canvasData: null })
+    const migratedLocalDraftRef = useRef(false)
+    const hydrationPendingRef = useRef(false)
+    const hydrationFingerprintRef = useRef('')
+
+    const reportSaveState = useCallback(
+        (state) => {
+            if (typeof onSaveStatusChange === 'function') {
+                onSaveStatusChange(state)
+            }
+        },
+        [onSaveStatusChange]
+    )
+
+    const persistCanvas = useCallback(
+        async (payloadProjectId, payloadCanvasData) => {
+            if (!payloadProjectId || !payloadCanvasData) return
+            const fingerprint = JSON.stringify(payloadCanvasData)
+            if (fingerprint === lastSavedFingerprintRef.current) return
+            await saveCanvas({ projectId: payloadProjectId, canvasData: payloadCanvasData })
+            lastSavedFingerprintRef.current = fingerprint
+        },
+        []
+    )
 
     const withNodeHandlers = useCallback(
         (rawNodes) =>
@@ -404,11 +645,24 @@ export default function IdeaCanvas({ projectId, isFullscreen = false }) {
 
     useEffect(() => {
         let cancelled = false
+        hasHydratedRef.current = false
+        migratedLocalDraftRef.current = false
+        hydrationPendingRef.current = false
+        hydrationFingerprintRef.current = ''
 
         async function fetchCanvas() {
             if (!projectId) {
-                setNodes([])
-                setEdges([])
+                const localDraft = readLocalCanvasDraft() || { nodes: [], edges: [], drawings: [] }
+                const localFingerprint = JSON.stringify(localDraft)
+                setNodes(withNodeHandlers(localDraft.nodes))
+                setEdges(localDraft.edges)
+                setDrawings(localDraft.drawings)
+                latestCanvasSnapshotRef.current = { projectId: '', canvasData: localDraft }
+                lastSavedFingerprintRef.current = localFingerprint
+                hydrationPendingRef.current = true
+                hydrationFingerprintRef.current = localFingerprint
+                hasHydratedRef.current = true
+                reportSaveState('saved')
                 return
             }
 
@@ -419,9 +673,37 @@ export default function IdeaCanvas({ projectId, isFullscreen = false }) {
                 const canvasData = response?.canvas_data || {}
                 if (cancelled) return
 
-                setNodes(withNodeHandlers(Array.isArray(canvasData.nodes) ? canvasData.nodes : []))
-                setEdges(Array.isArray(canvasData.edges) ? canvasData.edges : [])
-                setDrawings(Array.isArray(canvasData.drawings) ? canvasData.drawings : [])
+                let hydratedCanvasData = {
+                    nodes: Array.isArray(canvasData.nodes) ? canvasData.nodes : [],
+                    edges: Array.isArray(canvasData.edges) ? canvasData.edges : [],
+                    drawings: Array.isArray(canvasData.drawings) ? canvasData.drawings : [],
+                }
+
+                const hasServerContent =
+                    hydratedCanvasData.nodes.length > 0 ||
+                    hydratedCanvasData.edges.length > 0 ||
+                    hydratedCanvasData.drawings.length > 0
+
+                const localDraft = readLocalCanvasDraft()
+                const hasLocalDraft =
+                    !!localDraft &&
+                    (localDraft.nodes.length > 0 || localDraft.edges.length > 0 || localDraft.drawings.length > 0)
+
+                if (!hasServerContent && hasLocalDraft && !migratedLocalDraftRef.current) {
+                    hydratedCanvasData = localDraft
+                    migratedLocalDraftRef.current = true
+                }
+
+                setNodes(withNodeHandlers(hydratedCanvasData.nodes))
+                setEdges(hydratedCanvasData.edges)
+                setDrawings(hydratedCanvasData.drawings)
+                const hydratedFingerprint = JSON.stringify(hydratedCanvasData)
+                latestCanvasSnapshotRef.current = { projectId, canvasData: hydratedCanvasData }
+                lastSavedFingerprintRef.current = hydratedFingerprint
+                hydrationPendingRef.current = true
+                hydrationFingerprintRef.current = hydratedFingerprint
+                hasHydratedRef.current = true
+                reportSaveState('saved')
             } catch (loadError) {
                 console.error(loadError)
                 if (!cancelled) {
@@ -429,6 +711,15 @@ export default function IdeaCanvas({ projectId, isFullscreen = false }) {
                     setEdges([])
                     setDrawings([])
                     setError('Unable to load Idea Canvas for this project.')
+                    latestCanvasSnapshotRef.current = {
+                        projectId,
+                        canvasData: { nodes: [], edges: [], drawings: [] },
+                    }
+                    lastSavedFingerprintRef.current = JSON.stringify({ nodes: [], edges: [], drawings: [] })
+                    hasHydratedRef.current = true
+                    hydrationPendingRef.current = false
+                    hydrationFingerprintRef.current = ''
+                    reportSaveState('error')
                 }
             } finally {
                 if (!cancelled) setIsLoading(false)
@@ -442,22 +733,103 @@ export default function IdeaCanvas({ projectId, isFullscreen = false }) {
     }, [projectId, setEdges, setNodes, withNodeHandlers])
 
     useEffect(() => {
-        if (!projectId) return undefined
+        if (!hasHydratedRef.current) return undefined
 
-        const timer = window.setInterval(async () => {
+        const canvasData = {
+            ...sanitizeCanvasData(nodes, edges),
+            drawings,
+        }
+
+        const fingerprint = JSON.stringify(canvasData)
+
+        if (hydrationPendingRef.current) {
+            if (fingerprint !== hydrationFingerprintRef.current) {
+                return undefined
+            }
+            hydrationPendingRef.current = false
+            hydrationFingerprintRef.current = ''
+            latestCanvasSnapshotRef.current = { projectId, canvasData }
+            return undefined
+        }
+
+        latestCanvasSnapshotRef.current = { projectId, canvasData }
+
+        if (fingerprint !== lastSavedFingerprintRef.current) {
+            reportSaveState('unsaved')
+        }
+
+        if (saveTimerRef.current) {
+            window.clearTimeout(saveTimerRef.current)
+        }
+
+        saveTimerRef.current = window.setTimeout(async () => {
             try {
-                const canvasData = {
-                    ...sanitizeCanvasData(nodes, edges),
-                    drawings,
+                reportSaveState('saving')
+                if (!projectId) {
+                    writeLocalCanvasDraft(canvasData)
+                    lastSavedFingerprintRef.current = fingerprint
+                    reportSaveState('saved-local')
+                } else {
+                    await persistCanvas(projectId, canvasData)
+                    const hasAnyContent =
+                        canvasData.nodes.length > 0 ||
+                        canvasData.edges.length > 0 ||
+                        canvasData.drawings.length > 0
+                    if (hasAnyContent) {
+                        clearLocalCanvasDraft()
+                    }
+                    reportSaveState('saved')
                 }
-                await saveCanvas({ projectId, canvasData })
             } catch (saveError) {
                 console.error(saveError)
+                reportSaveState('error')
             }
-        }, 30000)
+        }, 1000)
 
-        return () => window.clearInterval(timer)
-    }, [projectId, nodes, edges, drawings])
+        return () => {
+            if (saveTimerRef.current) {
+                window.clearTimeout(saveTimerRef.current)
+                saveTimerRef.current = null
+            }
+        }
+    }, [projectId, nodes, edges, drawings, persistCanvas])
+
+    useEffect(() => {
+        return () => {
+            if (saveTimerRef.current) {
+                window.clearTimeout(saveTimerRef.current)
+                saveTimerRef.current = null
+            }
+
+            const snapshot = latestCanvasSnapshotRef.current
+            if (!snapshot?.canvasData || !hasHydratedRef.current) return
+
+            if (!snapshot.projectId) {
+                writeLocalCanvasDraft(snapshot.canvasData)
+                const localFingerprint = JSON.stringify(snapshot.canvasData)
+                lastSavedFingerprintRef.current = localFingerprint
+                reportSaveState('saved-local')
+                return
+            }
+
+            reportSaveState('saving')
+            persistCanvas(snapshot.projectId, snapshot.canvasData)
+                .then(() => {
+                    const hasAnyContent =
+                        snapshot.canvasData.nodes.length > 0 ||
+                        snapshot.canvasData.edges.length > 0 ||
+                        snapshot.canvasData.drawings.length > 0
+                    if (hasAnyContent) {
+                        clearLocalCanvasDraft()
+                    }
+                    reportSaveState('saved')
+                })
+                .catch((saveError) => {
+                    console.error(saveError)
+                    reportSaveState('error')
+                })
+        }
+    }, [persistCanvas, reportSaveState])
 
     useEffect(() => {
         const canvas = drawCanvasRef.current
@@ -480,47 +852,169 @@ export default function IdeaCanvas({ projectId, isFullscreen = false }) {
         ctx.lineCap = 'round'
         ctx.lineJoin = 'round'
 
-        drawings.forEach((stroke) => {
-            const points = Array.isArray(stroke?.points) ? stroke.points : []
-            if (points.length < 2) return
+        drawings.forEach((entry) => {
+            const drawing = normalizeDrawing(entry)
+            if (!drawing) return
+
+            if (drawing.kind === 'shape') {
+                const startX = drawing.start.x * width
+                const startY = drawing.start.y * height
+                const endX = drawing.end.x * width
+                const endY = drawing.end.y * height
+
+                ctx.save()
+                ctx.globalCompositeOperation = 'source-over'
+                ctx.strokeStyle = '#F26A2E'
+                ctx.lineWidth = 2
+
+                drawShape(ctx, drawing.shape, startX, startY, endX, endY)
+
+                ctx.restore()
+                return
+            }
+
+            const points = drawing.points
+            ctx.save()
+            if (drawing.tool === 'eraser') {
+                ctx.globalCompositeOperation = 'destination-out'
+                ctx.strokeStyle = 'rgba(0, 0, 0, 1)'
+                ctx.lineWidth = 18
+            } else {
+                ctx.globalCompositeOperation = 'source-over'
+                ctx.strokeStyle = '#F26A2E'
+                ctx.lineWidth = 2
+            }
+
             ctx.beginPath()
-            ctx.strokeStyle = '#F26A2E'
-            ctx.lineWidth = 2
             ctx.moveTo(points[0].x * width, points[0].y * height)
             for (let index = 1; index < points.length; index += 1) {
                 ctx.lineTo(points[index].x * width, points[index].y * height)
             }
             ctx.stroke()
+            ctx.restore()
         })
     }, [drawings, isFullscreen])
 
-    const appendDrawingPoint = useCallback((event) => {
+    useEffect(() => {
+        const miniCanvas = miniDrawingsCanvasRef.current
+        if (!miniCanvas) return
+        const width = miniCanvas.width
+        const height = miniCanvas.height
+        const ctx = miniCanvas.getContext('2d')
+        if (!ctx) return
+
+        ctx.clearRect(0, 0, width, height)
+        ctx.lineCap = 'round'
+        ctx.lineJoin = 'round'
+
+        drawings.forEach((entry) => {
+            const drawing = normalizeDrawing(entry)
+            if (!drawing) return
+
+            if (drawing.kind === 'shape') {
+                const startX = drawing.start.x * width
+                const startY = drawing.start.y * height
+                const endX = drawing.end.x * width
+                const endY = drawing.end.y * height
+                ctx.save()
+                ctx.globalCompositeOperation = 'source-over'
+                ctx.strokeStyle = '#F26A2E'
+                ctx.lineWidth = 1.5
+                drawShape(ctx, drawing.shape, startX, startY, endX, endY)
+                ctx.restore()
+                return
+            }
+
+            const points = drawing.points
+            ctx.save()
+            if (drawing.tool === 'eraser') {
+                ctx.globalCompositeOperation = 'destination-out'
+                ctx.strokeStyle = 'rgba(0, 0, 0, 1)'
+                ctx.lineWidth = 8
+            } else {
+                ctx.globalCompositeOperation = 'source-over'
+                ctx.strokeStyle = '#F26A2E'
+                ctx.lineWidth = 1.5
+            }
+            ctx.beginPath()
+            ctx.moveTo(points[0].x * width, points[0].y * height)
+            for (let index = 1; index < points.length; index += 1) {
+                ctx.lineTo(points[index].x * width, points[index].y * height)
+            }
+            ctx.stroke()
+            ctx.restore()
+        })
+    }, [drawings])
+
+    const getNormalizedPointFromEvent = useCallback((event) => {
         const container = drawContainerRef.current
-        if (!container || !liveStrokeRef.current) return
+        if (!container) return null
         const rect = container.getBoundingClientRect()
-        if (!rect.width || !rect.height) return
+        if (!rect.width || !rect.height) return null
         const x = (event.clientX - rect.left) / rect.width
         const y = (event.clientY - rect.top) / rect.height
-        const safeX = Math.min(1, Math.max(0, x))
-        const safeY = Math.min(1, Math.max(0, y))
-        liveStrokeRef.current.points.push({ x: safeX, y: safeY })
+        return {
+            x: Math.min(1, Math.max(0, x)),
+            y: Math.min(1, Math.max(0, y)),
+        }
     }, [])
+
+    const appendDrawingPoint = useCallback((event) => {
+        if (!liveStrokeRef.current) return
+        const point = getNormalizedPointFromEvent(event)
+        if (!point) return
+        if (!Array.isArray(liveStrokeRef.current.points)) {
+            liveStrokeRef.current.points = []
+        }
+        liveStrokeRef.current.points.push(point)
+    }, [getNormalizedPointFromEvent])
 
     const onDrawPointerDown = useCallback(
         (event) => {
             if (!drawMode) return
             event.preventDefault()
-            liveStrokeRef.current = { points: [] }
-            setDrawings((prev) => [...prev, { points: [] }])
+            if (drawTool === 'shape') {
+                const point = getNormalizedPointFromEvent(event)
+                if (!point) return
+                liveStrokeRef.current = {
+                    kind: 'shape',
+                    shape: shapeType,
+                    start: point,
+                    end: point,
+                }
+                setDrawings((prev) => [...prev, { ...liveStrokeRef.current }])
+                return
+            }
+
+            liveStrokeRef.current = {
+                kind: 'path',
+                tool: drawTool === 'eraser' ? 'eraser' : 'pen',
+                points: [],
+            }
+            setDrawings((prev) => [...prev, { ...liveStrokeRef.current }])
             appendDrawingPoint(event)
         },
-        [appendDrawingPoint, drawMode]
+        [appendDrawingPoint, drawMode, drawTool, getNormalizedPointFromEvent, shapeType]
     )
 
     const onDrawPointerMove = useCallback(
         (event) => {
             if (!drawMode || !liveStrokeRef.current) return
             event.preventDefault()
+
+            if (liveStrokeRef.current.kind === 'shape') {
+                const point = getNormalizedPointFromEvent(event)
+                if (!point) return
+                liveStrokeRef.current.end = point
+                setDrawings((prev) => {
+                    if (prev.length === 0) return [{ ...liveStrokeRef.current }]
+                    const draft = prev.slice()
+                    draft[draft.length - 1] = { ...liveStrokeRef.current }
+                    return draft
+                })
+                return
+            }
+
             appendDrawingPoint(event)
             setDrawings((prev) => {
                 if (prev.length === 0) return [{ ...liveStrokeRef.current }]
@@ -529,19 +1023,37 @@ export default function IdeaCanvas({ projectId, isFullscreen = false }) {
                 return draft
             })
         },
-        [appendDrawingPoint, drawMode]
+        [appendDrawingPoint, drawMode, getNormalizedPointFromEvent]
     )
 
     const onDrawPointerUp = useCallback(() => {
         const live = liveStrokeRef.current
-        if (live && live.points.length > 1) {
+        if (!live) return
+
+        if (live.kind === 'shape') {
+            const width = Math.abs((live.end?.x || 0) - (live.start?.x || 0))
+            const height = Math.abs((live.end?.y || 0) - (live.start?.y || 0))
+            if (width > 0.003 || height > 0.003) {
+                setDrawings((prev) => {
+                    const withoutDraft = prev.slice(0, -1)
+                    return [...withoutDraft, { ...live }]
+                })
+            } else {
+                setDrawings((prev) => prev.slice(0, -1))
+            }
+            liveStrokeRef.current = null
+            return
+        }
+
+        if (Array.isArray(live.points) && live.points.length > 1) {
             setDrawings((prev) => {
                 const withoutDraft = prev.slice(0, -1)
-                return [...withoutDraft, live]
+                return [...withoutDraft, { ...live }]
             })
-        } else if (live) {
+        } else {
             setDrawings((prev) => prev.slice(0, -1))
         }
+
         liveStrokeRef.current = null
     }, [])
 
@@ -554,7 +1066,18 @@ export default function IdeaCanvas({ projectId, isFullscreen = false }) {
                 onUploadFile={(file) => addUploadedAssetNode(file, 'fileNode')}
                 onAddUrl={addUrlNode}
                 drawMode={drawMode}
+                drawTool={drawTool}
                 onToggleDrawMode={() => setDrawMode((prev) => !prev)}
+                onSelectDrawTool={(tool) => {
+                    setDrawTool(tool)
+                    setDrawMode(true)
+                }}
+                shapeType={shapeType}
+                onSelectShape={(shape) => {
+                    setShapeType(shape)
+                    setDrawTool('shape')
+                    setDrawMode(true)
+                }}
                 onClearDrawings={() => setDrawings([])}
                 onClearCanvas={() => {
                     setNodes([])
@@ -608,12 +1131,18 @@ export default function IdeaCanvas({ projectId, isFullscreen = false }) {
                                 className="bg-card/90 border border-border rounded-lg"
                                 maskColor="hsl(var(--background) / 0.6)"
                             />
+                            <canvas
+                                ref={miniDrawingsCanvasRef}
+                                width={200}
+                                height={128}
+                                className="pointer-events-none absolute bottom-3 right-3 z-20 rounded-lg border border-border/70 bg-card/65"
+                            />
                         </ReactFlow>
                     )}
 
                     <canvas
                         ref={drawCanvasRef}
-                        className={`absolute inset-0 z-20 ${drawMode ? 'cursor-crosshair pointer-events-auto' : 'pointer-events-none'}`}
+                        className={`absolute inset-0 z-20 ${drawMode ? 'pointer-events-auto' : 'pointer-events-none'} ${drawTool === 'eraser' ? 'cursor-cell' : 'cursor-crosshair'}`}
                         onPointerDown={onDrawPointerDown}
                         onPointerMove={onDrawPointerMove}
                         onPointerUp={onDrawPointerUp}

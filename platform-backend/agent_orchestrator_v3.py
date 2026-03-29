@@ -654,6 +654,13 @@ YOU are responsible for all validation:
    ✅ Missing environment variables for external services
    ✅ These don't affect route/page structure validation
 
+6. API KEY LEDGER AUDIT (MANDATORY)
+  ├─ Inspect workspace/ledger_<project_id>.json
+  ├─ Verify `required_api_key_services` is populated when external APIs/SaaS are used
+  ├─ Verify `service_api_keys` contains placeholder keys for each required service
+  ├─ Infer missing services from contracts/specs/integrations (OpenAI, Stripe, Twilio, SendGrid, Supabase, Pinecone, SerpAPI, Firebase, Anthropic, Gemini, etc.)
+  └─ If missing/incomplete, report CRITICAL issue assigned to `system_architect` (or `backend_engineer` in fix iterations)
+
 ════════════════════════════════════════════════════════════════════════════════
 QA AUDIT MODE - NO TEST SUITE AUTHORING
 ════════════════════════════════════════════════════════════════════════════════
@@ -688,6 +695,7 @@ SYSTEM ARCHITECT COMPLIANCE (MANDATORY):
   ✅ Treat contracts/backend_api_contract.json and contracts/frontend_route_contract.json as compulsory source of truth.
   ✅ Verify EACH AND EVERY declared endpoint/page/route exists and behaves as specified.
   ✅ If any mismatch is found, report it as a concrete issue with expected vs actual evidence.
+  ✅ Treat ledger API-key fields as required deliverables: `required_api_key_services` and `service_api_keys`.
 
 PHASE 1: ANALYZE SYSTEM (Iteration 1-2)
   ├─ Read upstream components: Database schema, backend routes, frontend pages

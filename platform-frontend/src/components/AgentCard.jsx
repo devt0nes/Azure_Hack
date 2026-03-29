@@ -34,16 +34,16 @@ export default function AgentCard({ name, state, progress }) {
 
   return (
     <div
-      className={`group relative rounded-lg border px-3 py-2 text-xs transition-all duration-300 hover:border-foreground/20 ${styles.bg} ${styles.border} ${styles.glow}`}
+      className={`group relative rounded-xl border px-4 py-3 text-sm transition-all duration-300 hover:border-foreground/20 ${styles.bg} ${styles.border} ${styles.glow}`}
     >
-      <div className="absolute inset-0 rounded-lg bg-gradient-to-r from-transparent via-primary/5 to-transparent opacity-0 transition-opacity group-hover:opacity-100" />
+      <div className="absolute inset-0 rounded-xl bg-gradient-to-r from-transparent via-primary/5 to-transparent opacity-0 transition-opacity group-hover:opacity-100" />
       <div className="relative flex items-center justify-between">
-        <span className="mono text-[10px] font-semibold text-foreground">{name}</span>
-        <span className="mono text-[9px] uppercase tracking-[0.18em] text-foreground/60">
+        <span className="mono text-[11px] font-semibold text-foreground">{name}</span>
+        <span className="mono text-[10px] uppercase tracking-[0.2em] text-foreground/60">
           {state}
         </span>
       </div>
-      <div className="relative mt-2 h-1.5 overflow-hidden rounded-full bg-secondary">
+      <div className="relative mt-3 h-2 overflow-hidden rounded-full bg-secondary">
         <div
           className={`h-full rounded-full ${styles.progress} shadow-lg transition-all duration-700 ease-out`}
           style={{ width: `${progress}%` }}
@@ -52,7 +52,7 @@ export default function AgentCard({ name, state, progress }) {
           <div className="absolute inset-0 animate-shimmer bg-gradient-to-r from-transparent via-white/20 to-transparent" />
         )}
       </div>
-      <div className={`mt-1.5 flex items-center justify-between text-[10px] ${styles.text}`}>
+      <div className={`mt-2 flex items-center justify-between text-xs ${styles.text}`}>
         <span>{progress}%</span>
         <span>{progress === 100 ? 'Done' : progress > 0 ? 'In Progress' : 'Waiting'}</span>
       </div>

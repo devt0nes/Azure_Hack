@@ -73,6 +73,7 @@ export const executeFromSpecs = ({
   projectId,
   specPath = null,
   clarificationContext = null,
+  serviceApiKeys = null,
 }) =>
   apiFetch('/execute-from-specs', {
     method: 'POST',
@@ -80,8 +81,12 @@ export const executeFromSpecs = ({
       project_id: projectId,
       spec_path: specPath,
       clarification_context: clarificationContext,
+      service_api_keys: serviceApiKeys,
     }),
   })
+
+export const getProjectApiKeyStatus = ({ projectId }) =>
+  apiFetch(`/api/projects/${projectId}/service-api-keys/status`)
 
 export const deployProject = ({ projectId, mockSuccess = false }) =>
   apiFetch(`/api/projects/${projectId}/deploy`, {
@@ -100,6 +105,15 @@ export const getDeploymentStatus = ({ projectId }) =>
 
 export const getHealth = () => apiFetch('/api/health')
 export const listProjects = () => apiFetch('/api/projects')
+export const createProject = ({ projectName, userIntent, description = '' }) =>
+  apiFetch('/api/projects', {
+    method: 'POST',
+    body: JSON.stringify({
+      project_name: projectName,
+      user_intent: userIntent,
+      description,
+    }),
+  })
 export const getProject = ({ projectId }) => apiFetch(`/api/projects/${projectId}`)
 export const getProjectPreviewStatus = ({ projectId }) => apiFetch(`/api/projects/${projectId}/preview-status`)
 export const getProjectLogs = ({ projectId }) => apiFetch(`/api/projects/${projectId}/logs`)

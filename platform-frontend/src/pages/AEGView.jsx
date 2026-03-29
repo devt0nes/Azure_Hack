@@ -3,12 +3,11 @@ import { createPortal } from 'react-dom'
 import ReactFlow, {
   Background,
   Controls,
-  MiniMap,
   useNodesState,
   useEdgesState,
 } from 'reactflow'
 import 'reactflow/dist/style.css'
-import { getAEG } from '../services/api.js'
+import { getAEG, getProjectLedger } from '../services/api.js'
 
 const STATE_COLORS = {
   PENDING: '#1c1c24',
@@ -29,123 +28,179 @@ const FLASH_ANIMATION = `
 
 const nodeTypes = {}
 
-function titleCaseAgent(agentName) {
-  return agentName
+function titleCaseText(value) {
+  return value
     .split('_')
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(' ')
 }
 
-function normalizeLegacyGraph(payload) {
-  const nodes = Array.isArray(payload?.nodes) ? payload.nodes : []
-  const edges = Array.isArray(payload?.edges) ? payload.edges : []
-
-  const flowNodes = nodes.map((node, index) => ({
-    id: node.id,
-    type: 'default',
-    data: {
-      label: (
-        <div className="text-center">
-          <div className="font-semibold text-xs">{node.agent_type || node.id}</div>
-          <div className="mono text-[9px] uppercase tracking-wider mt-1">
-            {node.state || 'PENDING'}
-          </div>
-        </div>
-      ),
-    },
-    position: { x: (index % 3) * 220, y: Math.floor(index / 3) * 130 },
-    style: {
-      background: STATE_COLORS[node.state] || '#1c1c24',
-      color: node.state === 'PENDING' ? '#f7f1ea' : '#ffffff',
-      border: `2px solid ${STATE_COLORS[node.state] || '#1c1c24'}`,
-      borderRadius: '12px',
-      padding: '12px 16px',
-      fontSize: '11px',
-      width: 170,
-    },
-  }))
-
-  const flowEdges = edges.map((edge) => ({
-    id: `${edge.from}-${edge.to}`,
-    source: edge.from,
-    target: edge.to,
-    animated: true,
-    style: { stroke: '#f26a2e', strokeWidth: 2 },
-  }))
-
-  return { flowNodes, flowEdges }
+function toAgentRole(value) {
+  if (!value) return ''
+  if (typeof value === 'string') return value.trim()
+  if (typeof value === 'object') {
+    return String(value.role || value.agent_name || value.id || value.name || '').trim()
+  }
+  return ''
 }
 
-function normalizeLedgerGraph(payload, agentStatusMap = {}) {
-  const specs = payload?.agent_specifications || {}
-  const requiredAgents = Array.isArray(specs.required_agents) ? specs.required_agents : []
-  const dependencies = specs.agent_dependencies || {}
-  const executionGroups = Array.isArray(specs.parallel_execution_groups)
-    ? specs.parallel_execution_groups
-    : []
-
-  const groupIndexByAgent = {}
-  executionGroups.forEach((group, index) => {
-    group.forEach((agent) => {
-      groupIndexByAgent[agent] = index
-    })
-  })
-
-  const agents =
-    requiredAgents.length > 0
-      ? requiredAgents
-      : Array.from(
-        new Set([
-          ...Object.keys(dependencies),
-          ...Object.values(dependencies).flatMap((value) => value || []),
-        ])
-      )
-
-  const groupedAgents = executionGroups.length
-    ? executionGroups
-    : [agents.filter((agent) => agent in dependencies), agents.filter((agent) => !(agent in dependencies))]
-
-  const positionByAgent = {}
-  groupedAgents.forEach((group, groupIdx) => {
-    const yStart = 40
-    group.forEach((agent, idx) => {
-      positionByAgent[agent] = {
-        x: groupIdx * 260 + 30,
-        y: yStart + idx * 130,
+function getLayerAgents(layer) {
+  if (!layer) return []
+  if (Array.isArray(layer)) {
+    return layer.map(toAgentRole).filter(Boolean)
+  }
+  if (typeof layer === 'object') {
+    const candidates = [
+      layer.agents,
+      layer.required_agents,
+      layer.parallel_agents,
+      layer.members,
+      layer.roles,
+    ]
+    for (const candidate of candidates) {
+      if (Array.isArray(candidate)) {
+        return candidate.map(toAgentRole).filter(Boolean)
       }
-    })
-  })
+    }
+  }
+  return []
+}
 
-  const ungrouped = agents.filter((agent) => !positionByAgent[agent])
-  ungrouped.forEach((agent, idx) => {
-    positionByAgent[agent] = {
-      x: groupedAgents.length * 260 + 30,
-      y: 40 + idx * 130,
+function extractLayersFromPayload(payload = {}, fallbackSpecs = {}) {
+  const taskLedger = payload?.task_ledger || {}
+  const specs = payload?.agent_specifications || fallbackSpecs || {}
+
+  const fromTaskLedger = Array.isArray(taskLedger?.layers) ? taskLedger.layers : null
+  const fromSpecsLayers = Array.isArray(specs?.layers) ? specs.layers : null
+  const fromParallel = Array.isArray(specs?.parallel_execution_groups)
+    ? specs.parallel_execution_groups
+    : null
+
+  let rawLayers = fromTaskLedger || fromSpecsLayers || fromParallel || []
+  if (!Array.isArray(rawLayers) || rawLayers.length === 0) {
+    const required = Array.isArray(specs?.required_agents) ? specs.required_agents : []
+    const requiredRoles = required.map(toAgentRole).filter(Boolean)
+    rawLayers = requiredRoles.length > 0 ? [requiredRoles] : []
+  }
+
+  return rawLayers.map((layer, index) => {
+    const agents = getLayerAgents(layer)
+    const layerNumber = index + 1
+    const title =
+      typeof layer === 'object' && !Array.isArray(layer)
+        ? String(layer.title || layer.name || `Layer ${layerNumber}`)
+        : `Layer ${layerNumber}`
+
+    return {
+      id: `layer-${layerNumber}`,
+      index: layerNumber,
+      title,
+      agents,
+      raw: layer,
     }
   })
+}
 
-  const flowNodes = agents.map((agent) => {
-    const groupLevel = groupIndexByAgent[agent] ?? groupedAgents.length
-    const outgoingCount = (dependencies[agent] || []).length
-    const agentStatus = agentStatusMap[agent] || {}
-    const progress = Math.max(0, Math.min(100, Math.round(agentStatus.progress ?? 0)))
-    const state = agentStatus.state || 'PENDING'
+function deriveLayerState(layerAgents, agentStatusMap = {}) {
+  const statuses = layerAgents
+    .map((agent) => agentStatusMap[agent]?.state)
+    .filter(Boolean)
+
+  if (statuses.includes('FAILED')) return 'FAILED'
+  if (statuses.includes('RUNNING')) return 'RUNNING'
+  if (statuses.length > 0 && statuses.every((status) => status === 'COMPLETED')) return 'COMPLETED'
+  return 'PENDING'
+}
+
+function deriveLayerProgress(layerAgents, agentStatusMap = {}) {
+  const progresses = layerAgents
+    .map((agent) => Number(agentStatusMap[agent]?.progress ?? 0))
+    .filter((value) => Number.isFinite(value))
+
+  if (progresses.length === 0) return 0
+  const average = progresses.reduce((sum, value) => sum + value, 0) / progresses.length
+  return Math.max(0, Math.min(100, Math.round(average)))
+}
+
+function extractBlackboardNotes(layer, payload = {}) {
+  const notes = []
+  const taskLedger = payload?.task_ledger || {}
+
+  const pushNote = (value) => {
+    if (!value) return
+    if (Array.isArray(value)) {
+      value.forEach(pushNote)
+      return
+    }
+    if (typeof value === 'object') {
+      Object.entries(value).forEach(([k, v]) => {
+        if (v == null) return
+        if (typeof v === 'string' || typeof v === 'number') {
+          notes.push(`${titleCaseText(k)}: ${String(v)}`)
+        }
+      })
+      return
+    }
+    notes.push(String(value))
+  }
+
+  if (typeof layer?.raw === 'object' && layer.raw && !Array.isArray(layer.raw)) {
+    pushNote(layer.raw.blackboard)
+    pushNote(layer.raw.coordination_blackboard)
+    pushNote(layer.raw.coordination_expectations)
+    pushNote(layer.raw.notes)
+    pushNote(layer.raw.summary)
+    pushNote(layer.raw.deliverables)
+    pushNote(layer.raw.how)
+  }
+
+  const boardStore =
+    taskLedger?.layer_blackboards ||
+    taskLedger?.layer_blackboard ||
+    taskLedger?.blackboard ||
+    {}
+
+  if (boardStore && typeof boardStore === 'object') {
+    const keys = [layer.id, String(layer.index), `layer_${layer.index}`, layer.title]
+    keys.forEach((key) => {
+      if (key in boardStore) {
+        pushNote(boardStore[key])
+      }
+    })
+  }
+
+  return Array.from(new Set(notes.map((note) => String(note).trim()).filter(Boolean))).slice(0, 8)
+}
+
+function toLayerFlowGraph({ aegPayload, ledgerPayload, agentStatusMap = {} }) {
+  const ledgerData = ledgerPayload?.ledger_data || {}
+  const fallbackSpecs = aegPayload?.agent_specifications || {}
+
+  const layers = extractLayersFromPayload(ledgerData, fallbackSpecs)
+  if (layers.length === 0) {
+    throw new Error('No task ledger layers found for AEG')
+  }
+
+  const flowNodes = layers.map((layer, idx) => {
+    const progress = deriveLayerProgress(layer.agents, agentStatusMap)
+    const state = deriveLayerState(layer.agents, agentStatusMap)
     const isRunning = state === 'RUNNING'
 
     return {
-      id: agent,
+      id: layer.id,
       type: 'default',
-      position: positionByAgent[agent],
+      position: { x: idx * 260 + 30, y: 80 },
       data: {
         label: (
           <div className="text-left leading-tight">
-            <div className="font-semibold text-[11px]">{titleCaseAgent(agent)}</div>
-            <div className="mono text-[10px] font-bold mt-1">{progress}%</div>
-            <div className={`mono text-[8px] uppercase tracking-wider mt-1 ${isRunning ? 'text-amber-200 font-semibold' : 'text-white/85'
-              }`}>
+            <div className="font-semibold text-[11px]">{layer.title}</div>
+            <div className="mono text-[10px] mt-1">{progress}% complete</div>
+            <div className={`mono text-[8px] uppercase tracking-wider mt-1 ${isRunning ? 'text-amber-200 font-semibold' : 'text-white/85'}`}>
               {state}
             </div>
-            <div className="text-[8px] mt-1 text-white/75">Handoffs: {outgoingCount}</div>
+            <div className="text-[8px] mt-1 text-white/75">
+              Parallel agents: {layer.agents.length}
+            </div>
           </div>
         ),
       },
@@ -156,7 +211,7 @@ function normalizeLedgerGraph(payload, agentStatusMap = {}) {
         borderRadius: '12px',
         padding: '12px 14px',
         fontSize: '11px',
-        width: 190,
+        width: 205,
         boxShadow: isRunning
           ? '0 0 16px rgba(242, 106, 46, 0.8), inset 0 0 8px rgba(242, 106, 46, 0.3)'
           : '0 2px 8px rgba(0, 0, 0, 0.5)',
@@ -166,32 +221,25 @@ function normalizeLedgerGraph(payload, agentStatusMap = {}) {
     }
   })
 
-  const flowEdges = []
-  Object.entries(dependencies).forEach(([source, targets]) => {
-    ; (targets || []).forEach((target) => {
-      flowEdges.push({
-        id: `${source}-${target}`,
-        source,
-        target,
-        animated: true,
-        style: { stroke: '#f26a2e', strokeWidth: 2 },
-      })
-    })
-  })
+  const flowEdges = layers.slice(0, -1).map((layer, idx) => ({
+    id: `${layer.id}-${layers[idx + 1].id}`,
+    source: layer.id,
+    target: layers[idx + 1].id,
+    animated: true,
+    style: { stroke: '#f26a2e', strokeWidth: 2 },
+  }))
 
-  return { flowNodes, flowEdges }
-}
+  const blackboardByLayer = layers.reduce((acc, layer) => {
+    acc[layer.id] = extractBlackboardNotes(layer, ledgerData)
+    return acc
+  }, {})
 
-function toFlowGraph(payload, agentStatusMap = {}) {
-  if (Array.isArray(payload?.nodes) && Array.isArray(payload?.edges)) {
-    return normalizeLegacyGraph(payload)
+  return {
+    layers,
+    flowNodes,
+    flowEdges,
+    blackboardByLayer,
   }
-
-  if (payload?.agent_specifications) {
-    return normalizeLedgerGraph(payload, agentStatusMap)
-  }
-
-  throw new Error('Unsupported AEG payload format')
 }
 
 export default function AEGView({ projectId, onNodeSelect, agents = [] }) {
@@ -200,6 +248,9 @@ export default function AEGView({ projectId, onNodeSelect, agents = [] }) {
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState('')
   const [graphMeta, setGraphMeta] = useState({ projectName: '', source: '' })
+  const [layers, setLayers] = useState([])
+  const [blackboardByLayer, setBlackboardByLayer] = useState({})
+  const [selectedLayerId, setSelectedLayerId] = useState(null)
   const [isFocused, setIsFocused] = useState(false)
 
   const agentStatusMap = useMemo(() => {
@@ -230,27 +281,52 @@ export default function AEGView({ projectId, onNodeSelect, agents = [] }) {
         setIsLoading(true)
       }
       setError('')
-      const data = await getAEG({ projectId })
-      const { flowNodes, flowEdges } = toFlowGraph(data, agentStatusMap)
+      const [aegResult, ledgerResult] = await Promise.allSettled([
+        getAEG({ projectId }),
+        getProjectLedger({ projectId }),
+      ])
+
+      const aegData = aegResult.status === 'fulfilled' ? aegResult.value : {}
+      const ledgerData = ledgerResult.status === 'fulfilled' ? ledgerResult.value : {}
+
+      const { flowNodes, flowEdges, layers: layerRows, blackboardByLayer: board } = toLayerFlowGraph({
+        aegPayload: aegData,
+        ledgerPayload: ledgerData,
+        agentStatusMap,
+      })
 
       setNodes(flowNodes)
       setEdges(flowEdges)
+      setLayers(layerRows)
+      setBlackboardByLayer(board)
+      setSelectedLayerId((prev) => prev || layerRows[0]?.id || null)
       setGraphMeta({
-        projectName: data?.project_name || data?.projectId || projectId,
+        projectName: aegData?.project_name || aegData?.projectId || projectId,
         source: 'api',
       })
     } catch (fetchError) {
       console.error(fetchError)
-      setError('Unable to load AEG. Ensure backend is running and a project exists.')
-      setNodes([])
-      setEdges([])
-      setGraphMeta({ projectName: '', source: '' })
+      if (!silent) {
+        setError('Unable to load AEG. Ensure backend is running and a project exists.')
+        setNodes([])
+        setEdges([])
+        setLayers([])
+        setBlackboardByLayer({})
+        setSelectedLayerId(null)
+        setGraphMeta({ projectName: '', source: '' })
+      }
     } finally {
       if (!silent) {
         setIsLoading(false)
       }
     }
   }, [projectId, setNodes, setEdges, agentStatusMap])
+
+  useEffect(() => {
+    if (!selectedLayerId && layers.length > 0) {
+      setSelectedLayerId(layers[0].id)
+    }
+  }, [layers, selectedLayerId])
 
   useEffect(() => {
     fetchAEG()
@@ -284,8 +360,14 @@ export default function AEGView({ projectId, onNodeSelect, agents = [] }) {
       edges={edges}
       onNodesChange={onNodesChange}
       onEdgesChange={onEdgesChange}
-      onNodeClick={(_, node) => onNodeSelect?.(node?.id || null)}
-      onPaneClick={() => onNodeSelect?.(null)}
+      onNodeClick={(_, node) => {
+        const clickedId = node?.id || null
+        setSelectedLayerId(clickedId)
+        onNodeSelect?.(clickedId)
+      }}
+      onPaneClick={() => {
+        onNodeSelect?.(null)
+      }}
       nodeTypes={nodeTypes}
       fitView
       minZoom={0.5}
@@ -313,6 +395,11 @@ export default function AEGView({ projectId, onNodeSelect, agents = [] }) {
     )
   }
 
+  const selectedLayer = layers.find((layer) => layer.id === selectedLayerId) || layers[0] || null
+  const selectedBlackboardNotes = selectedLayer
+    ? blackboardByLayer[selectedLayer.id] || []
+    : []
+
   return (
     <>
       <style>{FLASH_ANIMATION}</style>
@@ -323,7 +410,7 @@ export default function AEGView({ projectId, onNodeSelect, agents = [] }) {
             Live Agent Graph
           </p>
         </div>
-        <div className="group relative h-[300px] min-h-[260px] border-b-2 border-primary/25 bg-gradient-to-b from-transparent to-card/20">
+        <div className="group relative h-[260px] min-h-[220px] border-b-2 border-primary/25 bg-gradient-to-b from-transparent to-card/20">
           {renderGraph({ className: 'h-full w-full' })}
           <button
             onClick={openFocusedGraph}
@@ -332,6 +419,54 @@ export default function AEGView({ projectId, onNodeSelect, agents = [] }) {
           >
             Focus
           </button>
+        </div>
+
+        <div className="space-y-3 p-4">
+          <div className="flex items-center justify-between">
+            <p className="mono text-[10px] uppercase tracking-[0.18em] text-foreground/65">Layer Blackboard</p>
+            {selectedLayer ? (
+              <span className="mono text-[10px] font-semibold uppercase tracking-[0.12em] text-primary/85">
+                {selectedLayer.title}
+              </span>
+            ) : null}
+          </div>
+
+          {selectedLayer ? (
+            <div className="rounded-xl border border-primary/30 bg-card/70 p-3">
+              <div className="mb-2 flex flex-wrap items-center gap-1.5">
+                {selectedLayer.agents.length > 0 ? (
+                  selectedLayer.agents.map((agent) => (
+                    <span
+                      key={`${selectedLayer.id}-${agent}`}
+                      className="inline-flex items-center rounded-full border border-border bg-secondary/70 px-2 py-0.5 text-[10px] font-medium text-foreground/75"
+                    >
+                      {titleCaseText(agent)}
+                    </span>
+                  ))
+                ) : (
+                  <span className="text-[11px] text-foreground/60">No layer agents found in task ledger.</span>
+                )}
+              </div>
+
+              {selectedBlackboardNotes.length > 0 ? (
+                <ul className="space-y-1.5 text-xs text-foreground/75">
+                  {selectedBlackboardNotes.map((note, index) => (
+                    <li key={`${selectedLayer.id}-note-${index}`} className="rounded-lg border border-border/80 bg-secondary/50 px-2.5 py-1.5">
+                      {note}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <div className="rounded-lg border border-dashed border-border/80 bg-secondary/35 px-3 py-2 text-xs text-foreground/60">
+                  No blackboard notes for this layer yet.
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="rounded-xl border border-dashed border-border p-3 text-xs text-foreground/60">
+              Select a layer in AEG to inspect blackboard activity.
+            </div>
+          )}
         </div>
 
         {isFocused &&
