@@ -18,6 +18,24 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
 
+function createEmptySummary(projectId) {
+  return {
+    project_id: projectId || '',
+    total_tokens: 0,
+    total_cost_usd: 0,
+    budget_usd: 0,
+    pct_budget_used: 0,
+    cap_reached: false,
+    total_calls: 0,
+    total_escalations: 0,
+    agent_breakdown: [],
+    tier_breakdown: {},
+    alerts: [],
+    learned_overrides: {},
+    paused_agents: [],
+  }
+}
+
 // ─── API helpers ─────────────────────────────────────────────────────────────
 async function fetchJSON(url) {
   const controller = new AbortController()
@@ -327,37 +345,27 @@ function EmptyState({ message }) {
 
 // ─── Main panel ───────────────────────────────────────────────────────────────
 export default function CostOptimizerPanel({ projectId }) {
-  const [summary, setSummary] = useState(null)
+  const [summary, setSummary] = useState(() => createEmptySummary(projectId))
   const [usage, setUsage] = useState([])
   const [escalations, setEscalations] = useState([])
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [activeTab, setActiveTab] = useState('overview')  // 'overview' | 'usage' | 'escalations'
   const tickerIntervalRef = useRef(null)
   const detailsIntervalRef = useRef(null)
 
+  useEffect(() => {
+    setSummary(createEmptySummary(projectId))
+    setUsage([])
+    setEscalations([])
+    setError(null)
+  }, [projectId])
+
   const loadTicker = useCallback(async () => {
     if (!projectId) return null
     const ticker = await fetchJSON(`${API_BASE}/api/cost/ticker?project_id=${projectId}`)
 
-    // Only update if the optimizer has actual data — ignore freshly created empty ones.
-    // An empty optimizer has total_cost_usd=0 AND total_tokens=0 AND no alerts.
-    // We still update if we previously had data (so a real zero is shown after a reset).
-    const hasRealData = (
-      (ticker.total_cost_usd ?? 0) > 0 ||
-      (ticker.total_tokens ?? 0) > 0 ||
-      ticker.latest_alert != null
-    )
-
     setSummary(prev => {
-      const hadDataBefore = prev && (
-        (prev.total_cost_usd ?? 0) > 0 ||
-        (prev.total_tokens ?? 0) > 0
-      )
-      if (!hasRealData && !hadDataBefore) {
-        // No data yet — keep loading spinner, don't flash zeros
-        return prev
-      }
       return {
         project_id: projectId,
         total_tokens: ticker.total_tokens ?? 0,
@@ -375,7 +383,7 @@ export default function CostOptimizerPanel({ projectId }) {
       }
     })
     setError(null)
-    if (hasRealData) setLoading(false)
+    setLoading(false)
     return ticker
   }, [projectId])
 
@@ -433,7 +441,7 @@ export default function CostOptimizerPanel({ projectId }) {
   }, [projectId, loadDetails])
 
   // ── Loading ──────────────────────────────────────────────────────────────
-  if (loading) {
+  if (loading && !summary) {
     return (
       <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
         <div className="h-8 w-8 rounded-full border-2 border-ember/30 border-t-ember animate-spin" />

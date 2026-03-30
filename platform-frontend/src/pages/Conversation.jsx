@@ -5,6 +5,7 @@ import {
   clarifyWithAnswers,
   createProject,
   executeFromSpecs,
+  getProject,
   getProjectApiKeyStatus,
   getProjectLedger,
   ingestProjectContext,
@@ -14,9 +15,25 @@ import {
 import { exportCanvasAsContext } from './IdeaCanvas.jsx'
 
 const CONVERSATION_STATE_PREFIX = 'nexus-conversation-state-v1:'
+const LAST_ACTIVE_PROJECT_STORAGE_KEY = 'nexus-conversation-last-project-id'
 
 function getConversationStateStorageKey(projectId) {
   return `${CONVERSATION_STATE_PREFIX}${projectId}`
+}
+
+function getLastActiveProjectId() {
+  if (typeof window === 'undefined') return ''
+  try {
+    return String(window.localStorage.getItem(LAST_ACTIVE_PROJECT_STORAGE_KEY) || '').trim()
+  } catch {
+    return ''
+  }
+}
+
+function resolveInitialProjectId(projectId) {
+  const explicit = String(projectId || '').trim()
+  if (explicit) return explicit
+  return getLastActiveProjectId()
 }
 
 const initialMessages = [
@@ -81,7 +98,7 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
   const [pendingQuestions, setPendingQuestions] = useState([])
   const [answerDrafts, setAnswerDrafts] = useState({})
   const [lastUserIntent, setLastUserIntent] = useState('')
-  const [activeProjectId, setActiveProjectId] = useState(projectId || '')
+  const [activeProjectId, setActiveProjectId] = useState(() => resolveInitialProjectId(projectId))
   const [includeCanvasContext, setIncludeCanvasContext] = useState(false)
   const [referenceFiles, setReferenceFiles] = useState([])
   const [specReady, setSpecReady] = useState(false)
@@ -101,6 +118,7 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
   const messagesEndRef = useRef(null)
   const referenceInputRef = useRef(null)
   const previousProjectIdRef = useRef(activeProjectId)
+  const hasHydratedProjectRef = useRef(false)
 
   const pushApiKeyInlineNotice = (services) => {
     const cleanServices = (services || [])
@@ -159,9 +177,19 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
   useEffect(() => {
     if (!projectId) return
     if (projectId !== activeProjectId) {
+      hasHydratedProjectRef.current = false
       setActiveProjectId(projectId)
     }
   }, [projectId, activeProjectId])
+
+  useEffect(() => {
+    if (!activeProjectId) return
+    try {
+      window.localStorage.setItem(LAST_ACTIVE_PROJECT_STORAGE_KEY, activeProjectId)
+    } catch {
+      // no-op: persistence is best effort
+    }
+  }, [activeProjectId])
 
   useEffect(() => {
     const previousProjectId = previousProjectIdRef.current
@@ -194,32 +222,96 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
   useEffect(() => {
     if (!activeProjectId) return
 
-    try {
-      const raw = window.localStorage.getItem(getConversationStateStorageKey(activeProjectId))
-      if (!raw) return
-      const saved = JSON.parse(raw)
+    hasHydratedProjectRef.current = false
 
-      if (Array.isArray(saved?.messages) && saved.messages.length > 0) {
-        setMessages(saved.messages)
+    let cancelled = false
+    const hydrateConversationState = async () => {
+      let loadedFromLocal = false
+
+      try {
+        const raw = window.localStorage.getItem(getConversationStateStorageKey(activeProjectId))
+        if (raw) {
+          const saved = JSON.parse(raw)
+
+          if (Array.isArray(saved?.messages) && saved.messages.length > 0) {
+            setMessages(saved.messages)
+            loadedFromLocal = true
+          }
+          if (typeof saved?.input === 'string') setInput(saved.input)
+          if (typeof saved?.lastUserIntent === 'string') setLastUserIntent(saved.lastUserIntent)
+          if (typeof saved?.specReady === 'boolean') setSpecReady(saved.specReady)
+          if (typeof saved?.specPreview === 'string') setSpecPreview(saved.specPreview)
+          if (typeof saved?.completeness === 'number') setCompleteness(saved.completeness)
+          if (typeof saved?.questionCount === 'number') setQuestionCount(saved.questionCount)
+          if (Array.isArray(saved?.nextTopics)) setNextTopics(saved.nextTopics)
+          if (Array.isArray(saved?.pendingQuestions)) setPendingQuestions(saved.pendingQuestions)
+          if (saved?.answerDrafts && typeof saved.answerDrafts === 'object') setAnswerDrafts(saved.answerDrafts)
+          if (Array.isArray(saved?.requiredApiKeyServices)) setRequiredApiKeyServices(saved.requiredApiKeyServices)
+          if (Array.isArray(saved?.savedApiKeyServices)) setSavedApiKeyServices(saved.savedApiKeyServices)
+        }
+      } catch {
+        // no-op: persistence is best effort
       }
-      if (typeof saved?.input === 'string') setInput(saved.input)
-      if (typeof saved?.lastUserIntent === 'string') setLastUserIntent(saved.lastUserIntent)
-      if (typeof saved?.specReady === 'boolean') setSpecReady(saved.specReady)
-      if (typeof saved?.specPreview === 'string') setSpecPreview(saved.specPreview)
-      if (typeof saved?.completeness === 'number') setCompleteness(saved.completeness)
-      if (typeof saved?.questionCount === 'number') setQuestionCount(saved.questionCount)
-      if (Array.isArray(saved?.nextTopics)) setNextTopics(saved.nextTopics)
-      if (Array.isArray(saved?.pendingQuestions)) setPendingQuestions(saved.pendingQuestions)
-      if (saved?.answerDrafts && typeof saved.answerDrafts === 'object') setAnswerDrafts(saved.answerDrafts)
-      if (Array.isArray(saved?.requiredApiKeyServices)) setRequiredApiKeyServices(saved.requiredApiKeyServices)
-      if (Array.isArray(saved?.savedApiKeyServices)) setSavedApiKeyServices(saved.savedApiKeyServices)
-    } catch {
-      // no-op: persistence is best effort
+
+      if (!loadedFromLocal) {
+        try {
+          const projectData = await getProject({ projectId: activeProjectId })
+          if (cancelled) return
+
+          const backendHistory = Array.isArray(projectData?.question_conversation_history)
+            ? projectData.question_conversation_history
+            : []
+
+          if (backendHistory.length > 0) {
+            const restoredMessages = backendHistory
+              .filter((item) => item && typeof item === 'object' && typeof item.content === 'string')
+              .map((item, index) => ({
+                id: `restored-${activeProjectId}-${index}`,
+                role: item.role === 'user' ? 'user' : 'assistant',
+                content: String(item.content || ''),
+              }))
+              .filter((item) => item.content.trim().length > 0)
+
+            if (restoredMessages.length > 0) {
+              setMessages(restoredMessages)
+            }
+          }
+
+          if (typeof projectData?.question_count === 'number') {
+            setQuestionCount(Number(projectData.question_count || 0))
+          }
+
+          const backendRequiredServices = Array.isArray(projectData?.required_api_key_services)
+            ? projectData.required_api_key_services.map((service) => String(service || '').trim()).filter(Boolean)
+            : []
+          if (backendRequiredServices.length > 0) {
+            setRequiredApiKeyServices(backendRequiredServices)
+            setServiceApiKeys((prev) => {
+              const next = { ...prev }
+              backendRequiredServices.forEach((service) => {
+                if (!(service in next)) next[service] = ''
+              })
+              return next
+            })
+          }
+        } catch {
+          // best effort backend hydrate
+        }
+      }
+
+      hasHydratedProjectRef.current = true
+    }
+
+    hydrateConversationState()
+
+    return () => {
+      cancelled = true
     }
   }, [activeProjectId])
 
   useEffect(() => {
     if (!activeProjectId) return
+    if (!hasHydratedProjectRef.current) return
 
     const payload = {
       messages,
@@ -453,6 +545,46 @@ export default function Conversation({ projectId, onProjectChange, onOpenIdeaCan
       }
       if (response?.project_id) {
         setActiveProjectId(response.project_id)
+      }
+
+      const inferredRequiredServices = Array.isArray(response?.required_api_key_services)
+        ? response.required_api_key_services.map((service) => String(service || '').trim()).filter(Boolean)
+        : []
+
+      if (inferredRequiredServices.length > 0) {
+        setRequiredApiKeyServices(inferredRequiredServices)
+        setServiceApiKeys((prev) => {
+          const next = { ...prev }
+          inferredRequiredServices.forEach((service) => {
+            if (!(service in next)) next[service] = ''
+          })
+          return next
+        })
+        pushApiKeyInlineNotice(inferredRequiredServices)
+
+        const normalizedSavedServices = new Set(
+          (savedApiKeyServices || []).map((service) => String(service || '').trim().toLowerCase())
+        )
+        const missingKeyServices = inferredRequiredServices.filter(
+          (service) => !normalizedSavedServices.has(String(service || '').trim().toLowerCase())
+        )
+        if (missingKeyServices.length > 0) {
+          setIsApiKeyModalOpen(true)
+          setMessages((prev) => {
+            const existingPrompt = prev.some((msg) =>
+              String(msg?.content || '').includes('Please provide API keys for')
+            )
+            if (existingPrompt) return prev
+            return [
+              ...prev,
+              {
+                id: `api-key-request-${Date.now()}`,
+                role: 'assistant',
+                content: `Before execution, please provide API keys for: ${missingKeyServices.join(', ')}. You can open the API Keys popup now and save them.`,
+              },
+            ]
+          })
+        }
       }
 
       const assistantText = response?.response || 'Got it, thanks for sharing!'

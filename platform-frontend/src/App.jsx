@@ -264,8 +264,9 @@ export default function App() {
         setTotalCost(0)
 
         if (projects.length === 0) {
-          setCurrentProjectId('')
-          setCurrentProjectName('No Project Selected')
+          if (!currentProjectId) {
+            setCurrentProjectName('No Project Selected')
+          }
           return
         }
 
@@ -274,8 +275,8 @@ export default function App() {
           if (selectedProject) {
             setCurrentProjectName(selectedProject.project_name || selectedProject.project_id)
           } else {
-            setCurrentProjectId('')
-            setCurrentProjectName('No Project Selected')
+            // Keep the active project sticky across transient list refreshes.
+            setCurrentProjectName(currentProjectId)
           }
         } else {
           setCurrentProjectName('No Project Selected')

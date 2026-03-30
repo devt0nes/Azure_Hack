@@ -12,7 +12,6 @@ This is a general-purpose agent framework that can be extended for any role:
 To use this, instantiate with role-specific instructions.
 """
 
-from openai import AzureOpenAI
 import json
 import os
 import subprocess
@@ -28,6 +27,8 @@ from issues_tracker import get_issues_tracker
 from template_tools import attach_template_tools
 from azure_runtime_sync import upload_local_path_to_blob
 from azure_runtime_sync import write_text_azure_first
+from cost_optimizer import create_routed_client
+from cost_tracker import get_cost_tracker
 
 load_dotenv()
 
@@ -66,6 +67,7 @@ MODEL_CALL_MAX_RETRIES = int(os.getenv("MODEL_CALL_MAX_RETRIES", "2"))
 
 # Global references (set by orchestrator)
 _BLACKBOARD = None
+_COST_TRACKER = get_cost_tracker()
 
 def set_blackboard(blackboard):
     """Set the global blackboard reference for agents to use"""
@@ -1763,11 +1765,10 @@ BUILD FAST. COORDINATE ON LAYER BLACKBOARD. END WITH [READY_FOR_VERIFICATION].""
         self.max_iterations = max_iterations
         self.total_iteration_counter = 0
         
-        # Initialize Azure OpenAI client
-        self.client = AzureOpenAI(
-            api_key=os.getenv("AZURE_OPENAI_KEY"),
-            api_version="2024-05-01-preview",
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+        # Initialize routed Azure OpenAI client (token-thrifty middleware layer).
+        self.client = create_routed_client(
+            default_agent_role=_normalize_agent_role_name(role),
+            tracker=_COST_TRACKER,
         )
         
         # Initialize tools
@@ -2055,6 +2056,10 @@ BUILD FAST. COORDINATE ON LAYER BLACKBOARD. END WITH [READY_FOR_VERIFICATION].""
                         "messages": messages,
                         "tools": self.get_tools(),
                         "tool_choice": "auto",
+                        "project_id": os.getenv("NEXUS_ACTIVE_PROJECT_ID", "default"),
+                        "agent_role": _normalize_agent_role_name(self.role),
+                        "task_description": f"{self.role}: {task_description[:300]}",
+                        "non_critical": False,
                     }
                     if model_timeout is not None:
                         request_kwargs["timeout"] = model_timeout

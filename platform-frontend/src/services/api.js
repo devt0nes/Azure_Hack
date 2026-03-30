@@ -124,6 +124,24 @@ export const getWorkspaceFiles = ({ projectId }) => apiFetch(`/api/projects/${pr
 export const getProjectSpecs = ({ projectId }) => apiFetch(`/api/projects/${projectId}/specs`)
 export const getProjectLedger = ({ projectId }) => apiFetch(`/api/projects/${projectId}/ledger`)
 
+export const getCostTicker = ({ projectId }) =>
+  apiFetch(`/api/cost/ticker?project_id=${projectId}`)
+
+export const getCostSummary = ({ projectId }) =>
+  apiFetch(`/api/cost/summary?project_id=${projectId}`)
+
+export const getCostUsage = ({ projectId, limit = 20 }) =>
+  apiFetch(`/api/cost/usage?project_id=${projectId}&limit=${limit}`)
+
+export const getCostEscalations = ({ projectId }) =>
+  apiFetch(`/api/cost/escalations?project_id=${projectId}`)
+
+export const setCostBudget = ({ projectId, budgetUsd }) =>
+  apiFetch(`/api/cost/budget?project_id=${projectId}`, {
+    method: 'POST',
+    body: JSON.stringify({ budget_usd: budgetUsd }),
+  })
+
 export const saveCanvas = ({ projectId, canvasData }) =>
   apiFetch(`/api/projects/${projectId}/canvas`, {
     method: 'PUT',

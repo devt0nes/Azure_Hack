@@ -32,6 +32,8 @@ from dotenv import load_dotenv
 from ingestion_service import build_ingestion_context
 from blob_workspace import build_blob_workspace_from_env
 from azure_runtime_sync import download_blob_to_local_path, write_text_azure_first
+from cost_optimizer import create_routed_client
+from cost_tracker import get_cost_tracker
 from cosmos_client import (
     get_cosmos_client,
     get_starter_template,
@@ -277,6 +279,7 @@ class ProjectStore:
 
 
 store = ProjectStore()
+COST_TRACKER = get_cost_tracker()
 BLOB_WORKSPACE = None
 try:
     BLOB_WORKSPACE = build_blob_workspace_from_env()
@@ -1560,20 +1563,35 @@ def _infer_required_api_key_services(ledger_data: Dict[str, Any]) -> List[str]:
     haystack = " ".join(text_chunks).lower()
     service_rules = [
         ("openai", "OpenAI"),
+        ("azure openai", "Azure OpenAI"),
+        ("azure ai", "Azure AI Services"),
         ("anthropic", "Anthropic"),
         ("claude", "Anthropic"),
         ("gemini", "Google Gemini"),
         ("google ai studio", "Google Gemini"),
         ("stripe", "Stripe"),
+        ("paypal", "PayPal"),
         ("twilio", "Twilio"),
+        ("slack", "Slack"),
+        ("notion", "Notion"),
         ("sendgrid", "SendGrid"),
         ("mailgun", "Mailgun"),
         ("resend", "Resend"),
         ("supabase", "Supabase"),
         ("firebase", "Firebase"),
+        ("auth0", "Auth0"),
+        ("clerk", "Clerk"),
+        ("okta", "Okta"),
         ("pinecone", "Pinecone"),
         ("serpapi", "SerpAPI"),
         ("hugging face", "Hugging Face"),
+        ("mapbox", "Mapbox"),
+        ("openweathermap", "OpenWeatherMap"),
+        ("weatherapi", "WeatherAPI"),
+        ("rapidapi", "RapidAPI"),
+        ("youtube api", "YouTube Data API"),
+        ("telegram bot", "Telegram Bot API"),
+        ("discord bot", "Discord API"),
         ("mongodb atlas", "MongoDB Atlas"),
         ("postgres", "Postgres"),
         ("postgresql", "Postgres"),
@@ -1602,6 +1620,30 @@ def _infer_required_api_key_services(ledger_data: Dict[str, Any]) -> List[str]:
         if "MongoDB Atlas" not in inferred:
             inferred.append("MongoDB Atlas")
 
+    # If explicit credential cues appear, infer provider names from env-style keys and API phrases.
+    if any(cue in haystack for cue in ["api key", "access token", "client secret", "secret key", "bearer token"]):
+        env_key_matches = re.findall(r"\b([A-Z][A-Z0-9_]{2,})_(API_KEY|TOKEN|SECRET|CLIENT_ID|CLIENT_SECRET)\b", " ".join(text_chunks))
+        for key_name, _suffix in env_key_matches:
+            provider = key_name.replace("_", " ").title().strip()
+            if provider and provider not in inferred:
+                inferred.append(provider)
+
+        api_phrase_matches = re.findall(r"\b([a-z][a-z0-9\-+ ]{2,40})\s+api\b", haystack)
+        skip = {
+            "rest", "graphql", "http", "web", "backend", "frontend", "public", "internal", "external",
+            "third party", "third-party", "generic", "service",
+        }
+        for phrase in api_phrase_matches:
+            candidate = " ".join(phrase.split()).strip(" -")
+            if not candidate or candidate in skip:
+                continue
+            provider = " ".join(part.capitalize() for part in candidate.split()) + " API"
+            if provider not in inferred:
+                inferred.append(provider)
+
+    if not inferred and any(cue in haystack for cue in ["api key", "access token", "client secret", "secret key", "bearer token"]):
+        inferred.append("Third-Party API")
+
     return inferred
 
 
@@ -1613,21 +1655,36 @@ def _infer_required_api_key_services_from_text(spec_text: str) -> List[str]:
 
     service_rules = [
         ("openai", "OpenAI"),
+        ("azure openai", "Azure OpenAI"),
+        ("azure ai", "Azure AI Services"),
         ("anthropic", "Anthropic"),
         ("claude", "Anthropic"),
         ("gemini", "Google Gemini"),
         ("google ai studio", "Google Gemini"),
         ("stripe", "Stripe"),
+        ("paypal", "PayPal"),
         ("twilio", "Twilio"),
+        ("slack", "Slack"),
+        ("notion", "Notion"),
         ("sendgrid", "SendGrid"),
         ("mailgun", "Mailgun"),
         ("resend", "Resend"),
         ("supabase", "Supabase"),
         ("firebase", "Firebase"),
+        ("auth0", "Auth0"),
+        ("clerk", "Clerk"),
+        ("okta", "Okta"),
         ("pinecone", "Pinecone"),
         ("serpapi", "SerpAPI"),
         ("hugging face", "Hugging Face"),
         ("google cloud vision", "Google Cloud Vision API"),
+        ("mapbox", "Mapbox"),
+        ("openweathermap", "OpenWeatherMap"),
+        ("weatherapi", "WeatherAPI"),
+        ("rapidapi", "RapidAPI"),
+        ("youtube api", "YouTube Data API"),
+        ("telegram bot", "Telegram Bot API"),
+        ("discord bot", "Discord API"),
         ("mongodb atlas", "MongoDB Atlas"),
         ("postgres", "Postgres"),
         ("postgresql", "Postgres"),
@@ -1656,7 +1713,49 @@ def _infer_required_api_key_services_from_text(spec_text: str) -> List[str]:
         if "MongoDB Atlas" not in inferred:
             inferred.append("MongoDB Atlas")
 
+    if any(cue in haystack for cue in ["api key", "access token", "client secret", "secret key", "bearer token"]):
+        env_key_matches = re.findall(r"\b([A-Z][A-Z0-9_]{2,})_(API_KEY|TOKEN|SECRET|CLIENT_ID|CLIENT_SECRET)\b", str(spec_text or ""))
+        for key_name, _suffix in env_key_matches:
+            provider = key_name.replace("_", " ").title().strip()
+            if provider and provider not in inferred:
+                inferred.append(provider)
+
+        api_phrase_matches = re.findall(r"\b([a-z][a-z0-9\-+ ]{2,40})\s+api\b", haystack)
+        skip = {
+            "rest", "graphql", "http", "web", "backend", "frontend", "public", "internal", "external",
+            "third party", "third-party", "generic", "service",
+        }
+        for phrase in api_phrase_matches:
+            candidate = " ".join(phrase.split()).strip(" -")
+            if not candidate or candidate in skip:
+                continue
+            provider = " ".join(part.capitalize() for part in candidate.split()) + " API"
+            if provider not in inferred:
+                inferred.append(provider)
+
+    if not inferred and any(cue in haystack for cue in ["api key", "access token", "client secret", "secret key", "bearer token"]):
+        inferred.append("Third-Party API")
+
     return inferred
+
+
+def _merge_required_services(*service_lists: Any) -> List[str]:
+    """Merge service name lists preserving order and removing duplicates/case noise."""
+    merged: List[str] = []
+    seen = set()
+    for group in service_lists:
+        if not isinstance(group, list):
+            continue
+        for item in group:
+            name = str(item or "").strip()
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(name)
+    return merged
 
 
 async def _generate_task_ledger_only(project_id: str, user_input: str, owner_id: str) -> Dict[str, Any]:
@@ -1777,6 +1876,10 @@ def _generate_director_questions(user_intent: str) -> List[str]:
             messages=messages,
             response_format={"type": "json_object"},
             temperature=0.3,
+            project_id=os.getenv("NEXUS_ACTIVE_PROJECT_ID", "default"),
+            agent_role="director_agent",
+            task_description=f"Generate 3 clarification questions: {user_intent[:220]}",
+            non_critical=True,
         )
         payload = json.loads(response.choices[0].message.content)
         questions = payload.get("questions", [])
@@ -2361,13 +2464,7 @@ def _answer_learning_question(project_id: str, question: str, selected_files: Li
     context_text = "\n\n".join(context_blocks)
 
     try:
-        from openai import AzureOpenAI
-
-        client = AzureOpenAI(
-            api_key=os.getenv("AZURE_OPENAI_KEY"),
-            api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        )
+        client = create_routed_client(default_agent_role="learning_agent", tracker=COST_TRACKER)
         messages = [
             {
                 "role": "system",
@@ -2390,6 +2487,10 @@ def _answer_learning_question(project_id: str, question: str, selected_files: Li
             model=AZURE_MODEL_DEPLOYMENT,
             messages=messages,
             temperature=0.2,
+            project_id=project_id,
+            agent_role="learning_agent",
+            task_description=f"Answer learning question for project {project_id}: {question_text}",
+            non_critical=True,
         )
         text = (response.choices[0].message.content or "").strip()
         if text:
@@ -3241,49 +3342,27 @@ async def get_selected_agents(project_id: str):
 
 @app.get("/api/cost/ticker", tags=["Compatibility"])
 async def cost_ticker(project_id: str):
-    return {
-        "project_id": project_id,
-        "estimated_usd": 0.0,
-        "budget_usd": 100.0,
-        "updated_at": datetime.utcnow().isoformat(),
-    }
+    return COST_TRACKER.get_ticker(project_id)
 
 
 @app.post("/api/cost/budget", tags=["Compatibility"])
 async def set_cost_budget(project_id: str, request: BudgetRequest):
-    return {
-        "project_id": project_id,
-        "budget_usd": float(request.budget_usd),
-        "updated_at": datetime.utcnow().isoformat(),
-    }
+    return COST_TRACKER.set_budget(project_id, request.budget_usd)
 
 
 @app.get("/api/cost/summary", tags=["Compatibility"])
 async def cost_summary(project_id: str):
-    return {
-        "project_id": project_id,
-        "total_usd": 0.0,
-        "by_agent": [],
-        "updated_at": datetime.utcnow().isoformat(),
-    }
+    return COST_TRACKER.get_summary(project_id)
 
 
 @app.get("/api/cost/usage", tags=["Compatibility"])
 async def cost_usage(project_id: str, limit: int = 20):
-    return {
-        "project_id": project_id,
-        "limit": int(limit),
-        "entries": [],
-    }
+    return COST_TRACKER.get_usage(project_id, limit=limit)
 
 
 @app.get("/api/cost/escalations", tags=["Compatibility"])
 async def cost_escalations(project_id: str):
-    return {
-        "project_id": project_id,
-        "items": [],
-        "count": 0,
-    }
+    return COST_TRACKER.get_escalations(project_id)
 
 
 @app.post("/clarify", tags=["Compatibility"])
@@ -3402,13 +3481,41 @@ async def question_endpoint(request: QuestionRequest):
             if requested_question_count == 0 and history_count <= 1 and stored_question_count >= 10:
                 stored_question_count = 0
                 project["question_count"] = 0
+                project["question_conversation_history"] = []
                 project["updated_at"] = datetime.utcnow().isoformat()
                 store._save()
 
             current_question_count = max(stored_question_count, requested_question_count)
         
         agent = QuestioningAgent()
-        conversation_history = request.conversation_history or []
+        client_history = request.conversation_history or []
+        conversation_history = []
+        for item in client_history:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "")).strip().lower()
+            content = str(item.get("content", "")).strip()
+            if role not in {"user", "assistant", "system"} or not content:
+                continue
+            conversation_history.append({"role": role, "content": content})
+
+        stored_history = project.get("question_conversation_history", []) if isinstance(project, dict) else []
+        if not conversation_history and isinstance(stored_history, list) and stored_history:
+            recovered = []
+            for item in stored_history:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role", "")).strip().lower()
+                content = str(item.get("content", "")).strip()
+                if role not in {"user", "assistant", "system"} or not content:
+                    continue
+                recovered.append({"role": role, "content": content})
+            conversation_history = recovered[-60:]
+            _append_project_log(
+                request.project_id,
+                "questioning_history_recovered",
+                restored_messages=len(conversation_history),
+            )
         
         response = agent.get_response(
             request.project_id,
@@ -3416,6 +3523,65 @@ async def question_endpoint(request: QuestionRequest):
             conversation_history,
             question_count=current_question_count
         )
+
+        required_services: List[str] = []
+        ledger_required_services: List[str] = []
+        text_inferred_services: List[str] = []
+        try:
+            spec_path = response.get("full_spec_path")
+            if spec_path:
+                download_blob_to_local_path(str(spec_path))
+                if os.path.exists(spec_path):
+                    spec_text = Path(spec_path).read_text(encoding="utf-8")
+                    required_services = _infer_required_api_key_services_from_text(spec_text)
+
+            workspace_dir = REPO_ROOT / "workspace"
+            ledger_file = workspace_dir / f"ledger_{request.project_id}.json"
+            download_blob_to_local_path(str(ledger_file))
+            if ledger_file.exists():
+                ledger_data = json.loads(ledger_file.read_text(encoding="utf-8"))
+                ledger_required_services = _normalize_required_api_key_services(ledger_data)
+                if not ledger_required_services:
+                    ledger_required_services = _infer_required_api_key_services(ledger_data)
+
+            conversation_text_blob = "\n".join([
+                str(request.user_message or ""),
+                str(response.get("response") or ""),
+                str(project.get("user_intent") or "") if isinstance(project, dict) else "",
+            ])
+            text_inferred_services = _infer_required_api_key_services_from_text(conversation_text_blob)
+
+            required_services = _merge_required_services(
+                required_services,
+                ledger_required_services,
+                text_inferred_services,
+                project.get("required_api_key_services", []) if isinstance(project, dict) else [],
+            )
+        except Exception:
+            required_services = []
+
+        if required_services:
+            project["required_api_key_services"] = required_services
+
+        saved_keys = _load_service_api_keys(request.project_id)
+        missing_required_services = [
+            service for service in required_services
+            if not str(saved_keys.get(service, "")).strip()
+        ]
+
+        base_response_text = str(response.get("response") or "").strip()
+        api_key_follow_up_question = ""
+        if missing_required_services:
+            api_key_follow_up_question = (
+                "I detected integrations that need credentials. "
+                f"Could you provide API keys for: {', '.join(missing_required_services)}?"
+            )
+
+            if "api key" not in base_response_text.lower() and "api keys" not in base_response_text.lower():
+                base_response_text = (
+                    f"{base_response_text}\n\n"
+                    f"🔐 {api_key_follow_up_question}"
+                ).strip()
         
         # Always persist the latest question count, including terminal 10/10 state.
         response_question_count = response.get("question_count", current_question_count)
@@ -3425,6 +3591,14 @@ async def question_endpoint(request: QuestionRequest):
             persisted_question_count = current_question_count
 
         project["question_count"] = max(0, min(10, persisted_question_count))
+        updated_history = list(conversation_history)
+        user_message_text = str(request.user_message or "").strip()
+        assistant_message_text = str(response.get("response") or "").strip()
+        if user_message_text:
+            updated_history.append({"role": "user", "content": user_message_text})
+        if assistant_message_text:
+            updated_history.append({"role": "assistant", "content": assistant_message_text})
+        project["question_conversation_history"] = updated_history[-80:]
         project["updated_at"] = datetime.utcnow().isoformat()
         store._save()
         
@@ -3436,7 +3610,7 @@ async def question_endpoint(request: QuestionRequest):
         )
         
         return {
-            "response": response["response"],
+            "response": base_response_text,
             "agent_thinking": response["agent_thinking"],
             "next_topics": response["next_topics"],
             "project_id": request.project_id,
@@ -3446,6 +3620,9 @@ async def question_endpoint(request: QuestionRequest):
             "question_count": response["question_count"],
             "questions_remaining": response["questions_remaining"],
             "must_execute": response["must_execute"],
+            "required_api_key_services": required_services,
+            "missing_api_key_services": missing_required_services,
+            "api_key_follow_up_question": api_key_follow_up_question,
             "web_context_used": bool(response.get("web_context_used", False)),
         }
     except Exception as exc:
@@ -3510,6 +3687,16 @@ async def question_readiness_endpoint(request: QuestionReadinessRequest):
                 if os.path.exists(full_spec_path):
                     spec_text = Path(full_spec_path).read_text(encoding="utf-8")
                     required_services = _infer_required_api_key_services_from_text(spec_text)
+
+            if not required_services and full_spec_path and os.path.exists(full_spec_path):
+                spec_text = Path(full_spec_path).read_text(encoding="utf-8")
+                required_services = _infer_required_api_key_services_from_text(spec_text)
+
+            if not required_services and isinstance(project, dict):
+                required_services = _merge_required_services(
+                    project.get("required_api_key_services", []),
+                    _infer_required_api_key_services_from_text(str(project.get("user_intent") or "")),
+                )
         except Exception:
             required_services = []
         
@@ -3611,6 +3798,12 @@ async def execute_from_specs(request: ExecuteRequest, background_tasks: Backgrou
 
         if not required_services:
             required_services = _infer_required_api_key_services_from_text(project_specs)
+
+        if not required_services and isinstance(project, dict):
+            required_services = _merge_required_services(
+                project.get("required_api_key_services", []),
+                _infer_required_api_key_services_from_text(str(project.get("user_intent") or "")),
+            )
 
         ledger_data["required_api_key_services"] = required_services
 
@@ -4001,6 +4194,7 @@ async def general_exception_handler(_request, _exc: Exception):
 @app.on_event("startup")
 async def startup_event():
     logger.info("🚀 Nexus platform-compatible backend starting")
+    COST_TRACKER.ensure_containers()
     logger.info(
         "Azure Blob config | conn_configured=%s container=%s blob_workspace_enabled=%s enable_local_file_generation=%s legacy_project_sync=%s autosync_enabled=%s autosync_interval_seconds=%s",
         bool(_AZURE_STORAGE_CONN_STR),
