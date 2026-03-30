@@ -31,12 +31,9 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from ingestion_service import build_ingestion_context
 from blob_workspace import build_blob_workspace_from_env
-from azure_runtime_sync import (
-    download_blob_to_local_path,
-    is_azure_source_of_truth_enforced,
-    upload_dist_dir_to_web_container,
-    write_text_azure_first,
-)
+from azure_runtime_sync import download_blob_to_local_path, write_text_azure_first
+from cost_optimizer import create_routed_client
+from cost_tracker import get_cost_tracker
 from cosmos_client import (
     get_cosmos_client,
     get_starter_template,
@@ -48,12 +45,20 @@ from cosmos_client import (
 
 
 load_dotenv()
-AZURE_MODEL_DEPLOYMENT = os.getenv("AZURE_MODEL_DEPLOYMENT") or os.getenv("AZURE_OPENAI_DEPLOYMENT") or "gpt-4o"
+AZURE_MODEL_DEPLOYMENT = os.getenv("AZURE_MODEL_DEPLOYMENT") or os.getenv("AZURE_OPENAI_DEPLOYMENT") or "gpt-4.1"
+
+# Pin all routed tiers to the same deployment for this backend process.
+# This prevents fallback to undeployed models like phi-4 / gpt-4o-mini.
+os.environ["AZURE_DEPLOYMENT_PHI4"] = AZURE_MODEL_DEPLOYMENT
+os.environ["AZURE_DEPLOYMENT_GPT4O_MINI"] = AZURE_MODEL_DEPLOYMENT
+os.environ["AZURE_DEPLOYMENT_GPT4O"] = AZURE_MODEL_DEPLOYMENT
+os.environ["AZURE_DEPLOYMENT_O1_PREVIEW"] = AZURE_MODEL_DEPLOYMENT
 DEFAULT_AZURE_RESOURCE_GROUP = os.getenv("AZURE_RESOURCE_GROUP", "agentic_brocode")
 DEFAULT_AZURE_LOCATION = os.getenv("AZURE_LOCATION", "eastus")
 ENABLE_AUTO_REMOTE_PREVIEW = str(os.getenv("ENABLE_AUTO_REMOTE_PREVIEW", "true")).lower() in {"1", "true", "yes"}
 AUTO_REMOTE_PREVIEW_MOCK_SUCCESS = str(os.getenv("AUTO_REMOTE_PREVIEW_MOCK_SUCCESS", "false")).lower() in {"1", "true", "yes"}
 REMOTE_PREVIEW_DEPLOY_COOLDOWN_SECONDS = max(30, int(os.getenv("REMOTE_PREVIEW_DEPLOY_COOLDOWN_SECONDS", "120")))
+_PREFER_LOCAL_PREVIEW = str(os.getenv("PREFER_LOCAL_PREVIEW", "true")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _detect_repo_root() -> Path:
@@ -282,6 +287,7 @@ class ProjectStore:
 
 
 store = ProjectStore()
+COST_TRACKER = get_cost_tracker()
 BLOB_WORKSPACE = None
 try:
     BLOB_WORKSPACE = build_blob_workspace_from_env()
@@ -643,15 +649,23 @@ def _project_log_file(project_id: str) -> Path:
 
 def _frontend_preview_bases(project_id: str) -> List[Path]:
     """Candidate frontend output roots for preview serving."""
-    project_root = _project_generated_dir(project_id)
     workspace_root = REPO_ROOT / "workspace"
+    if _PREFER_LOCAL_PREVIEW:
+        local_candidates = [
+            workspace_root / "frontend",
+            workspace_root / "frontend_engineer",
+        ]
+        return [p for p in local_candidates if p.exists() and p.is_dir()]
+
+    project_root = _project_generated_dir(project_id)
     candidates = [
-        project_root / "frontend_engineer",
-        project_root / "frontend",
-        workspace_root / project_id / "frontend_engineer",
-        workspace_root / project_id / "frontend",
-        workspace_root / "frontend_engineer",
+        # Local workspace output must win over generated_code mirrors.
         workspace_root / "frontend",
+        workspace_root / "frontend_engineer",
+        workspace_root / project_id / "frontend",
+        workspace_root / project_id / "frontend_engineer",
+        project_root / "frontend",
+        project_root / "frontend_engineer",
     ]
     seen: set[str] = set()
     unique: List[Path] = []
@@ -665,7 +679,8 @@ def _frontend_preview_bases(project_id: str) -> List[Path]:
 
 
 def _collect_preview_progress(project_id: str, limit_files: int = 30, limit_logs: int = 40) -> Dict[str, Any]:
-    _sync_project_from_blob(project_id)
+    if not _PREFER_LOCAL_PREVIEW:
+        _sync_project_from_blob(project_id)
     preview_entry = _discover_frontend_preview_entry(project_id)
     remote_preview_url = _resolve_remote_frontend_preview_url(project_id)
 
@@ -715,8 +730,8 @@ def _discover_frontend_preview_target(project_id: str) -> Optional[Tuple[Path, s
         return None
 
     preferred = [
-        "index.html",
         "dist/index.html",
+        "index.html",
         "public/index.html",
         "build/index.html",
     ]
@@ -765,20 +780,6 @@ def _resolve_remote_frontend_preview_url(project_id: str) -> Optional[str]:
         except Exception:
             continue
     return None
-
-
-def _preview_blob_candidates(project_id: str, requested_filename: str) -> List[str]:
-    requested = requested_filename.strip("/")
-    if not requested:
-        requested = "index.html"
-
-    # Keep compatibility with both the current runtime/workspace layout and older flat prefixes.
-    return [
-        f"{project_id}/runtime/workspace/frontend/dist/{requested}",
-        f"{project_id}/runtime/workspace/frontend_engineer/dist/{requested}",
-        f"{project_id}/frontend/dist/{requested}",
-        f"{project_id}/frontend_engineer/dist/{requested}",
-    ]
 
 
 def _queue_auto_remote_preview_deployment(
@@ -917,14 +918,6 @@ def _rewrite_preview_html_paths(html: str, project_id: str, requested_filename: 
         rel_dir = ""
     preview_base = f"/api/preview/{project_id}/" + (f"{rel_dir}/" if rel_dir else "")
 
-    # Inject base href for relative paths.
-    base_tag = f'<base href="{preview_base}">'
-    if "<base " not in html.lower():
-        if "<head>" in html:
-            html = html.replace("<head>", f"<head>{base_tag}")
-        else:
-            html = base_tag + html
-
     # Rewrite absolute src/href URLs (e.g. /assets/...) into preview-routed URLs.
     html = re.sub(
         r'(?i)(\b(?:src|href)=(["\"]))/(?!/)',
@@ -934,6 +927,14 @@ def _rewrite_preview_html_paths(html: str, project_id: str, requested_filename: 
     # Rewrite CSS url(/...)
     html = re.sub(r'(?i)url\((\s*["\"])\/(?!\/)', lambda m: f"url({m.group(1)}{preview_base}", html)
     html = re.sub(r'(?i)url\((\s*)\/(?!\/)', lambda m: f"url({m.group(1)}{preview_base}", html)
+
+    # Inject base href for relative paths after rewrites so base href itself isn't rewritten.
+    base_tag = f'<base href="{preview_base}">'
+    if "<base " not in html.lower():
+        if "<head>" in html:
+            html = html.replace("<head>", f"<head>{base_tag}")
+        else:
+            html = base_tag + html
     return html
 
 
@@ -1004,9 +1005,7 @@ def _service_api_keys_file(project_id: str) -> Path:
 
 def _load_service_api_keys(project_id: str) -> Dict[str, str]:
     path = _service_api_keys_file(project_id)
-    ok_blob, _ = download_blob_to_local_path(str(path))
-    if (not ok_blob) and is_azure_source_of_truth_enforced():
-        return {}
+    download_blob_to_local_path(str(path))
     if not path.exists():
         return {}
     try:
@@ -1222,42 +1221,9 @@ def _sync_project_to_blob(project_id: str) -> None:
             local_path=str(local_dir.resolve()),
             source_of_truth_prefixes=["runtime/workspace"],
         )
-        _sync_frontend_dist_to_web_container(project_id)
     except Exception as exc:
         _report_blob_error("Blob upload failed", exc, project_id=project_id)
         _append_project_log(project_id, "blob_upload_failed", error=f"{type(exc).__name__}: {exc}")
-
-
-def _sync_frontend_dist_to_web_container(project_id: str) -> None:
-    workspace_root = (REPO_ROOT / "workspace").resolve()
-    dist_candidates = [
-        workspace_root / "frontend" / "dist",
-        workspace_root / "frontend_engineer" / "dist",
-    ]
-
-    uploaded = 0
-    for dist_dir in dist_candidates:
-        if not dist_dir.exists() or not dist_dir.is_dir():
-            continue
-        ok, detail = upload_dist_dir_to_web_container(str(dist_dir), project_id=project_id)
-        if ok:
-            uploaded += 1
-            _append_project_log(
-                project_id,
-                "web_dist_upload",
-                dist_dir=str(dist_dir),
-                detail=detail,
-            )
-        else:
-            _append_project_log(
-                project_id,
-                "web_dist_upload_failed",
-                dist_dir=str(dist_dir),
-                error=detail,
-            )
-
-    if uploaded:
-        logger.info("Uploaded frontend dist to $web for %s from %d location(s)", project_id, uploaded)
 
 
 def _resolve_orchestrator_main_path() -> Path:
@@ -1568,6 +1534,37 @@ def _ledger_has_agent_plan(ledger_data: Any) -> bool:
     )
 
 
+def _is_ledger_reuse_compatible(existing_ledger_data: Dict[str, Any], current_user_input: str) -> bool:
+    """Return True only when an existing ledger appears aligned with current intent/specs."""
+    if not isinstance(existing_ledger_data, dict):
+        return False
+    if not _ledger_has_agent_plan(existing_ledger_data):
+        return False
+
+    existing_intent = str(existing_ledger_data.get("user_intent") or "").strip().lower()
+    current_intent = str(current_user_input or "").strip().lower()
+
+    # If either side is blank, don't trust reuse.
+    if not existing_intent or not current_intent:
+        return False
+
+    # Direct containment handles most cases (current prompt prepends full specs).
+    if existing_intent in current_intent or current_intent in existing_intent:
+        return True
+
+    # Token-overlap guardrail: require substantial overlap before reusing.
+    token_pattern = re.compile(r"[a-z0-9_]{3,}")
+    existing_tokens = set(token_pattern.findall(existing_intent))
+    current_tokens = set(token_pattern.findall(current_intent))
+    if not existing_tokens or not current_tokens:
+        return False
+
+    overlap = len(existing_tokens.intersection(current_tokens))
+    smaller = min(len(existing_tokens), len(current_tokens))
+    overlap_ratio = overlap / max(1, smaller)
+    return overlap_ratio >= 0.60
+
+
 def _normalize_required_api_key_services(ledger_data: Dict[str, Any]) -> List[str]:
     """Return a cleaned, de-duplicated list of service names requiring API keys."""
     if not isinstance(ledger_data, dict):
@@ -1614,20 +1611,35 @@ def _infer_required_api_key_services(ledger_data: Dict[str, Any]) -> List[str]:
     haystack = " ".join(text_chunks).lower()
     service_rules = [
         ("openai", "OpenAI"),
+        ("azure openai", "Azure OpenAI"),
+        ("azure ai", "Azure AI Services"),
         ("anthropic", "Anthropic"),
         ("claude", "Anthropic"),
         ("gemini", "Google Gemini"),
         ("google ai studio", "Google Gemini"),
         ("stripe", "Stripe"),
+        ("paypal", "PayPal"),
         ("twilio", "Twilio"),
+        ("slack", "Slack"),
+        ("notion", "Notion"),
         ("sendgrid", "SendGrid"),
         ("mailgun", "Mailgun"),
         ("resend", "Resend"),
         ("supabase", "Supabase"),
         ("firebase", "Firebase"),
+        ("auth0", "Auth0"),
+        ("clerk", "Clerk"),
+        ("okta", "Okta"),
         ("pinecone", "Pinecone"),
         ("serpapi", "SerpAPI"),
         ("hugging face", "Hugging Face"),
+        ("mapbox", "Mapbox"),
+        ("openweathermap", "OpenWeatherMap"),
+        ("weatherapi", "WeatherAPI"),
+        ("rapidapi", "RapidAPI"),
+        ("youtube api", "YouTube Data API"),
+        ("telegram bot", "Telegram Bot API"),
+        ("discord bot", "Discord API"),
         ("mongodb atlas", "MongoDB Atlas"),
         ("postgres", "Postgres"),
         ("postgresql", "Postgres"),
@@ -1656,6 +1668,30 @@ def _infer_required_api_key_services(ledger_data: Dict[str, Any]) -> List[str]:
         if "MongoDB Atlas" not in inferred:
             inferred.append("MongoDB Atlas")
 
+    # If explicit credential cues appear, infer provider names from env-style keys and API phrases.
+    if any(cue in haystack for cue in ["api key", "access token", "client secret", "secret key", "bearer token"]):
+        env_key_matches = re.findall(r"\b([A-Z][A-Z0-9_]{2,})_(API_KEY|TOKEN|SECRET|CLIENT_ID|CLIENT_SECRET)\b", " ".join(text_chunks))
+        for key_name, _suffix in env_key_matches:
+            provider = key_name.replace("_", " ").title().strip()
+            if provider and provider not in inferred:
+                inferred.append(provider)
+
+        api_phrase_matches = re.findall(r"\b([a-z][a-z0-9\-+ ]{2,40})\s+api\b", haystack)
+        skip = {
+            "rest", "graphql", "http", "web", "backend", "frontend", "public", "internal", "external",
+            "third party", "third-party", "generic", "service",
+        }
+        for phrase in api_phrase_matches:
+            candidate = " ".join(phrase.split()).strip(" -")
+            if not candidate or candidate in skip:
+                continue
+            provider = " ".join(part.capitalize() for part in candidate.split()) + " API"
+            if provider not in inferred:
+                inferred.append(provider)
+
+    if not inferred and any(cue in haystack for cue in ["api key", "access token", "client secret", "secret key", "bearer token"]):
+        inferred.append("Third-Party API")
+
     return inferred
 
 
@@ -1667,21 +1703,36 @@ def _infer_required_api_key_services_from_text(spec_text: str) -> List[str]:
 
     service_rules = [
         ("openai", "OpenAI"),
+        ("azure openai", "Azure OpenAI"),
+        ("azure ai", "Azure AI Services"),
         ("anthropic", "Anthropic"),
         ("claude", "Anthropic"),
         ("gemini", "Google Gemini"),
         ("google ai studio", "Google Gemini"),
         ("stripe", "Stripe"),
+        ("paypal", "PayPal"),
         ("twilio", "Twilio"),
+        ("slack", "Slack"),
+        ("notion", "Notion"),
         ("sendgrid", "SendGrid"),
         ("mailgun", "Mailgun"),
         ("resend", "Resend"),
         ("supabase", "Supabase"),
         ("firebase", "Firebase"),
+        ("auth0", "Auth0"),
+        ("clerk", "Clerk"),
+        ("okta", "Okta"),
         ("pinecone", "Pinecone"),
         ("serpapi", "SerpAPI"),
         ("hugging face", "Hugging Face"),
         ("google cloud vision", "Google Cloud Vision API"),
+        ("mapbox", "Mapbox"),
+        ("openweathermap", "OpenWeatherMap"),
+        ("weatherapi", "WeatherAPI"),
+        ("rapidapi", "RapidAPI"),
+        ("youtube api", "YouTube Data API"),
+        ("telegram bot", "Telegram Bot API"),
+        ("discord bot", "Discord API"),
         ("mongodb atlas", "MongoDB Atlas"),
         ("postgres", "Postgres"),
         ("postgresql", "Postgres"),
@@ -1710,7 +1761,49 @@ def _infer_required_api_key_services_from_text(spec_text: str) -> List[str]:
         if "MongoDB Atlas" not in inferred:
             inferred.append("MongoDB Atlas")
 
+    if any(cue in haystack for cue in ["api key", "access token", "client secret", "secret key", "bearer token"]):
+        env_key_matches = re.findall(r"\b([A-Z][A-Z0-9_]{2,})_(API_KEY|TOKEN|SECRET|CLIENT_ID|CLIENT_SECRET)\b", str(spec_text or ""))
+        for key_name, _suffix in env_key_matches:
+            provider = key_name.replace("_", " ").title().strip()
+            if provider and provider not in inferred:
+                inferred.append(provider)
+
+        api_phrase_matches = re.findall(r"\b([a-z][a-z0-9\-+ ]{2,40})\s+api\b", haystack)
+        skip = {
+            "rest", "graphql", "http", "web", "backend", "frontend", "public", "internal", "external",
+            "third party", "third-party", "generic", "service",
+        }
+        for phrase in api_phrase_matches:
+            candidate = " ".join(phrase.split()).strip(" -")
+            if not candidate or candidate in skip:
+                continue
+            provider = " ".join(part.capitalize() for part in candidate.split()) + " API"
+            if provider not in inferred:
+                inferred.append(provider)
+
+    if not inferred and any(cue in haystack for cue in ["api key", "access token", "client secret", "secret key", "bearer token"]):
+        inferred.append("Third-Party API")
+
     return inferred
+
+
+def _merge_required_services(*service_lists: Any) -> List[str]:
+    """Merge service name lists preserving order and removing duplicates/case noise."""
+    merged: List[str] = []
+    seen = set()
+    for group in service_lists:
+        if not isinstance(group, list):
+            continue
+        for item in group:
+            name = str(item or "").strip()
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(name)
+    return merged
 
 
 async def _generate_task_ledger_only(project_id: str, user_input: str, owner_id: str) -> Dict[str, Any]:
@@ -1831,6 +1924,10 @@ def _generate_director_questions(user_intent: str) -> List[str]:
             messages=messages,
             response_format={"type": "json_object"},
             temperature=0.3,
+            project_id=os.getenv("NEXUS_ACTIVE_PROJECT_ID", "default"),
+            agent_role="director_agent",
+            task_description=f"Generate 3 clarification questions: {user_intent[:220]}",
+            non_critical=True,
         )
         payload = json.loads(response.choices[0].message.content)
         questions = payload.get("questions", [])
@@ -1898,16 +1995,21 @@ async def _invoke_real_orchestrator(project_id: str, project_data: Dict[str, Any
         workspace_dir = REPO_ROOT / "workspace"
         workspace_dir.mkdir(parents=True, exist_ok=True)
         initial_ledger_file = workspace_dir / f"ledger_{project_id}.json"
-        download_blob_to_local_path(str(initial_ledger_file))
         if initial_ledger_file.exists() and initial_ledger_file.is_file():
             try:
                 existing_ledger_data = json.loads(initial_ledger_file.read_text(encoding="utf-8"))
-                if _ledger_has_agent_plan(existing_ledger_data):
+                if _is_ledger_reuse_compatible(existing_ledger_data, user_input):
                     _deep_merge_dict(ledger.data, existing_ledger_data)
                     max_director_iterations = 0
                     _append_project_log(
                         project_id,
                         "director_existing_ledger_reused",
+                        path=str(initial_ledger_file.resolve()),
+                    )
+                else:
+                    _append_project_log(
+                        project_id,
+                        "director_existing_ledger_ignored_mismatch",
                         path=str(initial_ledger_file.resolve()),
                     )
             except Exception as exc:
@@ -1916,13 +2018,7 @@ async def _invoke_real_orchestrator(project_id: str, project_data: Dict[str, Any
         # Seed ledger file BEFORE first director tool call.
         # Director prompts mandate read_task_ledger() first; without this file, the model can loop on read errors.
         if max_director_iterations > 0:
-            ok_seed, detail_seed = write_text_azure_first(
-                str(initial_ledger_file),
-                json.dumps(ledger.data, indent=2),
-                materialize_local=True,
-            )
-            if not ok_seed:
-                raise RuntimeError(f"Failed to seed ledger (azure-first): {detail_seed}")
+            initial_ledger_file.write_text(json.dumps(ledger.data, indent=2), encoding="utf-8")
             _append_project_log(
                 project_id,
                 "ledger_seeded",
@@ -2046,13 +2142,7 @@ async def _invoke_real_orchestrator(project_id: str, project_data: Dict[str, Any
         ledger_file = workspace_dir / f"ledger_{ledger_id}.json"
         
         ledger_json = json.dumps(ledger.data, indent=2)
-        ok_ledger, detail_ledger = write_text_azure_first(
-            str(ledger_file),
-            ledger_json,
-            materialize_local=True,
-        )
-        if not ok_ledger:
-            raise RuntimeError(f"Failed to persist ledger (azure-first): {detail_ledger}")
+        ledger_file.write_text(ledger_json, encoding="utf-8")
         logger.info("Ledger persisted to: %s", ledger_file.resolve())
         _append_project_log(project_id, "ledger_persisted", ledger_id=ledger_id, path=str(ledger_file.resolve()), size=len(ledger_json))
         
@@ -2290,9 +2380,6 @@ def _read_project_specs_file(project_id: str) -> Optional[str]:
     try:
         workspace_dir = REPO_ROOT / "workspace"
         spec_file = workspace_dir / f"project_specs_{project_id}.md"
-        ok_blob, _ = download_blob_to_local_path(str(spec_file))
-        if (not ok_blob) and is_azure_source_of_truth_enforced():
-            return None
         if spec_file.exists() and spec_file.is_file():
             content = spec_file.read_text(encoding="utf-8")
             logger.info("Read project specifications from: %s", spec_file.resolve())
@@ -2431,13 +2518,7 @@ def _answer_learning_question(project_id: str, question: str, selected_files: Li
     context_text = "\n\n".join(context_blocks)
 
     try:
-        from openai import AzureOpenAI
-
-        client = AzureOpenAI(
-            api_key=os.getenv("AZURE_OPENAI_KEY"),
-            api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        )
+        client = create_routed_client(default_agent_role="learning_agent", tracker=COST_TRACKER)
         messages = [
             {
                 "role": "system",
@@ -2460,6 +2541,10 @@ def _answer_learning_question(project_id: str, question: str, selected_files: Li
             model=AZURE_MODEL_DEPLOYMENT,
             messages=messages,
             temperature=0.2,
+            project_id=project_id,
+            agent_role="learning_agent",
+            task_description=f"Answer learning question for project {project_id}: {question_text}",
+            non_critical=True,
         )
         text = (response.choices[0].message.content or "").strip()
         if text:
@@ -3040,17 +3125,26 @@ async def generate_project_ingestion_context(
 
 @app.get("/api/preview/{project_id}/{path:path}", tags=["Compatibility"])
 async def preview(project_id: str, path: str = ""):
-    _sync_project_from_blob(project_id)
+    if not _PREFER_LOCAL_PREVIEW:
+        _sync_project_from_blob(project_id)
     raw_path = path.strip("/") if path and path.strip() != "/" else ""
     requested_filename = raw_path or "index.html"
 
-    # Try to serve from Azure Blob Storage first
-    container = _get_azure_blob_container_client()
-    if container:
-        for blob_path in _preview_blob_candidates(project_id, requested_filename):
+    # Try to serve from Azure Blob Storage first when local preview is not preferred.
+    if not _PREFER_LOCAL_PREVIEW:
+        container = _get_azure_blob_container_client()
+        blob_paths = [
+            f"{project_id}/runtime/workspace/frontend/dist/{path.strip('/') or 'index.html'}",
+            f"{project_id}/runtime/workspace/frontend_engineer/dist/{path.strip('/') or 'index.html'}",
+            f"{project_id}/frontend/dist/{path.strip('/') or 'index.html'}",
+            f"{project_id}/frontend_engineer/dist/{path.strip('/') or 'index.html'}",
+        ]
+        if container:
             try:
-                blob = container.get_blob_client(blob_path)
-                if blob.exists():
+                for blob_path in blob_paths:
+                    blob = container.get_blob_client(blob_path)
+                    if not blob.exists():
+                        continue
                     stream = blob.download_blob()
                     suffix = os.path.splitext(blob_path)[1].lower()
                     content_types = {
@@ -3068,7 +3162,7 @@ async def preview(project_id: str, path: str = ""):
                         media_type=content_types.get(suffix, "application/octet-stream")
                     )
             except Exception as exc:
-                logger.warning(f"Azure Blob preview fetch failed ({blob_path}): {exc}")
+                logger.warning(f"Azure Blob preview fetch failed: {exc}")
     # Fallback to local logic if not in Azure
     bases = _frontend_preview_bases(project_id)
     fallback_dist = (REPO_ROOT / "platform-frontend" / "dist").resolve()
@@ -3103,6 +3197,7 @@ async def preview(project_id: str, path: str = ""):
                 candidate.resolve().relative_to(base.resolve())
                 if candidate.exists() and candidate.is_file():
                     target = candidate
+                    requested_filename = rel
             except Exception:
                 target = None
 
@@ -3146,7 +3241,8 @@ async def get_project_preview_status(project_id: str, background_tasks: Backgrou
     if not project:
         raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
 
-    _sync_project_from_blob(project_id)
+    if not _PREFER_LOCAL_PREVIEW:
+        _sync_project_from_blob(project_id)
     auto_deploy = _queue_auto_remote_preview_deployment(project_id, project, background_tasks)
     entry = _discover_frontend_preview_entry(project_id)
     remote_preview_url = _resolve_remote_frontend_preview_url(project_id)
@@ -3311,49 +3407,27 @@ async def get_selected_agents(project_id: str):
 
 @app.get("/api/cost/ticker", tags=["Compatibility"])
 async def cost_ticker(project_id: str):
-    return {
-        "project_id": project_id,
-        "estimated_usd": 0.0,
-        "budget_usd": 100.0,
-        "updated_at": datetime.utcnow().isoformat(),
-    }
+    return COST_TRACKER.get_ticker(project_id)
 
 
 @app.post("/api/cost/budget", tags=["Compatibility"])
 async def set_cost_budget(project_id: str, request: BudgetRequest):
-    return {
-        "project_id": project_id,
-        "budget_usd": float(request.budget_usd),
-        "updated_at": datetime.utcnow().isoformat(),
-    }
+    return COST_TRACKER.set_budget(project_id, request.budget_usd)
 
 
 @app.get("/api/cost/summary", tags=["Compatibility"])
 async def cost_summary(project_id: str):
-    return {
-        "project_id": project_id,
-        "total_usd": 0.0,
-        "by_agent": [],
-        "updated_at": datetime.utcnow().isoformat(),
-    }
+    return COST_TRACKER.get_summary(project_id)
 
 
 @app.get("/api/cost/usage", tags=["Compatibility"])
 async def cost_usage(project_id: str, limit: int = 20):
-    return {
-        "project_id": project_id,
-        "limit": int(limit),
-        "entries": [],
-    }
+    return COST_TRACKER.get_usage(project_id, limit=limit)
 
 
 @app.get("/api/cost/escalations", tags=["Compatibility"])
 async def cost_escalations(project_id: str):
-    return {
-        "project_id": project_id,
-        "items": [],
-        "count": 0,
-    }
+    return COST_TRACKER.get_escalations(project_id)
 
 
 @app.post("/clarify", tags=["Compatibility"])
@@ -3472,13 +3546,42 @@ async def question_endpoint(request: QuestionRequest):
             if requested_question_count == 0 and history_count <= 1 and stored_question_count >= 10:
                 stored_question_count = 0
                 project["question_count"] = 0
+                project["question_conversation_history"] = []
+                project["required_api_key_services"] = []
                 project["updated_at"] = datetime.utcnow().isoformat()
                 store._save()
 
             current_question_count = max(stored_question_count, requested_question_count)
         
         agent = QuestioningAgent()
-        conversation_history = request.conversation_history or []
+        client_history = request.conversation_history or []
+        conversation_history = []
+        for item in client_history:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "")).strip().lower()
+            content = str(item.get("content", "")).strip()
+            if role not in {"user", "assistant", "system"} or not content:
+                continue
+            conversation_history.append({"role": role, "content": content})
+
+        stored_history = project.get("question_conversation_history", []) if isinstance(project, dict) else []
+        if not conversation_history and isinstance(stored_history, list) and stored_history:
+            recovered = []
+            for item in stored_history:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role", "")).strip().lower()
+                content = str(item.get("content", "")).strip()
+                if role not in {"user", "assistant", "system"} or not content:
+                    continue
+                recovered.append({"role": role, "content": content})
+            conversation_history = recovered[-60:]
+            _append_project_log(
+                request.project_id,
+                "questioning_history_recovered",
+                restored_messages=len(conversation_history),
+            )
         
         response = agent.get_response(
             request.project_id,
@@ -3486,6 +3589,72 @@ async def question_endpoint(request: QuestionRequest):
             conversation_history,
             question_count=current_question_count
         )
+
+        has_user_input = bool(str(request.user_message or "").strip()) or any(
+            str(item.get("role", "")).strip().lower() == "user" and bool(str(item.get("content", "")).strip())
+            for item in conversation_history
+            if isinstance(item, dict)
+        )
+
+        required_services: List[str] = []
+        ledger_required_services: List[str] = []
+        text_inferred_services: List[str] = []
+        try:
+            spec_path = response.get("full_spec_path")
+            if spec_path:
+                download_blob_to_local_path(str(spec_path))
+                if os.path.exists(spec_path):
+                    spec_text = Path(spec_path).read_text(encoding="utf-8")
+                    required_services = _infer_required_api_key_services_from_text(spec_text)
+
+            workspace_dir = REPO_ROOT / "workspace"
+            ledger_file = workspace_dir / f"ledger_{request.project_id}.json"
+            download_blob_to_local_path(str(ledger_file))
+            if ledger_file.exists():
+                ledger_data = json.loads(ledger_file.read_text(encoding="utf-8"))
+                ledger_required_services = _normalize_required_api_key_services(ledger_data)
+                if not ledger_required_services:
+                    ledger_required_services = _infer_required_api_key_services(ledger_data)
+
+            conversation_text_blob = "\n".join([
+                str(request.user_message or ""),
+                str(response.get("response") or ""),
+            ])
+            text_inferred_services = _infer_required_api_key_services_from_text(conversation_text_blob)
+
+            required_services = _merge_required_services(
+                required_services,
+                ledger_required_services,
+                text_inferred_services,
+                project.get("required_api_key_services", []) if isinstance(project, dict) else [],
+            )
+        except Exception:
+            required_services = []
+
+        if required_services and has_user_input:
+            project["required_api_key_services"] = required_services
+
+        saved_keys = _load_service_api_keys(request.project_id) if has_user_input else {}
+        missing_required_services = []
+        if has_user_input:
+            missing_required_services = [
+                service for service in required_services
+                if not str(saved_keys.get(service, "")).strip()
+            ]
+
+        base_response_text = str(response.get("response") or "").strip()
+        api_key_follow_up_question = ""
+        if has_user_input and missing_required_services:
+            api_key_follow_up_question = (
+                "I detected integrations that need credentials. "
+                f"Could you provide API keys for: {', '.join(missing_required_services)}?"
+            )
+
+            if "api key" not in base_response_text.lower() and "api keys" not in base_response_text.lower():
+                base_response_text = (
+                    f"{base_response_text}\n\n"
+                    f"🔐 {api_key_follow_up_question}"
+                ).strip()
         
         # Always persist the latest question count, including terminal 10/10 state.
         response_question_count = response.get("question_count", current_question_count)
@@ -3495,6 +3664,14 @@ async def question_endpoint(request: QuestionRequest):
             persisted_question_count = current_question_count
 
         project["question_count"] = max(0, min(10, persisted_question_count))
+        updated_history = list(conversation_history)
+        user_message_text = str(request.user_message or "").strip()
+        assistant_message_text = str(response.get("response") or "").strip()
+        if user_message_text:
+            updated_history.append({"role": "user", "content": user_message_text})
+        if assistant_message_text:
+            updated_history.append({"role": "assistant", "content": assistant_message_text})
+        project["question_conversation_history"] = updated_history[-80:]
         project["updated_at"] = datetime.utcnow().isoformat()
         store._save()
         
@@ -3506,7 +3683,7 @@ async def question_endpoint(request: QuestionRequest):
         )
         
         return {
-            "response": response["response"],
+            "response": base_response_text,
             "agent_thinking": response["agent_thinking"],
             "next_topics": response["next_topics"],
             "project_id": request.project_id,
@@ -3516,6 +3693,9 @@ async def question_endpoint(request: QuestionRequest):
             "question_count": response["question_count"],
             "questions_remaining": response["questions_remaining"],
             "must_execute": response["must_execute"],
+            "required_api_key_services": required_services,
+            "missing_api_key_services": missing_required_services,
+            "api_key_follow_up_question": api_key_follow_up_question,
             "web_context_used": bool(response.get("web_context_used", False)),
         }
     except Exception as exc:
@@ -3569,21 +3749,27 @@ async def question_readiness_endpoint(request: QuestionReadinessRequest):
         try:
             workspace_dir = REPO_ROOT / "workspace"
             ledger_file = workspace_dir / f"ledger_{request.project_id}.json"
-            ok_ledger_blob, _ = download_blob_to_local_path(str(ledger_file))
+            download_blob_to_local_path(str(ledger_file))
             if ledger_file.exists():
                 ledger_data = json.loads(ledger_file.read_text(encoding="utf-8"))
                 required_services = _normalize_required_api_key_services(ledger_data)
                 if not required_services:
                     required_services = _infer_required_api_key_services(ledger_data)
             elif full_spec_path:
-                ok_spec_blob, _ = download_blob_to_local_path(str(full_spec_path))
-                if (not ok_spec_blob) and is_azure_source_of_truth_enforced():
-                    required_services = []
-                elif os.path.exists(full_spec_path):
+                download_blob_to_local_path(str(full_spec_path))
+                if os.path.exists(full_spec_path):
                     spec_text = Path(full_spec_path).read_text(encoding="utf-8")
                     required_services = _infer_required_api_key_services_from_text(spec_text)
-            elif (not ok_ledger_blob) and is_azure_source_of_truth_enforced():
-                required_services = []
+
+            if not required_services and full_spec_path and os.path.exists(full_spec_path):
+                spec_text = Path(full_spec_path).read_text(encoding="utf-8")
+                required_services = _infer_required_api_key_services_from_text(spec_text)
+
+            if not required_services and isinstance(project, dict):
+                required_services = _merge_required_services(
+                    project.get("required_api_key_services", []),
+                    _infer_required_api_key_services_from_text(str(project.get("user_intent") or "")),
+                )
         except Exception:
             required_services = []
         
@@ -3641,13 +3827,7 @@ async def execute_from_specs(request: ExecuteRequest, background_tasks: Backgrou
         # Load the specification file
         agent = QuestioningAgent()
         spec_path = agent._get_spec_file_path(request.project_id)
-        ok_spec_blob, _ = download_blob_to_local_path(spec_path)
-        if (not ok_spec_blob) and is_azure_source_of_truth_enforced():
-            return {
-                "message": "No specifications found in Azure blob. Please complete the questioning process first.",
-                "project_id": request.project_id,
-                "status": "failed"
-            }
+        download_blob_to_local_path(spec_path)
         
         if not os.path.exists(spec_path):
             return {
@@ -3661,7 +3841,7 @@ async def execute_from_specs(request: ExecuteRequest, background_tasks: Backgrou
         ledger_file = workspace_dir / f"ledger_{active_project_id}.json"
         ledger_data: Dict[str, Any] = {}
         required_services: List[str] = []
-        ok_ledger_blob, _ = download_blob_to_local_path(str(ledger_file))
+        download_blob_to_local_path(str(ledger_file))
         if ledger_file.exists():
             try:
                 ledger_data = json.loads(ledger_file.read_text(encoding="utf-8"))
@@ -3671,11 +3851,9 @@ async def execute_from_specs(request: ExecuteRequest, background_tasks: Backgrou
             except Exception:
                 ledger_data = {}
                 required_services = []
-        elif (not ok_ledger_blob) and is_azure_source_of_truth_enforced():
-            ledger_data = {}
-            required_services = []
         
-        project_specs = Path(spec_path).read_text(encoding="utf-8")
+        with open(spec_path, 'r', encoding='utf-8') as f:
+            project_specs = f.read()
 
         if not _ledger_has_agent_plan(ledger_data):
             director_input = (
@@ -3693,6 +3871,12 @@ async def execute_from_specs(request: ExecuteRequest, background_tasks: Backgrou
 
         if not required_services:
             required_services = _infer_required_api_key_services_from_text(project_specs)
+
+        if not required_services and isinstance(project, dict):
+            required_services = _merge_required_services(
+                project.get("required_api_key_services", []),
+                _infer_required_api_key_services_from_text(str(project.get("user_intent") or "")),
+            )
 
         ledger_data["required_api_key_services"] = required_services
 
@@ -3724,7 +3908,7 @@ async def execute_from_specs(request: ExecuteRequest, background_tasks: Backgrou
             ledger_service_keys[service_name] = api_key
         ledger_data["service_api_keys"] = ledger_service_keys
         ledger_payload = json.dumps(ledger_data, indent=2, ensure_ascii=False)
-        ok, detail = write_text_azure_first(str(ledger_file), ledger_payload, materialize_local=True)
+        ok, detail = write_text_azure_first(str(ledger_file), ledger_payload)
         if not ok:
             raise RuntimeError(f"Failed to persist task ledger with API keys: {detail}")
 
@@ -3836,7 +4020,6 @@ async def get_project_specs_file(project_id: str):
     try:
         workspace_dir = REPO_ROOT / "workspace"
         spec_file = workspace_dir / f"project_specs_{project_id}.md"
-        download_blob_to_local_path(str(spec_file))
         
         if not spec_file.exists():
             raise HTTPException(status_code=404, detail=f"Specifications file not found for project {project_id}")
@@ -3862,7 +4045,6 @@ async def get_project_ledger(project_id: str):
     try:
         workspace_dir = REPO_ROOT / "workspace"
         ledger_file = workspace_dir / f"ledger_{project_id}.json"
-        download_blob_to_local_path(str(ledger_file))
         
         # Also get project status and logs
         project = store.get(project_id)
@@ -4085,6 +4267,7 @@ async def general_exception_handler(_request, _exc: Exception):
 @app.on_event("startup")
 async def startup_event():
     logger.info("🚀 Nexus platform-compatible backend starting")
+    COST_TRACKER.ensure_containers()
     logger.info(
         "Azure Blob config | conn_configured=%s container=%s blob_workspace_enabled=%s enable_local_file_generation=%s legacy_project_sync=%s autosync_enabled=%s autosync_interval_seconds=%s",
         bool(_AZURE_STORAGE_CONN_STR),

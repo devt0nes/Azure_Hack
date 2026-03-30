@@ -10,8 +10,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
-from openai import AzureOpenAI
 from azure_runtime_sync import write_text_azure_first
+from cost_optimizer import create_routed_client
+from cost_tracker import get_cost_tracker
+
+
+_COST_TRACKER = get_cost_tracker()
 
 
 def _safe_json_loads(value: str) -> Optional[Dict[str, Any]]:
@@ -63,14 +67,13 @@ def _infer_domain_from_terms(terms: List[str]) -> str:
     return "general"
 
 
-def _build_openai_client() -> Optional[AzureOpenAI]:
+def _build_openai_client() -> Optional[Any]:
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     api_key = os.getenv("AZURE_OPENAI_KEY") or os.getenv("AZURE_OPENAI_API_KEY")
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION") or "2024-02-01"
     if not endpoint or not api_key:
         return None
     try:
-        return AzureOpenAI(azure_endpoint=endpoint, api_key=api_key, api_version=api_version)
+        return create_routed_client(default_agent_role="ingestion_service", tracker=_COST_TRACKER)
     except Exception:
         return None
 
@@ -97,6 +100,10 @@ def _chat_json(
             ],
             max_tokens=1200,
             temperature=0.2,
+            project_id=os.getenv("NEXUS_ACTIVE_PROJECT_ID", "default"),
+            agent_role="ingestion_service",
+            task_description=f"Ingestion synthesis: {prompt[:240]}",
+            non_critical=True,
         )
         content = response.choices[0].message.content or ""
         parsed = _safe_json_loads(content)
@@ -282,6 +289,10 @@ def _analyze_image(project_id: str, content_bytes: bytes, filename: str, client:
                 }
             ],
             max_tokens=1200,
+            project_id=project_id,
+            agent_role="ingestion_service",
+            task_description=f"Analyze wireframe/image file: {filename}",
+            non_critical=True,
         )
         parsed = _safe_json_loads(response.choices[0].message.content or "") or default
     except Exception:

@@ -26,10 +26,11 @@ from typing import Dict, List, Optional, Tuple, Any
 from html import unescape
 from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 
-from openai import AzureOpenAI
 from dotenv import load_dotenv
-from azure_runtime_sync import download_blob_to_local_path, write_text_azure_first, is_azure_source_of_truth_enforced
+from azure_runtime_sync import download_blob_to_local_path, write_text_azure_first
 import requests
+from cost_optimizer import create_routed_client
+from cost_tracker import get_cost_tracker
 
 load_dotenv()
 
@@ -45,6 +46,7 @@ WEB_SEARCH_MAX_RESULTS = int(os.getenv("QUESTIONING_WEB_SEARCH_MAX_RESULTS", "4"
 WEB_SEARCH_MAX_QUERIES = int(os.getenv("QUESTIONING_WEB_SEARCH_MAX_QUERIES", "2"))
 
 logger = logging.getLogger("questioning_agent")
+_COST_TRACKER = get_cost_tracker()
 
 
 def _detect_repo_root() -> str:
@@ -80,11 +82,7 @@ class QuestioningAgent:
     """
 
     def __init__(self):
-        self.client = AzureOpenAI(
-            api_key=AZURE_OPENAI_KEY,
-            api_version=AZURE_API_VERSION,
-            azure_endpoint=AZURE_ENDPOINT
-        )
+        self.client = create_routed_client(default_agent_role="questioning_agent", tracker=_COST_TRACKER)
         self.model = AZURE_MODEL_DEPLOYMENT
 
     def _get_spec_file_path(self, project_id: str) -> str:
@@ -94,9 +92,7 @@ class QuestioningAgent:
     def _load_spec_file(self, project_id: str) -> str:
         """Load existing specification file if it exists."""
         spec_path = self._get_spec_file_path(project_id)
-        ok, _ = download_blob_to_local_path(spec_path)
-        if (not ok) and is_azure_source_of_truth_enforced():
-            return ""
+        download_blob_to_local_path(spec_path)
         if os.path.exists(spec_path):
             with open(spec_path, 'r', encoding='utf-8') as f:
                 return f.read()
@@ -105,7 +101,7 @@ class QuestioningAgent:
     def _save_spec_file(self, project_id: str, content: str) -> None:
         """Save the specification file."""
         spec_path = self._get_spec_file_path(project_id)
-        ok, detail = write_text_azure_first(spec_path, content, materialize_local=True)
+        ok, detail = write_text_azure_first(spec_path, content)
         if not ok:
             raise RuntimeError(f"Failed to save project specs (azure-first): {detail}")
 
@@ -530,7 +526,11 @@ Do NOT:
             model=self.model,
             messages=messages,
             temperature=0.7,
-            max_tokens=700
+            max_tokens=700,
+            project_id=project_id,
+            agent_role="questioning_agent",
+            task_description=f"Questioning conversation turn: {user_message[:280]}",
+            non_critical=False,
         )
         
         agent_response = response.choices[0].message.content
@@ -617,7 +617,11 @@ Keep it concise but comprehensive."""
             model=self.model,
             messages=spec_update_prompt,
             temperature=0.3,
-            max_tokens=2000
+            max_tokens=2000,
+            project_id=project_id,
+            agent_role="questioning_agent",
+            task_description="Synthesize project specification markdown",
+            non_critical=False,
         )
         
         updated_spec = spec_response.choices[0].message.content
@@ -643,7 +647,11 @@ Keep it concise but comprehensive."""
                 messages=next_topics_prompt,
                 response_format={"type": "json_object"},
                 temperature=0.4,
-                max_tokens=300
+                max_tokens=300,
+                project_id=project_id,
+                agent_role="questioning_agent",
+                task_description="Generate next questioning topics",
+                non_critical=True,
             )
             topics_data = json.loads(topics_response.choices[0].message.content)
             next_topics = topics_data.get("topics", [])
@@ -779,7 +787,11 @@ It's "very complete" (85%+) if it also covers:
                 messages=readiness_prompt,
                 response_format={"type": "json_object"},
                 temperature=0.3,
-                max_tokens=400
+                max_tokens=400,
+                project_id=project_id,
+                agent_role="questioning_agent",
+                task_description="Evaluate specification readiness",
+                non_critical=True,
             )
             assessment = json.loads(response.choices[0].message.content)
             is_ready = assessment.get("completeness_percentage", 0) >= 70

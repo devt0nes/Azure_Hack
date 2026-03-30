@@ -21,6 +21,8 @@ import random
 import re
 import shlex
 import sys
+from cost_optimizer import create_routed_client
+from cost_tracker import get_cost_tracker
 from datetime import datetime
 from dotenv import load_dotenv
 from tooly import ToolRegistry, has_command_failed, is_done
@@ -72,6 +74,7 @@ MODEL_CALL_MAX_RETRIES = int(os.getenv("MODEL_CALL_MAX_RETRIES", "2"))
 
 # Global references (set by orchestrator)
 _BLACKBOARD = None
+_COST_TRACKER = get_cost_tracker()  
 KNOWN_WORKSPACE_ROOT_DIRS = {
     "backend",
     "frontend",
@@ -1806,10 +1809,9 @@ BUILD FAST. COORDINATE ON LAYER BLACKBOARD. END WITH [READY_FOR_VERIFICATION].""
         self.total_iteration_counter = 0
         
         # Initialize Azure OpenAI client
-        self.client = AzureOpenAI(
-            api_key=os.getenv("AZURE_OPENAI_KEY"),
-            api_version="2024-05-01-preview",
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+        self.client = create_routed_client(
+            default_agent_role=_normalize_agent_role_name(role),
+            tracker=_COST_TRACKER,
         )
         
         # Initialize tools
@@ -2097,6 +2099,10 @@ BUILD FAST. COORDINATE ON LAYER BLACKBOARD. END WITH [READY_FOR_VERIFICATION].""
                         "messages": messages,
                         "tools": self.get_tools(),
                         "tool_choice": "auto",
+                        "project_id": os.getenv("NEXUS_ACTIVE_PROJECT_ID", "default"),
+                        "agent_role": _normalize_agent_role_name(self.role),
+                        "task_description": f"{self.role}: {task_description[:300]}",
+                        "non_critical": False,
                     }
                     if model_timeout is not None:
                         request_kwargs["timeout"] = model_timeout

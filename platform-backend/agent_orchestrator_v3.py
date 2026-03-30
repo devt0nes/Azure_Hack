@@ -136,8 +136,8 @@ STANDARD_BACKEND_PORT = int(os.getenv("STANDARD_BACKEND_PORT", "5100"))
 STANDARD_FRONTEND_PORT = int(os.getenv("STANDARD_FRONTEND_PORT", "5180"))
 STANDARD_BACKEND_URL = os.getenv("STANDARD_BACKEND_URL", f"http://127.0.0.1:{STANDARD_BACKEND_PORT}")
 STANDARD_FRONTEND_URL = os.getenv("STANDARD_FRONTEND_URL", f"http://127.0.0.1:{STANDARD_FRONTEND_PORT}")
-RUN_RUNTIME_IN_AZURE_CONTAINER = os.getenv("RUN_RUNTIME_IN_AZURE_CONTAINER", "true").strip().lower() == "true"
-RUN_SMOKE_TESTS_IN_AZURE_CONTAINER = os.getenv("RUN_SMOKE_TESTS_IN_AZURE_CONTAINER", "true").strip().lower() == "true"
+RUN_RUNTIME_IN_AZURE_CONTAINER = os.getenv("RUN_RUNTIME_IN_AZURE_CONTAINER", "false").strip().lower() == "true"
+RUN_SMOKE_TESTS_IN_AZURE_CONTAINER = os.getenv("RUN_SMOKE_TESTS_IN_AZURE_CONTAINER", "false").strip().lower() == "true"
 ENABLE_PLACEHOLDER_DETECTION = str(os.getenv("ENABLE_PLACEHOLDER_DETECTION", "false")).lower() in {"1", "true", "yes"}
 STRICT_REMOTE_LSP_PRECHECK = str(os.getenv("STRICT_REMOTE_LSP_PRECHECK", "true")).lower() in {"1", "true", "yes"}
 

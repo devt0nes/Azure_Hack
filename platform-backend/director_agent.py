@@ -4,7 +4,8 @@ from typing import Dict, List, Tuple
 import uuid
 import time
 import random
-
+from cost_optimizer import create_routed_client
+from cost_tracker import get_cost_tracker
 from openai import AzureOpenAI
 import json
 import os
@@ -40,6 +41,7 @@ def _detect_repo_root() -> str:
 REPO_ROOT = _detect_repo_root()
 WORKSPACE_DIR = os.path.join(REPO_ROOT, "workspace")
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
+_COST_TRACKER = get_cost_tracker()
 
 class AgentRole(str, Enum):
     """Enumeration of available agent specializations."""
@@ -785,11 +787,7 @@ class DirectorToolRegistry:
 class DirectorAI:
 
     def __init__(self):
-        self.client = AzureOpenAI(
-            api_key = AZURE_OPENAI_KEY,
-            api_version = AZURE_API_VERSION,
-            azure_endpoint = AZURE_ENDPOINT
-        )
+        self.client = create_routed_client(default_agent_role="director_agent", tracker=_COST_TRACKER)
         self.tools_registry = DirectorToolRegistry()
     
     def get_tools(self):
@@ -836,7 +834,6 @@ CONSISTENCY RULES:
 - If two agents can coordinate effectively with bounded dependency risk, place them in the same layer
 - Do NOT force a fixed canonical pattern; derive layer composition from THIS project's requirements.
 - After layer 1 (system_architect only), arrange remaining layers exactly as your project-specific dependency analysis dictates.
-- Try to put frontend engineer in the layer after system architect so the user can see the preview early.
 - Each agent needs: role, instructions
 - The first agent and layer must be the system_architect, always
 - Minimize agent count (quality over quantity)
@@ -880,7 +877,11 @@ Return JSON with only the fields you update. The tool will validate before persi
             messages=messages,
             tools=self.get_tools(),
             tool_choice="auto",
-            temperature=0.7
+            temperature=0.7,
+            project_id=project_id,
+            agent_role="director_agent",
+            task_description=f"Director clarify intent iteration {iteration}: {ledger.data.get('user_intent', '')}",
+            non_critical=False,
         )
         
         assistant_message = response.choices[0].message
@@ -917,7 +918,11 @@ Return JSON with only the fields you update. The tool will validate before persi
                 model = AZURE_MODEL_DEPLOYMENT,
                 messages=messages,
                 response_format={"type": "json_object"},
-                temperature=0.7
+                temperature=0.7,
+                project_id=project_id,
+                agent_role="director_agent",
+                task_description=f"Director finalize ledger iteration {iteration}",
+                non_critical=False,
             )
             
             final_content = final_response.choices[0].message.content
@@ -1008,7 +1013,11 @@ USER CONTEXT:
             messages=messages,
             tools=self.get_tools(),
             tool_choice="auto",
-            temperature=0.7
+            temperature=0.7,
+            project_id=project_id,
+            agent_role="director_agent",
+            task_description=f"Director clarify with thought iteration {iteration}: {ledger.data.get('user_intent', '')}",
+            non_critical=False,
         )
         
         assistant_message = response.choices[0].message
@@ -1074,7 +1083,11 @@ USER CONTEXT:
                 model=AZURE_MODEL_DEPLOYMENT,
                 messages=messages,
                 response_format={"type": "json_object"},
-                temperature=0.7
+                temperature=0.7,
+                project_id=project_id,
+                agent_role="director_agent",
+                task_description=f"Director finalize thought iteration {iteration}",
+                non_critical=False, 
             )
             
             final_content = final_response.choices[0].message.content

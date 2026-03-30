@@ -7,12 +7,12 @@ from typing import Optional, Tuple
 
 
 _BLOB_CONTAINER_CLIENT = None
-_ENABLE_LOCAL_FILE_GENERATION = str(os.getenv("ENABLE_LOCAL_FILE_GENERATION", "false")).strip().lower() in {"1", "true", "yes", "on"}
-_ENFORCE_AZURE_SOT = str(os.getenv("ENFORCE_AZURE_SOURCE_OF_TRUTH", "true")).strip().lower() in {"1", "true", "yes", "on"}
+_ENABLE_LOCAL_FILE_GENERATION = str(os.getenv("ENABLE_LOCAL_FILE_GENERATION", "true")).strip().lower() in {"1", "true", "yes", "on"}
+_ENFORCE_AZURE_SOT = str(os.getenv("ENFORCE_AZURE_SOURCE_OF_TRUTH", "false")).strip().lower() in {"1", "true", "yes", "on"}
 _STRICT_AZURE_COMMAND_EXECUTION = str(
     os.getenv(
         "STRICT_AZURE_COMMAND_EXECUTION",
-        "true" if _ENFORCE_AZURE_SOT else "false",
+        "false",
     )
 ).strip().lower() in {"1", "true", "yes", "on"}
 

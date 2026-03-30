@@ -239,6 +239,48 @@ class CommandTools:
             and str(cmd_parts[2]).lower() == "build"
         )
 
+    def _is_frontend_npm_command(self, cmd_parts) -> bool:
+        if not cmd_parts:
+            return False
+        if str(cmd_parts[0]).lower() != "npm":
+            return False
+        if len(cmd_parts) >= 2 and str(cmd_parts[1]).lower() in {"install", "ci"}:
+            return True
+        if len(cmd_parts) >= 3 and str(cmd_parts[1]).lower() == "run":
+            script = str(cmd_parts[2]).lower()
+            return script in {"build", "dev", "preview", "start"}
+        return False
+
+    def _resolve_frontend_working_dir(self) -> str:
+        workspace_root = Path(self.config.workspace_root).resolve()
+        candidates = [
+            workspace_root / "frontend",
+            workspace_root / "frontend_engineer",
+        ]
+        for candidate in candidates:
+            if (candidate / "package.json").exists():
+                return str(candidate.resolve())
+        return str(Path(self.config.allowed_root).resolve())
+
+    def _is_safe_command_path(self, full_path: str, cmd_parts) -> bool:
+        # Default strict rule: inside role root only.
+        if self.config.is_safe_path(full_path):
+            return True
+
+        # For frontend npm lifecycle commands, allow workspace/frontend explicitly.
+        if self._is_frontend_npm_command(cmd_parts):
+            try:
+                candidate = Path(full_path).resolve()
+                workspace_frontend = (Path(self.config.workspace_root).resolve() / "frontend").resolve()
+                workspace_frontend_engineer = (Path(self.config.workspace_root).resolve() / "frontend_engineer").resolve()
+                return (
+                    candidate == workspace_frontend
+                    or candidate == workspace_frontend_engineer
+                )
+            except Exception:
+                return False
+        return False
+
     def _auto_fix_frontend_build_setup(self, working_dir: str) -> tuple[bool, str]:
         wd = Path(working_dir).resolve()
         package_json_path = wd / "package.json"
@@ -331,6 +373,37 @@ class CommandTools:
             return True, "; ".join(notes)
 
         return False, "no frontend auto-fixes needed"
+
+    def _should_auto_install_for_build(self, stdout_text: str, stderr_text: str) -> bool:
+        txt = ((stdout_text or "") + "\n" + (stderr_text or "")).lower()
+        signals = [
+            "cannot find module",
+            "module not found",
+            "failed to load postcss config",
+            "loading postcss plugin failed",
+            "@vitejs/plugin-react",
+            "vite: not found",
+            "tsc: not found",
+            "command not found",
+        ]
+        return any(s in txt for s in signals)
+
+    def _run_npm_install(self, working_dir: str) -> tuple[bool, str]:
+        try:
+            install = subprocess.run(
+                ["npm", "install", "--no-audit", "--no-fund"],
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=max(180, int(self.config.timeout or 60)),
+                cwd=working_dir,
+            )
+            output = ((install.stdout or "") + "\n" + (install.stderr or "")).strip()
+            if install.returncode == 0:
+                return True, output
+            return False, output
+        except Exception as exc:
+            return False, str(exc)
 
     def _parse_azure_command_result_logs(self, logs: str):
         text = str(logs or "")
@@ -438,6 +511,22 @@ class CommandTools:
 
         status = "SUCCESS" if int(exit_code) == 0 else "FAILED"
         return f"STATUS: {status}\nEXIT_CODE: {int(exit_code)}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+
+    def _extract_exit_code(self, result_text: str):
+        m_code = re.search(r"EXIT_CODE:\s*(-?\d+)", str(result_text or ""))
+        if not m_code:
+            return None
+        with suppress(Exception):
+            return int(m_code.group(1))
+        return None
+
+    def _extract_stdout_stderr(self, result_text: str):
+        text = str(result_text or "")
+        m_out = re.search(r"STDOUT:\n(.*?)\nSTDERR:\n", text, flags=re.DOTALL)
+        m_err = re.search(r"STDERR:\n(.*)$", text, flags=re.DOTALL)
+        stdout = str(m_out.group(1) if m_out else "")
+        stderr = str(m_err.group(1) if m_err else "")
+        return stdout, stderr
     
     def run_command(self, command, cwd=None):
         """Execute shell command in the workspace directory"""
@@ -453,22 +542,22 @@ class CommandTools:
             if not cmd_parts:
                 return "ERROR: Empty command"
 
-            # Normalize build command execution to role root. Agents should call:
-            # run_command({"command":"npm run build"}) with no cwd.
-            if self._is_npm_build_command(cmd_parts):
-                working_dir = os.path.abspath(self.config.allowed_root)
+            # Normalize frontend npm commands to actual frontend workspace folder.
+            if self._is_frontend_npm_command(cmd_parts):
+                working_dir = self._resolve_frontend_working_dir()
             else:
                 if cwd is None or str(cwd).strip() == "":
                     working_dir = os.path.abspath(self.config.allowed_root)
                 else:
                     working_dir = self.config.resolve_path(str(cwd))
 
-            if not self.config.is_safe_path(working_dir):
+            if not self._is_safe_command_path(working_dir, cmd_parts):
                 return "ERROR: Unsafe working directory"
 
-            ok_in, detail_in = sync_blob_prefix_to_local_dir(working_dir)
-            if ok_in:
-                print(f"[AzureBlob][tooly][run_command] hydrated: {detail_in}", file=sys.stderr, flush=True)
+            if is_azure_source_of_truth_enforced():
+                ok_in, detail_in = sync_blob_prefix_to_local_dir(working_dir)
+                if ok_in:
+                    print(f"[AzureBlob][tooly][run_command] hydrated: {detail_in}", file=sys.stderr, flush=True)
 
             pre_notes = []
             if self._is_npm_build_command(cmd_parts):
@@ -478,6 +567,23 @@ class CommandTools:
 
             if is_strict_azure_command_execution_enabled():
                 result_text = self._run_command_in_azure_container(cmd_parts, working_dir)
+
+                if self._is_npm_build_command(cmd_parts):
+                    exit_code = self._extract_exit_code(result_text)
+                    if exit_code not in (None, 0):
+                        out_text, err_text = self._extract_stdout_stderr(result_text)
+                        if self._should_auto_install_for_build(out_text, err_text):
+                            install_cmd = ["npm", "install", "--no-audit", "--no-fund"]
+                            install_result = self._run_command_in_azure_container(install_cmd, working_dir)
+                            install_exit = self._extract_exit_code(install_result)
+                            install_ok = install_exit == 0
+                            pre_notes.append(
+                                "[auto-install] npm install succeeded (azure)"
+                                if install_ok else "[auto-install] npm install failed (azure)"
+                            )
+                            if install_ok:
+                                result_text = self._run_command_in_azure_container(cmd_parts, working_dir)
+
                 if pre_notes:
                     return "\n".join(pre_notes) + "\n" + result_text
                 return result_text
@@ -509,12 +615,37 @@ class CommandTools:
                         )
                         status = "SUCCESS" if result.returncode == 0 else "FAILED"
 
-            ok_out, detail_out = sync_local_dir_to_blob_prefix(working_dir)
-            if ok_out:
-                print(f"[AzureBlob][tooly][run_command] uploaded: {detail_out}", file=sys.stderr, flush=True)
+                # Auto-heal missing dependency / missing node_modules failures.
+                if result.returncode != 0 and self._should_auto_install_for_build(result.stdout, result.stderr):
+                    ok_install, install_out = self._run_npm_install(working_dir)
+                    pre_notes.append(
+                        "[auto-install] npm install succeeded"
+                        if ok_install else "[auto-install] npm install failed"
+                    )
+                    if install_out:
+                        pre_notes.append(f"[auto-install-output]\n{install_out[-1200:]}")
+                    if ok_install:
+                        result = subprocess.run(
+                            cmd_parts,
+                            shell=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=self.config.timeout,
+                            cwd=working_dir
+                        )
+                        status = "SUCCESS" if result.returncode == 0 else "FAILED"
+
+            if is_azure_source_of_truth_enforced():
+                ok_out, detail_out = sync_local_dir_to_blob_prefix(working_dir)
+                if ok_out:
+                    print(f"[AzureBlob][tooly][run_command] uploaded: {detail_out}", file=sys.stderr, flush=True)
 
             # Frontend preview depends on dist/ being uploaded after successful build.
-            if result.returncode == 0 and self._is_npm_build_command(cmd_parts):
+            if (
+                is_azure_source_of_truth_enforced()
+                and result.returncode == 0
+                and self._is_npm_build_command(cmd_parts)
+            ):
                 dist_candidates = [
                     Path(working_dir) / "dist",
                     Path(working_dir) / "frontend" / "dist",
