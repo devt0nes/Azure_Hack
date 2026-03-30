@@ -109,9 +109,12 @@ async def test_run_all_tests_container_command_and_cleanup(monkeypatch):
     created_container = created_group.containers[0]
     command = created_container.command
 
-    assert command[0] == "pytest"
-    assert "/app/smoke_test.py" in command
-    assert "/app/orchestrator_contract_verifier_smoketest.py" in command
+    assert command[0] == "/bin/sh"
+    assert command[1] == "-lc"
+    assert "pytest /app -v" in command[2]
+    assert "python /app/orchestrator_contract_verifier_smoketest.py" in command[2]
+    assert "python /app/smoke_test.py --workspace /app/workspace --role backend_engineer" in command[2]
+    assert "python /app/smoke_test.py --workspace /app/workspace --role frontend_engineer" in command[2]
 
     assert len(fake_client.container_groups.deleted) == 1
     assert fake_client.container_groups.deleted[0] == ("rg-test", "nexus-all-tests")

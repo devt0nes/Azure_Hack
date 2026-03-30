@@ -31,7 +31,12 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from ingestion_service import build_ingestion_context
 from blob_workspace import build_blob_workspace_from_env
-from azure_runtime_sync import download_blob_to_local_path, write_text_azure_first
+from azure_runtime_sync import (
+    download_blob_to_local_path,
+    is_azure_source_of_truth_enforced,
+    upload_dist_dir_to_web_container,
+    write_text_azure_first,
+)
 from cosmos_client import (
     get_cosmos_client,
     get_starter_template,
@@ -762,6 +767,20 @@ def _resolve_remote_frontend_preview_url(project_id: str) -> Optional[str]:
     return None
 
 
+def _preview_blob_candidates(project_id: str, requested_filename: str) -> List[str]:
+    requested = requested_filename.strip("/")
+    if not requested:
+        requested = "index.html"
+
+    # Keep compatibility with both the current runtime/workspace layout and older flat prefixes.
+    return [
+        f"{project_id}/runtime/workspace/frontend/dist/{requested}",
+        f"{project_id}/runtime/workspace/frontend_engineer/dist/{requested}",
+        f"{project_id}/frontend/dist/{requested}",
+        f"{project_id}/frontend_engineer/dist/{requested}",
+    ]
+
+
 def _queue_auto_remote_preview_deployment(
     project_id: str,
     project: Optional[Dict[str, Any]],
@@ -985,7 +1004,9 @@ def _service_api_keys_file(project_id: str) -> Path:
 
 def _load_service_api_keys(project_id: str) -> Dict[str, str]:
     path = _service_api_keys_file(project_id)
-    download_blob_to_local_path(str(path))
+    ok_blob, _ = download_blob_to_local_path(str(path))
+    if (not ok_blob) and is_azure_source_of_truth_enforced():
+        return {}
     if not path.exists():
         return {}
     try:
@@ -1201,9 +1222,42 @@ def _sync_project_to_blob(project_id: str) -> None:
             local_path=str(local_dir.resolve()),
             source_of_truth_prefixes=["runtime/workspace"],
         )
+        _sync_frontend_dist_to_web_container(project_id)
     except Exception as exc:
         _report_blob_error("Blob upload failed", exc, project_id=project_id)
         _append_project_log(project_id, "blob_upload_failed", error=f"{type(exc).__name__}: {exc}")
+
+
+def _sync_frontend_dist_to_web_container(project_id: str) -> None:
+    workspace_root = (REPO_ROOT / "workspace").resolve()
+    dist_candidates = [
+        workspace_root / "frontend" / "dist",
+        workspace_root / "frontend_engineer" / "dist",
+    ]
+
+    uploaded = 0
+    for dist_dir in dist_candidates:
+        if not dist_dir.exists() or not dist_dir.is_dir():
+            continue
+        ok, detail = upload_dist_dir_to_web_container(str(dist_dir), project_id=project_id)
+        if ok:
+            uploaded += 1
+            _append_project_log(
+                project_id,
+                "web_dist_upload",
+                dist_dir=str(dist_dir),
+                detail=detail,
+            )
+        else:
+            _append_project_log(
+                project_id,
+                "web_dist_upload_failed",
+                dist_dir=str(dist_dir),
+                error=detail,
+            )
+
+    if uploaded:
+        logger.info("Uploaded frontend dist to $web for %s from %d location(s)", project_id, uploaded)
 
 
 def _resolve_orchestrator_main_path() -> Path:
@@ -1844,6 +1898,7 @@ async def _invoke_real_orchestrator(project_id: str, project_data: Dict[str, Any
         workspace_dir = REPO_ROOT / "workspace"
         workspace_dir.mkdir(parents=True, exist_ok=True)
         initial_ledger_file = workspace_dir / f"ledger_{project_id}.json"
+        download_blob_to_local_path(str(initial_ledger_file))
         if initial_ledger_file.exists() and initial_ledger_file.is_file():
             try:
                 existing_ledger_data = json.loads(initial_ledger_file.read_text(encoding="utf-8"))
@@ -1861,7 +1916,13 @@ async def _invoke_real_orchestrator(project_id: str, project_data: Dict[str, Any
         # Seed ledger file BEFORE first director tool call.
         # Director prompts mandate read_task_ledger() first; without this file, the model can loop on read errors.
         if max_director_iterations > 0:
-            initial_ledger_file.write_text(json.dumps(ledger.data, indent=2), encoding="utf-8")
+            ok_seed, detail_seed = write_text_azure_first(
+                str(initial_ledger_file),
+                json.dumps(ledger.data, indent=2),
+                materialize_local=True,
+            )
+            if not ok_seed:
+                raise RuntimeError(f"Failed to seed ledger (azure-first): {detail_seed}")
             _append_project_log(
                 project_id,
                 "ledger_seeded",
@@ -1985,7 +2046,13 @@ async def _invoke_real_orchestrator(project_id: str, project_data: Dict[str, Any
         ledger_file = workspace_dir / f"ledger_{ledger_id}.json"
         
         ledger_json = json.dumps(ledger.data, indent=2)
-        ledger_file.write_text(ledger_json, encoding="utf-8")
+        ok_ledger, detail_ledger = write_text_azure_first(
+            str(ledger_file),
+            ledger_json,
+            materialize_local=True,
+        )
+        if not ok_ledger:
+            raise RuntimeError(f"Failed to persist ledger (azure-first): {detail_ledger}")
         logger.info("Ledger persisted to: %s", ledger_file.resolve())
         _append_project_log(project_id, "ledger_persisted", ledger_id=ledger_id, path=str(ledger_file.resolve()), size=len(ledger_json))
         
@@ -2223,6 +2290,9 @@ def _read_project_specs_file(project_id: str) -> Optional[str]:
     try:
         workspace_dir = REPO_ROOT / "workspace"
         spec_file = workspace_dir / f"project_specs_{project_id}.md"
+        ok_blob, _ = download_blob_to_local_path(str(spec_file))
+        if (not ok_blob) and is_azure_source_of_truth_enforced():
+            return None
         if spec_file.exists() and spec_file.is_file():
             content = spec_file.read_text(encoding="utf-8")
             logger.info("Read project specifications from: %s", spec_file.resolve())
@@ -2976,29 +3046,29 @@ async def preview(project_id: str, path: str = ""):
 
     # Try to serve from Azure Blob Storage first
     container = _get_azure_blob_container_client()
-    blob_path = f"{project_id}/frontend_engineer/dist/{path.strip('/') or 'index.html'}"
     if container:
-        try:
-            blob = container.get_blob_client(blob_path)
-            if blob.exists():
-                stream = blob.download_blob()
-                suffix = os.path.splitext(blob_path)[1].lower()
-                content_types = {
-                    ".html": "text/html",
-                    ".css": "text/css",
-                    ".js": "application/javascript",
-                    ".json": "application/json",
-                    ".png": "image/png",
-                    ".jpg": "image/jpeg",
-                    ".gif": "image/gif",
-                    ".svg": "image/svg+xml",
-                }
-                return Response(
-                    content=stream.readall(),
-                    media_type=content_types.get(suffix, "application/octet-stream")
-                )
-        except Exception as exc:
-            logger.warning(f"Azure Blob preview fetch failed: {exc}")
+        for blob_path in _preview_blob_candidates(project_id, requested_filename):
+            try:
+                blob = container.get_blob_client(blob_path)
+                if blob.exists():
+                    stream = blob.download_blob()
+                    suffix = os.path.splitext(blob_path)[1].lower()
+                    content_types = {
+                        ".html": "text/html",
+                        ".css": "text/css",
+                        ".js": "application/javascript",
+                        ".json": "application/json",
+                        ".png": "image/png",
+                        ".jpg": "image/jpeg",
+                        ".gif": "image/gif",
+                        ".svg": "image/svg+xml",
+                    }
+                    return Response(
+                        content=stream.readall(),
+                        media_type=content_types.get(suffix, "application/octet-stream")
+                    )
+            except Exception as exc:
+                logger.warning(f"Azure Blob preview fetch failed ({blob_path}): {exc}")
     # Fallback to local logic if not in Azure
     bases = _frontend_preview_bases(project_id)
     fallback_dist = (REPO_ROOT / "platform-frontend" / "dist").resolve()
@@ -3499,17 +3569,21 @@ async def question_readiness_endpoint(request: QuestionReadinessRequest):
         try:
             workspace_dir = REPO_ROOT / "workspace"
             ledger_file = workspace_dir / f"ledger_{request.project_id}.json"
-            download_blob_to_local_path(str(ledger_file))
+            ok_ledger_blob, _ = download_blob_to_local_path(str(ledger_file))
             if ledger_file.exists():
                 ledger_data = json.loads(ledger_file.read_text(encoding="utf-8"))
                 required_services = _normalize_required_api_key_services(ledger_data)
                 if not required_services:
                     required_services = _infer_required_api_key_services(ledger_data)
             elif full_spec_path:
-                download_blob_to_local_path(str(full_spec_path))
-                if os.path.exists(full_spec_path):
+                ok_spec_blob, _ = download_blob_to_local_path(str(full_spec_path))
+                if (not ok_spec_blob) and is_azure_source_of_truth_enforced():
+                    required_services = []
+                elif os.path.exists(full_spec_path):
                     spec_text = Path(full_spec_path).read_text(encoding="utf-8")
                     required_services = _infer_required_api_key_services_from_text(spec_text)
+            elif (not ok_ledger_blob) and is_azure_source_of_truth_enforced():
+                required_services = []
         except Exception:
             required_services = []
         
@@ -3567,7 +3641,13 @@ async def execute_from_specs(request: ExecuteRequest, background_tasks: Backgrou
         # Load the specification file
         agent = QuestioningAgent()
         spec_path = agent._get_spec_file_path(request.project_id)
-        download_blob_to_local_path(spec_path)
+        ok_spec_blob, _ = download_blob_to_local_path(spec_path)
+        if (not ok_spec_blob) and is_azure_source_of_truth_enforced():
+            return {
+                "message": "No specifications found in Azure blob. Please complete the questioning process first.",
+                "project_id": request.project_id,
+                "status": "failed"
+            }
         
         if not os.path.exists(spec_path):
             return {
@@ -3581,7 +3661,7 @@ async def execute_from_specs(request: ExecuteRequest, background_tasks: Backgrou
         ledger_file = workspace_dir / f"ledger_{active_project_id}.json"
         ledger_data: Dict[str, Any] = {}
         required_services: List[str] = []
-        download_blob_to_local_path(str(ledger_file))
+        ok_ledger_blob, _ = download_blob_to_local_path(str(ledger_file))
         if ledger_file.exists():
             try:
                 ledger_data = json.loads(ledger_file.read_text(encoding="utf-8"))
@@ -3591,9 +3671,11 @@ async def execute_from_specs(request: ExecuteRequest, background_tasks: Backgrou
             except Exception:
                 ledger_data = {}
                 required_services = []
+        elif (not ok_ledger_blob) and is_azure_source_of_truth_enforced():
+            ledger_data = {}
+            required_services = []
         
-        with open(spec_path, 'r', encoding='utf-8') as f:
-            project_specs = f.read()
+        project_specs = Path(spec_path).read_text(encoding="utf-8")
 
         if not _ledger_has_agent_plan(ledger_data):
             director_input = (
@@ -3642,7 +3724,7 @@ async def execute_from_specs(request: ExecuteRequest, background_tasks: Backgrou
             ledger_service_keys[service_name] = api_key
         ledger_data["service_api_keys"] = ledger_service_keys
         ledger_payload = json.dumps(ledger_data, indent=2, ensure_ascii=False)
-        ok, detail = write_text_azure_first(str(ledger_file), ledger_payload)
+        ok, detail = write_text_azure_first(str(ledger_file), ledger_payload, materialize_local=True)
         if not ok:
             raise RuntimeError(f"Failed to persist task ledger with API keys: {detail}")
 
@@ -3754,6 +3836,7 @@ async def get_project_specs_file(project_id: str):
     try:
         workspace_dir = REPO_ROOT / "workspace"
         spec_file = workspace_dir / f"project_specs_{project_id}.md"
+        download_blob_to_local_path(str(spec_file))
         
         if not spec_file.exists():
             raise HTTPException(status_code=404, detail=f"Specifications file not found for project {project_id}")
@@ -3779,6 +3862,7 @@ async def get_project_ledger(project_id: str):
     try:
         workspace_dir = REPO_ROOT / "workspace"
         ledger_file = workspace_dir / f"ledger_{project_id}.json"
+        download_blob_to_local_path(str(ledger_file))
         
         # Also get project status and logs
         project = store.get(project_id)

@@ -275,16 +275,13 @@ class ContractValidator:
 
     def validate_all(self) -> Dict[str, Any]:
         backend_routes = _extract_backend_routes(self.api)
-        if not backend_routes:
-            raise ContractValidationError(
-                "backend_api_contract.json has no usable routes (expected endpoints[] with route or method+path, or OpenAPI paths{})"
-            )
-
         smoke_ok, smoke_err = _validate_backend_smoke_policy(self.api)
         if not smoke_ok:
             raise ContractValidationError(smoke_err)
 
-        if len(backend_routes) != len(set(backend_routes)):
+        # Empty backend contract is allowed and should not block orchestration.
+        # When routes exist, still guard against duplicate declarations.
+        if backend_routes and len(backend_routes) != len(set(backend_routes)):
             raise ContractValidationError("backend_api_contract.json contains duplicate routes")
 
         frontend_routes = _extract_frontend_routes(self.routes)

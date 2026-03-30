@@ -10,7 +10,7 @@ class BlobWorkspace:
       <project_id>/<relative_path>
     """
 
-    def __init__(self, connection_string: str, container: str = "workspace"):
+    def __init__(self, connection_string: str, container: str = "project-workspace"):
         try:
             from azure.storage.blob import BlobServiceClient  # type: ignore
         except Exception as exc:  # pragma: no cover
@@ -58,9 +58,13 @@ class BlobWorkspace:
                 full_path = Path(root) / name
                 rel_path = full_path.relative_to(local_root).as_posix()
                 blob_name = f"{blob_base}{rel_path}"
-                with open(full_path, "rb") as data:
-                    self.container.upload_blob(blob_name, data, overwrite=True)
-                count += 1
+                try:
+                    with open(full_path, "rb") as data:
+                        self.container.upload_blob(blob_name, data, overwrite=True)
+                    count += 1
+                except FileNotFoundError:
+                    # File vanished between os.walk listing and open (expected in azure-first mode).
+                    continue
         return count
 
 
@@ -68,5 +72,5 @@ def build_blob_workspace_from_env() -> Optional[BlobWorkspace]:
     conn = (os.getenv("AZURE_STORAGE_CONNECTION_STRING") or "").strip()
     if not conn:
         return None
-    container = (os.getenv("AZURE_STORAGE_CONTAINER") or "workspace").strip() or "workspace"
+    container = (os.getenv("AZURE_STORAGE_CONTAINER") or "project-workspace").strip() or "project-workspace"
     return BlobWorkspace(conn, container=container)

@@ -9,6 +9,12 @@ from typing import Optional, Tuple
 _BLOB_CONTAINER_CLIENT = None
 _ENABLE_LOCAL_FILE_GENERATION = str(os.getenv("ENABLE_LOCAL_FILE_GENERATION", "false")).strip().lower() in {"1", "true", "yes", "on"}
 _ENFORCE_AZURE_SOT = str(os.getenv("ENFORCE_AZURE_SOURCE_OF_TRUTH", "true")).strip().lower() in {"1", "true", "yes", "on"}
+_STRICT_AZURE_COMMAND_EXECUTION = str(
+    os.getenv(
+        "STRICT_AZURE_COMMAND_EXECUTION",
+        "true" if _ENFORCE_AZURE_SOT else "false",
+    )
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _detect_repo_root() -> Path:
@@ -24,6 +30,18 @@ def _detect_repo_root() -> Path:
 
 
 REPO_ROOT = _detect_repo_root()
+
+
+def is_azure_source_of_truth_enforced() -> bool:
+    return bool(_ENFORCE_AZURE_SOT)
+
+
+def is_local_file_generation_enabled() -> bool:
+    return bool(_ENABLE_LOCAL_FILE_GENERATION)
+
+
+def is_strict_azure_command_execution_enabled() -> bool:
+    return bool(_STRICT_AZURE_COMMAND_EXECUTION)
 
 
 def _workspace_roots() -> list[Path]:
@@ -219,6 +237,12 @@ def download_blob_to_local_path(local_path: str) -> Tuple[bool, str]:
         p.write_bytes(data)
         return True, blob_name
     except Exception as exc:
+        if _ENFORCE_AZURE_SOT and p.exists() and p.is_file():
+            # Avoid stale local fallback when blob hydration fails.
+            try:
+                p.unlink()
+            except Exception:
+                pass
         return False, f"{type(exc).__name__}: {exc}"
 
 
@@ -313,5 +337,49 @@ def sync_local_dir_to_blob_prefix(local_dir: str) -> Tuple[bool, str]:
                     client.upload_blob(blob_name, data, overwrite=True)
                 count += 1
         return True, f"uploaded {count} file(s) to {prefix}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def upload_dist_dir_to_web_container(local_dist_dir: str, project_id: Optional[str] = None) -> Tuple[bool, str]:
+    """Upload a built frontend dist directory to Azure static website container ($web).
+
+    Files are written under:
+      <project_id>/frontend/dist/<relative_file_path>
+    """
+    dist_root = Path(local_dist_dir).resolve()
+    if not dist_root.exists() or not dist_root.is_dir():
+        return False, f"dist directory missing: {dist_root}"
+
+    conn = (os.getenv("AZURE_STORAGE_CONNECTION_STRING") or "").strip()
+    if not conn:
+        return False, "AZURE_STORAGE_CONNECTION_STRING is empty"
+
+    pid = str(project_id or "").strip() or _active_project_id(dist_root)
+    if not pid:
+        return False, "NEXUS_ACTIVE_PROJECT_ID not set"
+
+    try:
+        from azure.storage.blob import BlobServiceClient
+
+        svc = BlobServiceClient.from_connection_string(conn)
+        web_container = svc.get_container_client("$web")
+        try:
+            web_container.create_container()
+        except Exception:
+            pass
+
+        blob_prefix = f"{pid}/frontend/dist/"
+        count = 0
+        for root, _, files in os.walk(dist_root):
+            for name in files:
+                full = Path(root) / name
+                rel_path = full.relative_to(dist_root).as_posix()
+                blob_name = f"{blob_prefix}{rel_path}"
+                with full.open("rb") as data:
+                    web_container.upload_blob(blob_name, data, overwrite=True)
+                count += 1
+
+        return True, f"uploaded {count} file(s) to $web/{blob_prefix}"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"

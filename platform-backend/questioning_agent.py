@@ -28,7 +28,7 @@ from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 
 from openai import AzureOpenAI
 from dotenv import load_dotenv
-from azure_runtime_sync import download_blob_to_local_path, write_text_azure_first
+from azure_runtime_sync import download_blob_to_local_path, write_text_azure_first, is_azure_source_of_truth_enforced
 import requests
 
 load_dotenv()
@@ -94,7 +94,9 @@ class QuestioningAgent:
     def _load_spec_file(self, project_id: str) -> str:
         """Load existing specification file if it exists."""
         spec_path = self._get_spec_file_path(project_id)
-        download_blob_to_local_path(spec_path)
+        ok, _ = download_blob_to_local_path(spec_path)
+        if (not ok) and is_azure_source_of_truth_enforced():
+            return ""
         if os.path.exists(spec_path):
             with open(spec_path, 'r', encoding='utf-8') as f:
                 return f.read()
@@ -103,7 +105,7 @@ class QuestioningAgent:
     def _save_spec_file(self, project_id: str, content: str) -> None:
         """Save the specification file."""
         spec_path = self._get_spec_file_path(project_id)
-        ok, detail = write_text_azure_first(spec_path, content)
+        ok, detail = write_text_azure_first(spec_path, content, materialize_local=True)
         if not ok:
             raise RuntimeError(f"Failed to save project specs (azure-first): {detail}")
 

@@ -577,6 +577,56 @@ def _ensure_node_dependencies(role_workspace: Path, package_json: dict, role: st
         }
 
 
+def _run_frontend_build(role_workspace: Path, deadline_ts: float):
+    remaining = int(_remaining_seconds(deadline_ts))
+    if remaining <= 5:
+        return {
+            "ok": False,
+            "error": "not enough smoke time budget left to run npm run build",
+            "output": "",
+        }
+
+    timeout_seconds = max(30, min(300, remaining - 2))
+    _smoke_log("frontend_engineer", f"running npm run build (timeout={timeout_seconds}s)")
+    try:
+        completed = subprocess.run(
+            ["npm", "run", "build"],
+            cwd=str(role_workspace),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        out = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
+        if completed.returncode != 0:
+            return {
+                "ok": False,
+                "error": f"npm run build failed with exit code {completed.returncode}",
+                "output": out[-2500:],
+            }
+        return {
+            "ok": True,
+            "output": out[-1200:],
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "error": "npm run build timed out",
+            "output": "",
+        }
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "error": "npm executable not found",
+            "output": "",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"npm run build failed: {exc}",
+            "output": "",
+        }
+
+
 def _check_backend_endpoints(base_url: str, backend_contract: dict, deadline_ts: float):
     errors = []
     warnings = []
@@ -1042,6 +1092,24 @@ def run_smoke(
             "checks": checks,
             "output": dep_bootstrap.get("output", ""),
         }
+
+    if role == "frontend_engineer":
+        frontend_build = _run_frontend_build(role_workspace, deadline_ts)
+        checks.append(
+            {
+                "kind": "build",
+                "target": "npm run build",
+                "status": "ok" if frontend_build.get("ok") else "failed",
+            }
+        )
+        if not frontend_build.get("ok"):
+            errors.append(str(frontend_build.get("error") or "frontend build failed"))
+            return {
+                "ok": False,
+                "errors": errors,
+                "checks": checks,
+                "output": frontend_build.get("output", ""),
+            }
 
     desired_port = backend_port if role == "backend_engineer" else frontend_port
     host = "127.0.0.1"

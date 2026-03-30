@@ -28,6 +28,12 @@ from issues_tracker import get_issues_tracker
 from template_tools import attach_template_tools
 from azure_runtime_sync import upload_local_path_to_blob
 from azure_runtime_sync import write_text_azure_first
+from azure_runtime_sync import (
+    download_blob_to_local_path,
+    sync_blob_prefix_to_local_dir,
+    is_azure_source_of_truth_enforced,
+    is_strict_azure_command_execution_enabled,
+)
 
 load_dotenv()
 
@@ -66,6 +72,17 @@ MODEL_CALL_MAX_RETRIES = int(os.getenv("MODEL_CALL_MAX_RETRIES", "2"))
 
 # Global references (set by orchestrator)
 _BLACKBOARD = None
+KNOWN_WORKSPACE_ROOT_DIRS = {
+    "backend",
+    "frontend",
+    "database",
+    "contracts",
+    "tests",
+    "infra",
+    "docs",
+    "api",
+    "config",
+}
 
 def set_blackboard(blackboard):
     """Set the global blackboard reference for agents to use"""
@@ -256,9 +273,13 @@ class CWDAwareToolRegistry:
                 return resolved_abs
 
         # Case 4a: Single-segment workspace directory shortcut
-        # Example from frontend agent: "frontend" should map to workspace/frontend,
-        # not workspace/frontend/frontend.
+        # Treat known workspace roots as Azure-first logical directories even if local
+        # filesystem hasn't been hydrated yet.
         if "/" not in file_path and not file_path.startswith("./"):
+            if file_path in KNOWN_WORKSPACE_ROOT_DIRS:
+                candidate_abs = os.path.abspath(os.path.join(workspace_abs, file_path))
+                if self._is_within(workspace_abs, candidate_abs):
+                    return candidate_abs
             candidate_dir = os.path.join(workspace_abs, file_path)
             if os.path.isdir(candidate_dir):
                 candidate_abs = os.path.abspath(candidate_dir)
@@ -266,9 +287,14 @@ class CWDAwareToolRegistry:
                     return candidate_abs
 
         # Case 4: Cross-workspace direct path "other_agent/file.js"
-        # Only treat as cross-workspace if first segment is an existing workspace subdir.
+        # Prefer known workspace root directories even when local files are not present yet.
         if "/" in file_path and not file_path.startswith("./"):
             first_segment = file_path.split("/", 1)[0]
+            if first_segment in KNOWN_WORKSPACE_ROOT_DIRS:
+                resolved = os.path.join(workspace_abs, file_path)
+                resolved_abs = os.path.abspath(resolved)
+                if self._is_within(workspace_abs, resolved_abs):
+                    return resolved_abs
             first_segment_abs = os.path.join(workspace_abs, first_segment)
             if os.path.isdir(first_segment_abs):
                 resolved = os.path.join(workspace_abs, file_path)
@@ -975,6 +1001,9 @@ class CWDAwareToolRegistry:
                 "npm run dev -- --strictport --port 5180",
             }
             if cmd_norm in allowed_frontend_dev_probe:
+                if is_strict_azure_command_execution_enabled():
+                    return self.tool_registry.execute_tool(function_name, function_args)
+
                 cwd_arg = function_args.get("cwd")
                 if cwd_arg:
                     if os.path.isabs(str(cwd_arg)):
@@ -1028,6 +1057,9 @@ class CWDAwareToolRegistry:
                 )
             self.validation_actions += 1
             if getattr(self, "write_scope", "role") == "workspace":
+                if is_strict_azure_command_execution_enabled():
+                    return self.tool_registry.execute_tool(function_name, function_args)
+
                 cmd_text = str(cmd or "")
                 token_block = re.compile(r"(^|[\\s;&|()])(?:rm|curl|sudo|dd)(?=$|[\\s;&|()])", re.IGNORECASE)
                 if token_block.search(cmd_text) or ":/" in cmd_text:
@@ -1089,7 +1121,17 @@ class CWDAwareToolRegistry:
                 full_path = self._resolve_read_path(file_path)
             except ValueError as e:
                 return f"ERROR: {str(e)}"
-            
+
+            ok_blob, detail_blob = download_blob_to_local_path(full_path)
+            if (not ok_blob) and is_azure_source_of_truth_enforced():
+                parent = os.path.dirname(full_path)
+                ok_dir, detail_dir = sync_blob_prefix_to_local_dir(parent)
+                if not ok_dir:
+                    return (
+                        "ERROR: Azure-first read failed for syntax check: "
+                        f"{detail_blob}. Parent dir hydrate also failed: {detail_dir}"
+                    )
+
             if not os.path.exists(full_path):
                 return f"ERROR: File not found: {file_path}"
             

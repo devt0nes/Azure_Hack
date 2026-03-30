@@ -14,13 +14,20 @@ import json
 import subprocess
 import re
 import shlex
+import shutil
+import asyncio
+from contextlib import suppress
 from pathlib import Path
 import sys
 
 from azure_runtime_sync import (
     download_blob_to_local_path,
+    is_azure_source_of_truth_enforced,
+    is_local_file_generation_enabled,
+    is_strict_azure_command_execution_enabled,
     sync_blob_prefix_to_local_dir,
     sync_local_dir_to_blob_prefix,
+    upload_dist_dir_to_web_container,
     upload_local_path_to_blob,
     write_text_azure_first,
 )
@@ -95,14 +102,11 @@ class ToolConfig:
             return str(candidate.resolve())
 
         normalized = raw.lstrip("./")
-        candidate = allowed_root / normalized
-
         first_segment = normalized.split("/", 1)[0] if normalized else ""
-        if (not candidate.exists()) and first_segment in KNOWN_WORKSPACE_ROOT_DIRS:
+        if first_segment in KNOWN_WORKSPACE_ROOT_DIRS or first_segment == allowed_root.name:
             candidate = workspace_root / normalized
-
-        if (not candidate.exists()) and first_segment == allowed_root.name:
-            candidate = workspace_root / normalized
+        else:
+            candidate = allowed_root / normalized
 
         return str(candidate.resolve())
     
@@ -137,6 +141,8 @@ class FilesTools:
             ok, detail = download_blob_to_local_path(full_path)
             if ok:
                 print(f"[AzureBlob][tooly][read_file] hydrated: {detail}", file=sys.stderr, flush=True)
+            elif is_azure_source_of_truth_enforced():
+                return f"ERROR: Azure-first read failed: {detail}"
 
             with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
@@ -223,6 +229,215 @@ class CommandTools:
         self.config = config
         # Commands that are not allowed for security
         self.forbidden_keywords = ["rm", "curl", "sudo", "dd", ":/"]
+
+    def _is_npm_build_command(self, cmd_parts):
+        if len(cmd_parts) < 3:
+            return False
+        return (
+            str(cmd_parts[0]).lower() == "npm"
+            and str(cmd_parts[1]).lower() == "run"
+            and str(cmd_parts[2]).lower() == "build"
+        )
+
+    def _auto_fix_frontend_build_setup(self, working_dir: str) -> tuple[bool, str]:
+        wd = Path(working_dir).resolve()
+        package_json_path = wd / "package.json"
+        if not package_json_path.exists():
+            return False, "no package.json in working directory"
+
+        changed = False
+        notes = []
+
+        try:
+            pkg = json.loads(package_json_path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            pkg = {}
+        if not isinstance(pkg, dict):
+            pkg = {}
+
+        scripts = pkg.get("scripts", {})
+        if not isinstance(scripts, dict):
+            scripts = {}
+
+        deps = pkg.get("dependencies", {})
+        dev_deps = pkg.get("devDependencies", {})
+        if not isinstance(deps, dict):
+            deps = {}
+        if not isinstance(dev_deps, dict):
+            dev_deps = {}
+        all_deps = {**deps, **dev_deps}
+
+        if not str(scripts.get("build", "")).strip():
+            if "vite" in all_deps:
+                scripts["build"] = "vite build"
+                changed = True
+                notes.append("added scripts.build='vite build'")
+            elif "react-scripts" in all_deps:
+                scripts["build"] = "react-scripts build"
+                changed = True
+                notes.append("added scripts.build='react-scripts build'")
+
+        pkg["scripts"] = scripts
+
+        index_path = wd / "index.html"
+        if index_path.exists() and index_path.is_file():
+            html = index_path.read_text(encoding="utf-8", errors="ignore")
+            fixed_html = html
+            src_main_candidates = []
+            root_main_candidates = []
+            for probe_ext in ["tsx", "jsx", "ts", "js"]:
+                p_src = wd / "src" / f"main.{probe_ext}"
+                p_root = wd / f"main.{probe_ext}"
+                if p_src.exists():
+                    src_main_candidates.append(probe_ext)
+                if p_root.exists():
+                    root_main_candidates.append(probe_ext)
+            for ext in ["jsx", "tsx", "js", "ts"]:
+                bad_abs = f'src="/main.{ext}"'
+                if bad_abs in fixed_html:
+                    src_candidate = wd / "src" / f"main.{ext}"
+                    root_candidate = wd / f"main.{ext}"
+                    if src_candidate.exists():
+                        fixed_html = fixed_html.replace(bad_abs, f'src="/src/main.{ext}"')
+                        changed = True
+                        notes.append(f"index.html main entry fixed to /src/main.{ext}")
+                    elif root_candidate.exists():
+                        fixed_html = fixed_html.replace(bad_abs, f'src="./main.{ext}"')
+                        changed = True
+                        notes.append(f"index.html main entry fixed to ./main.{ext}")
+                    elif src_main_candidates:
+                        chosen = src_main_candidates[0]
+                        fixed_html = fixed_html.replace(bad_abs, f'src="/src/main.{chosen}"')
+                        changed = True
+                        notes.append(f"index.html main entry fixed to /src/main.{chosen}")
+                    elif root_main_candidates:
+                        chosen = root_main_candidates[0]
+                        fixed_html = fixed_html.replace(bad_abs, f'src="./main.{chosen}"')
+                        changed = True
+                        notes.append(f"index.html main entry fixed to ./main.{chosen}")
+            if fixed_html != html:
+                ok_idx, detail_idx = write_text_azure_first(str(index_path), fixed_html, materialize_local=True)
+                if not ok_idx:
+                    notes.append(f"failed to persist index.html auto-fix: {detail_idx}")
+
+        if changed:
+            ok_pkg, detail_pkg = write_text_azure_first(
+                str(package_json_path),
+                json.dumps(pkg, indent=2, ensure_ascii=False) + "\n",
+                materialize_local=True,
+            )
+            if not ok_pkg:
+                notes.append(f"failed to persist package.json auto-fix: {detail_pkg}")
+            return True, "; ".join(notes)
+
+        return False, "no frontend auto-fixes needed"
+
+    def _parse_azure_command_result_logs(self, logs: str):
+        text = str(logs or "")
+        stdout = ""
+        stderr = ""
+        exit_code = None
+
+        m_out = re.search(
+            r"__NEXUS_CMD_STDOUT_BEGIN__\n?(.*?)\n?__NEXUS_CMD_STDOUT_END__",
+            text,
+            flags=re.DOTALL,
+        )
+        if m_out:
+            stdout = str(m_out.group(1) or "")
+
+        m_err = re.search(
+            r"__NEXUS_CMD_STDERR_BEGIN__\n?(.*?)\n?__NEXUS_CMD_STDERR_END__",
+            text,
+            flags=re.DOTALL,
+        )
+        if m_err:
+            stderr = str(m_err.group(1) or "")
+
+        m_code = re.search(r"__NEXUS_CMD_EXIT_CODE__:(-?\d+)", text)
+        if m_code:
+            with suppress(Exception):
+                exit_code = int(m_code.group(1))
+
+        return stdout, stderr, exit_code
+
+    def _run_command_in_azure_container(self, cmd_parts, working_dir):
+        project_id = (os.getenv("NEXUS_ACTIVE_PROJECT_ID") or "").strip()
+        if not project_id:
+            return "ERROR: NEXUS_ACTIVE_PROJECT_ID is required for strict Azure command execution."
+
+        try:
+            from azure_container_test_runner import (
+                AzureContainerTestRunner,
+                build_container_image_ref,
+                normalize_acr_registry,
+            )
+        except Exception as exc:
+            return f"ERROR: Azure container runner unavailable: {exc}"
+
+        workspace_root = Path(self.config.workspace_root).resolve()
+        working_path = Path(working_dir).resolve()
+        try:
+            cwd_rel = working_path.relative_to(workspace_root).as_posix()
+        except Exception:
+            return "ERROR: Working directory must be under workspace root for Azure execution."
+
+        resource_group = os.getenv("AZURE_RESOURCE_GROUP", "Nipun-Bhattad-RG")
+        container_registry = os.getenv("AZURE_CONTAINER_REGISTRY", "nipunregistry")
+        container_repository = os.getenv(
+            "AZURE_CONTAINER_REPOSITORY",
+            os.getenv("AZURE_CONTAINER_NAME", "nexus-test-runner"),
+        )
+        container_tag = os.getenv("AZURE_CONTAINER_TAG", "latest")
+        timeout_seconds = int(os.getenv("AZURE_CONTAINER_INSTANCES_TIMEOUT", "3600"))
+        image_ref = build_container_image_ref(container_registry, container_repository, container_tag)
+
+        env_payload = {"NEXUS_ACTIVE_PROJECT_ID": project_id}
+        for key in [
+            "AZURE_STORAGE_CONNECTION_STRING",
+            "AZURE_STORAGE_CONTAINER",
+            "AZURE_STORAGE_ACCOUNT_NAME",
+            "AZURE_STORAGE_ACCOUNT_KEY",
+            "SMOKE_BACKEND_URL",
+            "SMOKE_FRONTEND_URL",
+            "SMOKE_BACKEND_PORT",
+            "SMOKE_FRONTEND_PORT",
+            "SMOKE_STARTUP_TIMEOUT_SECONDS",
+            "SMOKE_MAX_TOTAL_SECONDS",
+        ]:
+            value = os.getenv(key)
+            if value:
+                env_payload[key] = value
+
+        try:
+            runner = AzureContainerTestRunner(
+                resource_group=resource_group,
+                container_registry=normalize_acr_registry(container_registry),
+                container_image=image_ref,
+                timeout_seconds=timeout_seconds,
+            )
+            result = asyncio.run(
+                runner.run_workspace_command(
+                    project_id=project_id,
+                    command_parts=list(cmd_parts),
+                    cwd=cwd_rel,
+                    container_name=f"nexus-cmd-{project_id[:24]}",
+                    environment_vars=env_payload,
+                    timeout_seconds=min(timeout_seconds, max(120, self.config.timeout + 180)),
+                )
+            )
+        except Exception as exc:
+            return f"ERROR: Azure container command execution failed: {exc}"
+
+        logs = str(result.get("logs") or "")
+        stdout, stderr, exit_code = self._parse_azure_command_result_logs(logs)
+        if exit_code is None:
+            exit_code = 1
+            if not stderr:
+                stderr = str(result.get("error") or "Azure command failed without parsed exit code")
+
+        status = "SUCCESS" if int(exit_code) == 0 else "FAILED"
+        return f"STATUS: {status}\nEXIT_CODE: {int(exit_code)}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     
     def run_command(self, command, cwd=None):
         """Execute shell command in the workspace directory"""
@@ -234,18 +449,38 @@ class CommandTools:
             return "ERROR: Access Denied. The requested command contains forbidden keywords!"
         
         try:
-            working_dir = cwd or os.path.abspath(self.config.allowed_root)
-            
+            cmd_parts = shlex.split(cmd)
+            if not cmd_parts:
+                return "ERROR: Empty command"
+
+            # Normalize build command execution to role root. Agents should call:
+            # run_command({"command":"npm run build"}) with no cwd.
+            if self._is_npm_build_command(cmd_parts):
+                working_dir = os.path.abspath(self.config.allowed_root)
+            else:
+                if cwd is None or str(cwd).strip() == "":
+                    working_dir = os.path.abspath(self.config.allowed_root)
+                else:
+                    working_dir = self.config.resolve_path(str(cwd))
+
             if not self.config.is_safe_path(working_dir):
                 return "ERROR: Unsafe working directory"
 
             ok_in, detail_in = sync_blob_prefix_to_local_dir(working_dir)
             if ok_in:
                 print(f"[AzureBlob][tooly][run_command] hydrated: {detail_in}", file=sys.stderr, flush=True)
-            
-            cmd_parts = shlex.split(cmd)
-            if not cmd_parts:
-                return "ERROR: Empty command"
+
+            pre_notes = []
+            if self._is_npm_build_command(cmd_parts):
+                changed, note = self._auto_fix_frontend_build_setup(working_dir)
+                if changed:
+                    pre_notes.append(f"[auto-fix] {note}")
+
+            if is_strict_azure_command_execution_enabled():
+                result_text = self._run_command_in_azure_container(cmd_parts, working_dir)
+                if pre_notes:
+                    return "\n".join(pre_notes) + "\n" + result_text
+                return result_text
 
             result = subprocess.run(
                 cmd_parts,
@@ -258,11 +493,64 @@ class CommandTools:
             
             status = "SUCCESS" if result.returncode == 0 else "FAILED"
 
+            if self._is_npm_build_command(cmd_parts) and result.returncode != 0:
+                err_text = (result.stderr or "") + "\n" + (result.stdout or "")
+                if "Rollup failed to resolve import \"/main." in err_text and "index.html" in err_text:
+                    changed_retry, note_retry = self._auto_fix_frontend_build_setup(working_dir)
+                    if changed_retry:
+                        pre_notes.append(f"[auto-fix-retry] {note_retry}")
+                        result = subprocess.run(
+                            cmd_parts,
+                            shell=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=self.config.timeout,
+                            cwd=working_dir
+                        )
+                        status = "SUCCESS" if result.returncode == 0 else "FAILED"
+
             ok_out, detail_out = sync_local_dir_to_blob_prefix(working_dir)
             if ok_out:
                 print(f"[AzureBlob][tooly][run_command] uploaded: {detail_out}", file=sys.stderr, flush=True)
 
-            return f"STATUS: {status}\nEXIT_CODE: {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+            # Frontend preview depends on dist/ being uploaded after successful build.
+            if result.returncode == 0 and self._is_npm_build_command(cmd_parts):
+                dist_candidates = [
+                    Path(working_dir) / "dist",
+                    Path(working_dir) / "frontend" / "dist",
+                    Path(working_dir) / "frontend_engineer" / "dist",
+                ]
+                for dist_dir in dist_candidates:
+                    if not dist_dir.exists() or not dist_dir.is_dir():
+                        continue
+                    ok_dist, detail_dist = sync_local_dir_to_blob_prefix(str(dist_dir))
+                    if ok_dist:
+                        print(
+                            f"[AzureBlob][tooly][run_command] uploaded build dist: {detail_dist}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    ok_web, detail_web = upload_dist_dir_to_web_container(str(dist_dir))
+                    if ok_web:
+                        print(
+                            f"[AzureBlob][tooly][run_command] uploaded build dist to $web: {detail_web}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[AzureBlob][tooly][run_command] $web upload skipped/failed: {detail_web}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    if not is_local_file_generation_enabled():
+                        with suppress(Exception):
+                            shutil.rmtree(dist_dir)
+
+            preface = ""
+            if pre_notes:
+                preface = "\n".join(pre_notes) + "\n"
+            return f"{preface}STATUS: {status}\nEXIT_CODE: {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         except subprocess.TimeoutExpired:
             return f"ERROR: Command timed out after {self.config.timeout} seconds."
         except Exception as e:
@@ -371,6 +659,42 @@ class ValidationTools:
         except Exception:
             return None
         return None
+
+    def _resolve_existing_source_path(self, full_path):
+        candidate = Path(full_path)
+        if candidate.exists():
+            return str(candidate.resolve())
+
+        ci_match = self._resolve_case_insensitive(full_path)
+        if ci_match:
+            return ci_match
+
+        parent = candidate.parent
+        if not parent.exists() or not parent.is_dir():
+            return None
+
+        ext = candidate.suffix.lower()
+        stem = candidate.stem.lower()
+        extension_aliases = {
+            ".ts": [".tsx"],
+            ".tsx": [".ts"],
+            ".js": [".jsx", ".mjs", ".cjs"],
+            ".jsx": [".js", ".tsx"],
+            ".mjs": [".js"],
+            ".cjs": [".js"],
+        }
+        allowed_exts = [ext] + extension_aliases.get(ext, [])
+
+        try:
+            for child in parent.iterdir():
+                if not child.is_file():
+                    continue
+                if child.stem.lower() == stem and child.suffix.lower() in allowed_exts:
+                    return str(child.resolve())
+        except Exception:
+            return None
+
+        return None
     
     def check_syntax(self, file_path, language=None):
         """
@@ -386,9 +710,16 @@ class ValidationTools:
             if ok:
                 print(f"[AzureBlob][tooly][check_syntax] hydrated: {detail}", file=sys.stderr, flush=True)
 
-            ci_path = self._resolve_case_insensitive(full_path)
-            if ci_path and self.config.is_safe_path(ci_path):
-                full_path = ci_path
+            resolved = self._resolve_existing_source_path(full_path)
+            if (not resolved) or (not os.path.exists(resolved)):
+                parent_dir = str(Path(full_path).parent)
+                ok_dir, detail_dir = sync_blob_prefix_to_local_dir(parent_dir)
+                if ok_dir:
+                    print(f"[AzureBlob][tooly][check_syntax] hydrated parent dir: {detail_dir}", file=sys.stderr, flush=True)
+                resolved = self._resolve_existing_source_path(full_path)
+
+            if resolved and self.config.is_safe_path(resolved):
+                full_path = resolved
             
             if not os.path.exists(full_path):
                 return f"ERROR: File not found: {file_path}"
@@ -423,7 +754,7 @@ class ValidationTools:
             
             # JavaScript/TypeScript syntax check (basic)
             elif language in ['javascript', 'typescript', 'js', 'ts', 'jsx', 'tsx']:
-                return self._check_js_syntax(content, file_path, language=language)
+                return self._check_js_syntax(content, full_path, language=language)
             
             # JSON syntax check
             elif language == 'json':
@@ -768,7 +1099,7 @@ class ToolRegistry:
                 "type": "function",
                 "function": {
                     "name": "run_command",
-                    "description": "Execute a shell command (npm install, pytest, etc)",
+                    "description": "Execute a shell command (npm install, pytest, etc). For frontend builds, use only command='npm run build' and omit cwd.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -778,7 +1109,7 @@ class ToolRegistry:
                             },
                             "cwd": {
                                 "type": "string",
-                                "description": "Optional working directory (must stay within allowed workspace root)"
+                                "description": "Optional working directory (must stay within allowed workspace root). Do not pass cwd for npm run build."
                             }
                         },
                         "required": ["command"]

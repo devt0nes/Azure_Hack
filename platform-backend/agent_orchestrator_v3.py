@@ -92,7 +92,7 @@ from review_agent import ReviewAgent
 from service_bus_coordination import ServiceBusCoordinator
 from contract_validator import validate_system_architect_contracts
 from dotenv import load_dotenv
-from azure_runtime_sync import write_text_azure_first
+from azure_runtime_sync import upload_dist_dir_to_web_container, write_text_azure_first
 
 load_dotenv()
 
@@ -2455,6 +2455,17 @@ class EnhancedAgentOrchestrator:
           timeout_value = 25
         completed, out = _run_once(timeout_value)
         if completed.returncode == 0:
+          if str(script_name).strip().lower() == "build":
+            try:
+              dist_dir = os.path.join(workspace, "dist")
+              if os.path.isdir(dist_dir):
+                ok_web, detail_web = upload_dist_dir_to_web_container(dist_dir)
+                if ok_web:
+                  out = (out + "\n\n[AZURE_WEB_UPLOAD] " + detail_web)
+                else:
+                  out = (out + "\n\n[AZURE_WEB_UPLOAD] skipped/failed: " + detail_web)
+            except Exception as e:
+              out = (out + "\n\n[AZURE_WEB_UPLOAD] failed: " + str(e))
           return {"ok": True, "message": f"npm run {script_name} succeeded", "output": out[-4000:]}
 
         if _should_auto_install(out):
@@ -2463,6 +2474,17 @@ class EnhancedAgentOrchestrator:
             completed_retry, out_retry = _run_once(timeout_value)
             merged_output = (out + "\n\n[AUTO-HEAL] " + install.get("message", "") + "\n" + out_retry)
             if completed_retry.returncode == 0:
+              if str(script_name).strip().lower() == "build":
+                try:
+                  dist_dir = os.path.join(workspace, "dist")
+                  if os.path.isdir(dist_dir):
+                    ok_web, detail_web = upload_dist_dir_to_web_container(dist_dir)
+                    if ok_web:
+                      merged_output = merged_output + "\n\n[AZURE_WEB_UPLOAD] " + detail_web
+                    else:
+                      merged_output = merged_output + "\n\n[AZURE_WEB_UPLOAD] skipped/failed: " + detail_web
+                except Exception as e:
+                  merged_output = merged_output + "\n\n[AZURE_WEB_UPLOAD] failed: " + str(e)
               return {
                 "ok": True,
                 "message": f"npm run {script_name} succeeded after auto-install",
@@ -2536,7 +2558,17 @@ class EnhancedAgentOrchestrator:
         result = asyncio.run(
           runner.run_all_tests(
             container_name=f"nexus-smoke-{self.ledger_id[:8]}",
-            environment_vars={},
+            environment_vars={
+              "NEXUS_ACTIVE_PROJECT_ID": str(self.ledger_id),
+              "AZURE_STORAGE_CONNECTION_STRING": os.getenv("AZURE_STORAGE_CONNECTION_STRING", ""),
+              "AZURE_STORAGE_CONTAINER": os.getenv("AZURE_STORAGE_CONTAINER", "project-workspace"),
+              "SMOKE_BACKEND_URL": os.getenv("SMOKE_BACKEND_URL", STANDARD_BACKEND_URL),
+              "SMOKE_FRONTEND_URL": os.getenv("SMOKE_FRONTEND_URL", STANDARD_FRONTEND_URL),
+              "SMOKE_BACKEND_PORT": str(os.getenv("SMOKE_BACKEND_PORT", str(STANDARD_BACKEND_PORT))),
+              "SMOKE_FRONTEND_PORT": str(os.getenv("SMOKE_FRONTEND_PORT", str(STANDARD_FRONTEND_PORT))),
+              "SMOKE_STARTUP_TIMEOUT_SECONDS": str(os.getenv("SMOKE_STARTUP_TIMEOUT_SECONDS", "30")),
+              "SMOKE_MAX_TOTAL_SECONDS": str(os.getenv("SMOKE_MAX_TOTAL_SECONDS", str(RUNTIME_SMOKE_MAX_TOTAL_SECONDS))),
+            },
           )
         )
       except Exception as e:

@@ -17,9 +17,11 @@ import json
 import logging
 import os
 import re
+import shlex
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from contextlib import suppress
 
 from dotenv import load_dotenv
 
@@ -48,6 +50,22 @@ def normalize_acr_registry(registry: str) -> str:
     if "." not in value:
         value = f"{value}.azurecr.io"
     return value
+
+
+def acr_registry_name(registry: str) -> str:
+    """Return ACR resource name suitable for Azure CLI (-n).
+
+    Examples:
+      - nipunregistry.azurecr.io -> nipunregistry
+      - https://nipunregistry.azurecr.io -> nipunregistry
+      - nipunregistry -> nipunregistry
+    """
+    host = normalize_acr_registry(registry)
+    if not host:
+        return ""
+    if host.lower().endswith(".azurecr.io"):
+        return host.split(".", 1)[0].strip()
+    return host.split(".", 1)[0].strip() or host
 
 
 def build_container_image_ref(registry: str, repository: str, tag: str = "latest") -> str:
@@ -105,7 +123,7 @@ def fetch_acr_credentials_from_cli(registry_name: str) -> Optional[Tuple[str, st
     """
     try:
         import subprocess as sp
-        registry = str(registry_name or "").strip()
+        registry = acr_registry_name(registry_name)
         if not registry:
             return None
 
@@ -175,6 +193,91 @@ class AzureContainerTestRunner:
             logger.error("Failed to initialize Container Instances client: %s", exc)
             raise
 
+    def _candidate_locations(self) -> List[str]:
+        """Resolve ordered candidate Azure regions for ACI creation."""
+        raw = (os.getenv("AZURE_CONTAINER_LOCATIONS") or "").strip()
+        locations: List[str] = []
+        if raw:
+            for token in raw.split(","):
+                val = str(token or "").strip()
+                if val:
+                    locations.append(val)
+
+        primary = (os.getenv("AZURE_CONTAINER_LOCATION") or "").strip()
+        if primary:
+            locations.insert(0, primary)
+
+        if not locations:
+            locations = ["southeastasia"]
+
+        dedup: List[str] = []
+        seen = set()
+        for loc in locations:
+            key = loc.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(loc)
+        return dedup
+
+    def _create_or_update_group_with_location_fallback(
+        self,
+        client: Any,
+        container_name: str,
+        container_group_kwargs: Dict[str, Any],
+        container_group_cls: Any,
+    ) -> str:
+        """Create ACI container group trying configured locations in order."""
+        locations = self._candidate_locations()
+        last_exc: Optional[Exception] = None
+        for idx, location in enumerate(locations, start=1):
+            kwargs = dict(container_group_kwargs)
+            kwargs["location"] = location
+            try:
+                container_group = container_group_cls(**kwargs)
+                logger.info(
+                    "Creating container '%s' in location '%s' (%d/%d)",
+                    container_name,
+                    location,
+                    idx,
+                    len(locations),
+                )
+                if hasattr(client.container_groups, "begin_create_or_update"):
+                    poller = client.container_groups.begin_create_or_update(
+                        self.resource_group,
+                        container_name,
+                        container_group,
+                    )
+                    poller.result()
+                else:
+                    client.container_groups.create_or_update(
+                        self.resource_group,
+                        container_name,
+                        container_group,
+                    )
+                return location
+            except Exception as exc:
+                last_exc = exc
+                msg = str(exc)
+                if "RequestDisallowedByAzure" in msg and idx < len(locations):
+                    logger.warning(
+                        "ACI create disallowed in '%s' by policy; trying next location.",
+                        location,
+                    )
+                    continue
+                if idx < len(locations):
+                    logger.warning(
+                        "ACI create failed in '%s': %s. Trying next location.",
+                        location,
+                        msg[:300],
+                    )
+                    continue
+                raise
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("No Azure container locations available for ACI create")
+
     async def run_all_tests(
         self,
         container_name: str = "nexus-all-tests",
@@ -222,11 +325,15 @@ class AzureContainerTestRunner:
         registry_username = (
             os.getenv("AZURE_CONTAINER_REGISTRY_USERNAME")
             or os.getenv("AZURE_ACR_USERNAME")
+            or os.getenv("ACR_USERNAME")
+            or os.getenv("CONTAINER_REGISTRY_USERNAME")
             or ""
         ).strip()
         registry_password = (
             os.getenv("AZURE_CONTAINER_REGISTRY_PASSWORD")
             or os.getenv("AZURE_ACR_PASSWORD")
+            or os.getenv("ACR_PASSWORD")
+            or os.getenv("CONTAINER_REGISTRY_PASSWORD")
             or ""
         ).strip()
 
@@ -250,7 +357,12 @@ class AzureContainerTestRunner:
         if not image_registry_credentials and registry_password and not registry_username:
             logger.warning("ACR password was provided without username; private image pull may fail")
         if not image_registry_credentials and not registry_username and not registry_password:
-            logger.warning("No ACR credentials found in env or Azure CLI; image pull may fail for private registries")
+            logger.warning(
+                "No ACR credentials found in env or Azure CLI for registry '%s' (acr-name='%s'); "
+                "image pull may fail for private registries",
+                normalize_acr_registry(self.container_registry),
+                acr_registry_name(self.container_registry),
+            )
 
         try:
             from azure.mgmt.containerinstance.models import ContainerGroup as _ContainerGroupClass
@@ -268,17 +380,61 @@ class AzureContainerTestRunner:
 
         client = self._get_container_client()
         
-        # Test command: run full discovery plus explicit smoke-test entry points
-        # in a single container invocation.
+        project_id_expr = "${NEXUS_ACTIVE_PROJECT_ID:-}"
+        # Test command: hydrate workspace from blob, run pytest + smoke scripts,
+        # then upload workspace back to blob.
+        # runtime smoke checks explicitly (when workspace contracts are present).
+        # runtime smoke checks explicitly (when workspace contracts are present).
         test_command = [
-            "pytest",
-            "/app",
-            "/app/smoke_test.py",
-            "/app/orchestrator_contract_verifier_smoketest.py",
-            "-v",
-            "--tb=short",
-            "--color=yes",
-            "--maxfail=5",  # Stop after 5 failures to save time
+            "/bin/sh",
+            "-lc",
+            (
+                "set -e; "
+                "PYBIN=\"$(command -v python || command -v python3 || true)\"; "
+                "if [ -z \"$PYBIN\" ]; then echo '[ACI] python/python3 not found in image' >&2; exit 127; fi; "
+                f"if [ -n \"{project_id_expr}\" ]; then "
+                "if [ ! -f /app/azure_workspace_sync_cli.py ]; then "
+                "echo '[ACI] missing /app/azure_workspace_sync_cli.py in image' >&2; exit 127; "
+                "fi; "
+                "\"$PYBIN\" /app/azure_workspace_sync_cli.py "
+                "--mode download "
+                "--project-id \"$NEXUS_ACTIVE_PROJECT_ID\" "
+                "--workspace /app/workspace; "
+                "else "
+                "echo '[ACI] NEXUS_ACTIVE_PROJECT_ID not set; skipping blob download'; "
+                "fi; "
+                "pytest /app -v --tb=short --color=yes --maxfail=5; "
+                "\"$PYBIN\" /app/orchestrator_contract_verifier_smoketest.py; "
+                "if [ -f /app/workspace/contracts/backend_api_contract.json ] "
+                "&& [ -f /app/workspace/contracts/frontend_route_contract.json ] "
+                "&& [ -d /app/workspace/backend ] "
+                "&& [ -d /app/workspace/frontend ]; then "
+                "\"$PYBIN\" /app/smoke_test.py --workspace /app/workspace --role backend_engineer "
+                "--backend-url ${SMOKE_BACKEND_URL:-http://127.0.0.1:5100} "
+                "--frontend-url ${SMOKE_FRONTEND_URL:-http://127.0.0.1:5180} "
+                "--backend-port ${SMOKE_BACKEND_PORT:-5100} "
+                "--frontend-port ${SMOKE_FRONTEND_PORT:-5180} "
+                "--timeout ${SMOKE_STARTUP_TIMEOUT_SECONDS:-30} "
+                "--max-total-seconds ${SMOKE_MAX_TOTAL_SECONDS:-300}; "
+                "\"$PYBIN\" /app/smoke_test.py --workspace /app/workspace --role frontend_engineer "
+                "--backend-url ${SMOKE_BACKEND_URL:-http://127.0.0.1:5100} "
+                "--frontend-url ${SMOKE_FRONTEND_URL:-http://127.0.0.1:5180} "
+                "--backend-port ${SMOKE_BACKEND_PORT:-5100} "
+                "--frontend-port ${SMOKE_FRONTEND_PORT:-5180} "
+                "--timeout ${SMOKE_STARTUP_TIMEOUT_SECONDS:-30} "
+                "--max-total-seconds ${SMOKE_MAX_TOTAL_SECONDS:-300}; "
+                "else "
+                "echo '[ACI] workspace backend/frontend contracts not found; skipping smoke_test.py runtime checks'; "
+                "fi; "
+                f"if [ -n \"{project_id_expr}\" ]; then "
+                "\"$PYBIN\" /app/azure_workspace_sync_cli.py "
+                "--mode upload "
+                "--project-id \"$NEXUS_ACTIVE_PROJECT_ID\" "
+                "--workspace /app/workspace; "
+                "else "
+                "echo '[ACI] NEXUS_ACTIVE_PROJECT_ID not set; skipping blob upload'; "
+                "fi"
+            ),
         ]
         
         logger.info("Test command: %s", " ".join(test_command))
@@ -290,9 +446,15 @@ class AzureContainerTestRunner:
             EnvironmentVariable(name="LOG_LEVEL", value="INFO"),
         ]
         
-        if environment_vars:
-            for key, value in environment_vars.items():
-                env_vars_list.append(EnvironmentVariable(name=key, value=str(value)))
+        merged_env = dict(environment_vars or {})
+        if "AZURE_STORAGE_CONNECTION_STRING" not in merged_env and os.getenv("AZURE_STORAGE_CONNECTION_STRING"):
+            merged_env["AZURE_STORAGE_CONNECTION_STRING"] = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
+        if "AZURE_STORAGE_CONTAINER" not in merged_env:
+            merged_env["AZURE_STORAGE_CONTAINER"] = os.getenv("AZURE_STORAGE_CONTAINER", "project-workspace")
+        if "NEXUS_ACTIVE_PROJECT_ID" not in merged_env and os.getenv("NEXUS_ACTIVE_PROJECT_ID"):
+            merged_env["NEXUS_ACTIVE_PROJECT_ID"] = os.getenv("NEXUS_ACTIVE_PROJECT_ID", "")
+        for key, value in merged_env.items():
+            env_vars_list.append(EnvironmentVariable(name=key, value=str(value)))
         
         # Create container specification
         # Increase resources for faster test execution
@@ -308,35 +470,25 @@ class AzureContainerTestRunner:
         
         # Create container group
         container_group_kwargs = {
-            "location": "eastus",
             "containers": [container],
             "os_type": "Linux",
             "restart_policy": "Never",
         }
         if image_registry_credentials and supports_registry_credentials:
             container_group_kwargs["image_registry_credentials"] = image_registry_credentials
-
-        container_group = ContainerGroup(**container_group_kwargs)
         
         logger.info("Creating container: %s", sanitized_container_name)
         logger.info("Image: %s", self.container_image)
         logger.info("Timeout: %d seconds", self.timeout_seconds)
         
         try:
-            # Create the container group (support both old and new SDK method names)
-            if hasattr(client.container_groups, "begin_create_or_update"):
-                poller = client.container_groups.begin_create_or_update(
-                    self.resource_group,
-                    sanitized_container_name,
-                    container_group,
-                )
-                poller.result()
-            else:
-                client.container_groups.create_or_update(
-                    self.resource_group,
-                    sanitized_container_name,
-                    container_group,
-                )
+            # Create the container group (with region fallback support).
+            self._create_or_update_group_with_location_fallback(
+                client=client,
+                container_name=sanitized_container_name,
+                container_group_kwargs=container_group_kwargs,
+                container_group_cls=ContainerGroup,
+            )
             
             # Wait for container to complete
             result = await self._wait_for_completion(
@@ -377,6 +529,193 @@ class AzureContainerTestRunner:
                 "container_name": sanitized_container_name,
             }
 
+    async def run_workspace_command(
+        self,
+        project_id: str,
+        command_parts: List[str],
+        cwd: str = ".",
+        container_name: str = "nexus-cmd",
+        environment_vars: Optional[Dict[str, str]] = None,
+        timeout_seconds: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Execute a one-off workspace command inside ACI against blob-backed workspace."""
+        project_id = str(project_id or "").strip()
+        if not project_id:
+            return {"success": False, "error": "project_id is required", "container_name": container_name}
+        if not command_parts:
+            return {"success": False, "error": "command_parts is required", "container_name": container_name}
+
+        safe_parts = [str(p) for p in command_parts if str(p) != ""]
+        if not safe_parts:
+            return {"success": False, "error": "empty command", "container_name": container_name}
+        safe_cmd = " ".join(shlex.quote(p) for p in safe_parts)
+        cwd_rel = str(cwd or ".").strip().strip("/")
+        cwd_rel = cwd_rel or "."
+        cwd_quoted = shlex.quote(cwd_rel)
+        dist_rel = "dist" if cwd_rel in {".", ""} else f"{cwd_rel}/dist"
+        dist_rel_quoted = shlex.quote(dist_rel)
+
+        run_timeout = int(timeout_seconds or self.timeout_seconds or 600)
+        run_timeout = max(60, run_timeout)
+        sanitized_container_name = sanitize_aci_name(container_name)
+        client = self._get_container_client()
+
+        command = [
+            "/bin/sh",
+            "-lc",
+            (
+                "set -e; "
+                "PYBIN=\"$(command -v python || command -v python3 || true)\"; "
+                "if [ -z \"$PYBIN\" ]; then echo '[ACI] python/python3 not found in image' >&2; exit 127; fi; "
+                "if [ ! -f /app/azure_workspace_sync_cli.py ]; then "
+                "echo '[ACI] missing /app/azure_workspace_sync_cli.py in image' >&2; exit 127; "
+                "fi; "
+                "\"$PYBIN\" /app/azure_workspace_sync_cli.py "
+                "--mode download "
+                f"--project-id {shlex.quote(project_id)} "
+                "--workspace /app/workspace; "
+                "cd /app/workspace; "
+                f"cd {cwd_quoted}; "
+                "set +e; "
+                f"{safe_cmd} > /tmp/nexus_cmd_stdout.txt 2> /tmp/nexus_cmd_stderr.txt; "
+                "EXIT_CODE=$?; "
+                "set -e; "
+                "\"$PYBIN\" /app/azure_workspace_sync_cli.py "
+                "--mode upload "
+                f"--project-id {shlex.quote(project_id)} "
+                "--workspace /app/workspace || true; "
+                "if [ -d ./dist ]; then "
+                "\"$PYBIN\" /app/azure_workspace_sync_cli.py "
+                "--mode upload-dist-web "
+                f"--project-id {shlex.quote(project_id)} "
+                "--workspace /app/workspace "
+                f"--dist-relative {dist_rel_quoted} || true; "
+                "fi; "
+                "echo '__NEXUS_CMD_STDOUT_BEGIN__'; "
+                "cat /tmp/nexus_cmd_stdout.txt || true; "
+                "echo '__NEXUS_CMD_STDOUT_END__'; "
+                "echo '__NEXUS_CMD_STDERR_BEGIN__'; "
+                "cat /tmp/nexus_cmd_stderr.txt || true; "
+                "echo '__NEXUS_CMD_STDERR_END__'; "
+                "echo \"__NEXUS_CMD_EXIT_CODE__:${EXIT_CODE}\"; "
+                "exit ${EXIT_CODE}"
+            ),
+        ]
+
+        try:
+            from azure.mgmt.containerinstance.models import (
+                ContainerGroup,
+                Container,
+                ResourceRequests,
+                ResourceRequirements,
+                EnvironmentVariable,
+                ImageRegistryCredential,
+            )
+        except ImportError as exc:
+            ImageRegistryCredential = None  # type: ignore[assignment]
+            try:
+                from azure.mgmt.containerinstance.models import (  # type: ignore[no-redef]
+                    ContainerGroup,
+                    Container,
+                    ResourceRequests,
+                    ResourceRequirements,
+                    EnvironmentVariable,
+                )
+            except ImportError:
+                return {
+                    "success": False,
+                    "error": f"Required Azure SDK not installed: {exc}",
+                    "container_name": sanitized_container_name,
+                }
+
+        registry_username = (
+            os.getenv("AZURE_CONTAINER_REGISTRY_USERNAME")
+            or os.getenv("AZURE_ACR_USERNAME")
+            or os.getenv("ACR_USERNAME")
+            or os.getenv("CONTAINER_REGISTRY_USERNAME")
+            or ""
+        ).strip()
+        registry_password = (
+            os.getenv("AZURE_CONTAINER_REGISTRY_PASSWORD")
+            or os.getenv("AZURE_ACR_PASSWORD")
+            or os.getenv("ACR_PASSWORD")
+            or os.getenv("CONTAINER_REGISTRY_PASSWORD")
+            or ""
+        ).strip()
+        if not registry_username or not registry_password:
+            cli_creds = fetch_acr_credentials_from_cli(self.container_registry)
+            if cli_creds:
+                registry_username, registry_password = cli_creds
+
+        image_registry_credentials = []
+        if ImageRegistryCredential and registry_username and registry_password:
+            image_registry_credentials.append(
+                ImageRegistryCredential(
+                    server=normalize_acr_registry(self.container_registry),
+                    username=registry_username,
+                    password=registry_password,
+                )
+            )
+
+        env_map = dict(environment_vars or {})
+        env_map.setdefault("NEXUS_ACTIVE_PROJECT_ID", project_id)
+        env_map.setdefault("AZURE_STORAGE_CONNECTION_STRING", os.getenv("AZURE_STORAGE_CONNECTION_STRING", ""))
+        env_map.setdefault("AZURE_STORAGE_CONTAINER", os.getenv("AZURE_STORAGE_CONTAINER", "project-workspace"))
+
+        env_vars_list = [
+            EnvironmentVariable(name="ENVIRONMENT", value="test"),
+            EnvironmentVariable(name="PYTHONUNBUFFERED", value="1"),
+            EnvironmentVariable(name="LOG_LEVEL", value="INFO"),
+        ]
+        for key, value in env_map.items():
+            env_vars_list.append(EnvironmentVariable(name=key, value=str(value)))
+
+        container = Container(
+            name=sanitized_container_name,
+            image=self.container_image,
+            command=command,
+            resources=ResourceRequirements(
+                requests=ResourceRequests(cpu=2.0, memory_in_gb=3.0)
+            ),
+            environment_variables=env_vars_list,
+        )
+
+        try:
+            from azure.mgmt.containerinstance.models import ContainerGroup as _ContainerGroupClass
+            supports_registry_credentials = "image_registry_credentials" in getattr(_ContainerGroupClass, "__init__", object).__code__.co_varnames  # type: ignore[attr-defined]
+        except Exception:
+            supports_registry_credentials = True
+
+        group_kwargs = {
+            "containers": [container],
+            "os_type": "Linux",
+            "restart_policy": "Never",
+        }
+        if image_registry_credentials and supports_registry_credentials:
+            group_kwargs["image_registry_credentials"] = image_registry_credentials
+
+        try:
+            self._create_or_update_group_with_location_fallback(
+                client=client,
+                container_name=sanitized_container_name,
+                container_group_kwargs=group_kwargs,
+                container_group_cls=ContainerGroup,
+            )
+
+            result = await self._wait_for_completion(client, sanitized_container_name, run_timeout)
+            return result
+        finally:
+            try:
+                if hasattr(client.container_groups, "begin_delete"):
+                    delete_poller = client.container_groups.begin_delete(
+                        self.resource_group, sanitized_container_name
+                    )
+                    delete_poller.result()
+                else:
+                    client.container_groups.delete(self.resource_group, sanitized_container_name)
+            except Exception:
+                pass
+
     async def _wait_for_completion(
         self, client: Any, container_name: str, timeout_seconds: int
     ) -> Dict[str, Any]:
@@ -407,12 +746,16 @@ class AzureContainerTestRunner:
                     }
                 elif state == "Failed":
                     logs = self._get_container_logs(client, container_name)
+                    diagnostics = self._collect_failure_diagnostics(client, container_name)
+                    error_msg = "Container execution failed"
+                    if diagnostics:
+                        error_msg = f"{error_msg}: {diagnostics}"
                     return {
                         "success": False,
                         "container_name": container_name,
                         "status": "failed",
                         "duration_seconds": int(time.time() - start_time),
-                        "error": "Container execution failed",
+                        "error": error_msg,
                         "logs": logs,
                     }
                 
@@ -442,15 +785,73 @@ class AzureContainerTestRunner:
 
     def _get_container_logs(self, client: Any, container_name: str) -> str:
         """Retrieve container logs."""
+        last_error = None
+        for attr_name in ["containers", "container"]:
+            ops = getattr(client, attr_name, None)
+            if ops is None:
+                continue
+            for method_name in ["list_logs", "get_logs"]:
+                fn = getattr(ops, method_name, None)
+                if fn is None:
+                    continue
+                try:
+                    logs = fn(self.resource_group, container_name, container_name)
+                    if hasattr(logs, "logs") and getattr(logs, "logs"):
+                        return str(logs.logs)
+                    if isinstance(logs, str):
+                        return logs
+                except Exception as exc:
+                    last_error = exc
+                    continue
+
+        if last_error is not None:
+            logger.warning("Failed to retrieve container logs: %s", last_error)
+        return ""
+
+    def _collect_failure_diagnostics(self, client: Any, container_name: str) -> str:
+        """Extract concise ACI failure details from instance view."""
         try:
-            # Use the correct Azure SDK method for logs
-            logs = client.container.list_logs(
-                self.resource_group, container_name, container_name
-            )
-            return logs.logs if hasattr(logs, 'logs') and logs.logs else ""
+            cg = client.container_groups.get(self.resource_group, container_name)
         except Exception as exc:
-            logger.warning("Failed to retrieve container logs: %s", exc)
-            return ""
+            return f"failed to fetch container group diagnostics: {exc}"
+
+        details: List[str] = []
+        with suppress(Exception):
+            group_view = getattr(cg, "instance_view", None)
+            events = getattr(group_view, "events", None) or []
+            for ev in events:
+                msg = str(getattr(ev, "message", "") or "").strip()
+                if msg:
+                    details.append(msg)
+
+        with suppress(Exception):
+            for c in getattr(cg, "containers", []) or []:
+                c_name = getattr(c, "name", "container")
+                iv = getattr(c, "instance_view", None)
+                current = getattr(iv, "current_state", None)
+                if current is None:
+                    continue
+                state = str(getattr(current, "state", "") or "").strip()
+                detail_status = str(getattr(current, "detail_status", "") or "").strip()
+                exit_code = getattr(current, "exit_code", None)
+                msg = f"{c_name}: state={state or 'unknown'}"
+                if detail_status:
+                    msg += f", detail={detail_status}"
+                if exit_code is not None:
+                    msg += f", exit_code={exit_code}"
+                details.append(msg)
+
+        # De-duplicate while preserving order
+        deduped: List[str] = []
+        seen = set()
+        for d in details:
+            key = d.strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(key)
+
+        return " | ".join(deduped[:5])
 
     def _parse_test_summary(self, logs: str) -> Dict[str, Any]:
         """Parse pytest summary from logs."""
@@ -549,4 +950,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
